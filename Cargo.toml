@@ -4,4 +4,7 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
+tokio = {version = "1.44.1", features = ["macros", "rt", "net", "sync"]}
 quiche = "0.24.1"
+
+bytes = "1.10.1"
