@@ -9,7 +9,7 @@ use tracing::warn;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ReadError {
-    Fin,
+    Finish,
     ResetStream(u64),
     ConnectionClose,
 }
@@ -17,7 +17,7 @@ pub enum ReadError {
 impl Display for ReadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReadError::Fin => write!(f, "FIN"),
+            ReadError::Finish => write!(f, "FIN"),
             ReadError::ResetStream(code) => write!(f, "RESET_STREAM({code})"),
             ReadError::ConnectionClose => write!(f, "Connection closed"),
         }
@@ -47,25 +47,25 @@ impl Display for WriteError {
 
 pub(crate) fn channel<T>(
     buffer: usize,
-    stream_switch: Switch<u64>,
-    connection_switch: Switch<()>,
+    stream_state: Switch<u64>,
+    connection_state: Switch<()>,
     internal_error_code: Option<u64>,
 ) -> (StreamSender<T>, StreamReceiver<T>) {
     let (sender, receiver) = mpsc::channel(buffer);
-    let direction_switch = Switch::new();
+    let direction_state = Switch::new();
 
     let stream_sender = StreamSender::new(
         sender,
-        direction_switch.clone(),
-        stream_switch.clone(),
-        connection_switch.clone(),
+        direction_state.clone(),
+        stream_state.clone(),
+        connection_state.clone(),
         internal_error_code,
     );
     let stream_receiver = StreamReceiver::new(
         receiver,
-        direction_switch.clone(),
-        stream_switch.clone(),
-        connection_switch.clone(),
+        direction_state.clone(),
+        stream_state.clone(),
+        connection_state.clone(),
         internal_error_code,
     );
 
@@ -77,9 +77,9 @@ pub(crate) fn channel<T>(
 pub struct StreamSender<T> {
     sender: Sender<T>,
 
-    direction_switch: Switch<u64>,
-    stream_switch: Switch<u64>,
-    connection_switch: Switch<()>,
+    direction_state: Switch<u64>,
+    stream_state: Switch<u64>,
+    connection_state: Switch<()>,
 
     internal_error_code: Option<u64>,
     error: Option<WriteError>,
@@ -88,16 +88,16 @@ pub struct StreamSender<T> {
 impl<T> StreamSender<T> {
     pub(crate) fn new(
         sender: Sender<T>,
-        direction_switch: Switch<u64>,
-        stream_switch: Switch<u64>,
-        connection_switch: Switch<()>,
+        direction_state: Switch<u64>,
+        stream_state: Switch<u64>,
+        connection_state: Switch<()>,
         internal_error_code: Option<u64>,
     ) -> Self {
         Self {
             sender,
-            direction_switch,
-            stream_switch,
-            connection_switch,
+            direction_state,
+            stream_state,
+            connection_state,
             internal_error_code,
             error: None,
         }
@@ -121,13 +121,13 @@ impl<T> StreamSender<T> {
 
             // TODO(performance):
             //  Too many polls, will moving it to the FuturesUnordered help?
-            a = self.connection_switch.switched() => {
+            a = self.connection_state.switched() => {
                 Action::ConnectionClose
             }
-            a = self.stream_switch.switched() => {
+            a = self.stream_state.switched() => {
                 Action::ResetStream(a)
             }
-            a = self.direction_switch.switched() => {
+            a = self.direction_state.switched() => {
                 Action::StopSending(a)
             }
             a = self.sender.send(value) => {
@@ -161,20 +161,20 @@ impl<T> StreamSender<T> {
     }
 
     pub fn reset_stream(self, code: u64) {
-        let _ = self.stream_switch.try_switch(code);
+        let _ = self.stream_state.try_switch(code);
     }
 
 
-    pub(crate) fn direction_switch(&self) -> Switch<u64> {
-        self.direction_switch.clone()
+    pub(crate) fn direction_state(&self) -> Switch<u64> {
+        self.direction_state.clone()
     }
 
-    pub(crate) fn stream_switch(&self) -> Switch<u64> {
-        self.stream_switch.clone()
+    pub(crate) fn stream_state(&self) -> Switch<u64> {
+        self.stream_state.clone()
     }
 
-    pub(crate) fn connection_switch(&self) -> Switch<()> {
-        self.connection_switch.clone()
+    pub(crate) fn connection_state(&self) -> Switch<()> {
+        self.connection_state.clone()
     }
 }
 
@@ -182,11 +182,11 @@ impl<T> Drop for StreamSender<T> {
     fn drop(&mut self) {
         if thread::panicking()
             && self.error.is_none()
-            && !self.connection_switch.is_switched()
-            && !self.direction_switch.is_switched()
+            && !self.connection_state.is_switched()
+            && !self.direction_state.is_switched()
         {
             if let Some(code) = self.internal_error_code {
-                let _ = self.stream_switch.try_switch(code);
+                let _ = self.stream_state.try_switch(code);
             }
         }
     }
@@ -197,9 +197,9 @@ impl<T> Drop for StreamSender<T> {
 pub struct StreamReceiver<T> {
     receiver: Receiver<T>,
 
-    direction_switch: Switch<u64>,
-    stream_switch: Switch<u64>,
-    connection_switch: Switch<()>,
+    direction_state: Switch<u64>,
+    stream_state: Switch<u64>,
+    connection_state: Switch<()>,
 
     internal_error_code: Option<u64>,
     error: Option<ReadError>,
@@ -208,16 +208,16 @@ pub struct StreamReceiver<T> {
 impl<T> StreamReceiver<T> {
     pub(crate) fn new(
         receiver: Receiver<T>,
-        direction_switch: Switch<u64>,
-        stream_switch: Switch<u64>,
-        connection_switch: Switch<()>,
+        direction_state: Switch<u64>,
+        stream_state: Switch<u64>,
+        connection_state: Switch<()>,
         internal_error_code: Option<u64>,
     ) -> Self {
         Self {
             receiver,
-            direction_switch,
-            stream_switch,
-            connection_switch,
+            direction_state,
+            stream_state,
+            connection_state,
             internal_error_code,
             error: None,
         }
@@ -226,7 +226,7 @@ impl<T> StreamReceiver<T> {
 
     pub async fn recv(&mut self) -> Result<T, ReadError> {
         if let Some(error) = self.error {
-            if error == ReadError::Fin {
+            if error == ReadError::Finish {
                 return Err(error);
             }
 
@@ -250,10 +250,10 @@ impl<T> StreamReceiver<T> {
 
                     // TODO(performance):
                     //  Too many polls, will moving it to the FuturesUnordered help?
-                    a = self.connection_switch.switched() => {
+                    a = self.connection_state.switched() => {
                         Action::ConnectionClose,
                     }
-                    a = self.stream_switch.switched() => {
+                    a = self.stream_state.switched() => {
                         Action::ResetStream(a)
                     }
                     a = self.receiver.recv() => {
@@ -268,7 +268,7 @@ impl<T> StreamReceiver<T> {
                 if let Some(message) = message {
                     Ok(message)
                 } else {
-                    Err(ReadError::Fin)
+                    Err(ReadError::Finish)
                 }
             }
             Action::ResetStream(code) => Err(ReadError::ResetStream(code)),
@@ -286,33 +286,33 @@ impl<T> StreamReceiver<T> {
     }
 
     pub fn stop_sending(self, code: u64) {
-        let _ = self.direction_switch.try_switch(code);
+        let _ = self.direction_state.try_switch(code);
     }
 
 
-    pub(crate) fn direction_switch(&self) -> Switch<u64> {
-        self.direction_switch.clone()
+    pub(crate) fn direction_state(&self) -> Switch<u64> {
+        self.direction_state.clone()
     }
 
-    pub(crate) fn stream_switch(&self) -> Switch<u64> {
-        self.stream_switch.clone()
+    pub(crate) fn stream_state(&self) -> Switch<u64> {
+        self.stream_state.clone()
     }
 
-    pub(crate) fn connection_switch(&self) -> Switch<()> {
-        self.connection_switch.clone()
+    pub(crate) fn connection_state(&self) -> Switch<()> {
+        self.connection_state.clone()
     }
 }
 
 impl<T> Drop for StreamReceiver<T> {
     fn drop(&mut self) {
         if self.error.is_none()
-            && !self.connection_switch.is_switched()
-            && !self.stream_switch.is_switched()
+            && !self.connection_state.is_switched()
+            && !self.stream_state.is_switched()
         {
             if let Some(default_code) = self.internal_error_code {
-                let _ = self.direction_switch.try_switch(default_code);
+                let _ = self.direction_state.try_switch(default_code);
             } else {
-                if !self.direction_switch.is_switched() {
+                if !self.direction_state.is_switched() {
                     warn!(
                         "detected 'StreamReceiver<{}>.drop()' without invoking 'stop_sending(code)' first, \
                         while 'internal_error_code' is None",
