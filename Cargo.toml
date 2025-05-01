@@ -7,4 +7,5 @@ edition = "2024"
 tokio = {version = "1.44.1", features = ["macros", "rt", "net", "sync"]}
 quiche = "0.24.1"
 
+tracing = "0.1.41"
 bytes = "1.10.1"

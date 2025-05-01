@@ -1,9 +1,11 @@
 use crate::future::state::Switch;
 use std::any::type_name;
 use std::fmt::{Display, Formatter};
+use std::thread;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tracing::warn;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum ReadError {
@@ -47,7 +49,7 @@ pub(crate) fn channel<T>(
     buffer: usize,
     stream_switch: Switch<u64>,
     connection_switch: Switch<()>,
-    default_stop_sending_code: Option<u64>,
+    internal_error_code: Option<u64>,
 ) -> (StreamSender<T>, StreamReceiver<T>) {
     let (sender, receiver) = mpsc::channel(buffer);
     let direction_switch = Switch::new();
@@ -57,20 +59,21 @@ pub(crate) fn channel<T>(
         direction_switch.clone(),
         stream_switch.clone(),
         connection_switch.clone(),
+        internal_error_code,
     );
     let stream_receiver = StreamReceiver::new(
         receiver,
         direction_switch.clone(),
         stream_switch.clone(),
         connection_switch.clone(),
-        default_stop_sending_code,
+        internal_error_code,
     );
 
     (stream_sender, stream_receiver)
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StreamSender<T> {
     sender: Sender<T>,
 
@@ -78,6 +81,7 @@ pub struct StreamSender<T> {
     stream_switch: Switch<u64>,
     connection_switch: Switch<()>,
 
+    internal_error_code: Option<u64>,
     error: Option<WriteError>,
 }
 
@@ -87,12 +91,14 @@ impl<T> StreamSender<T> {
         direction_switch: Switch<u64>,
         stream_switch: Switch<u64>,
         connection_switch: Switch<()>,
+        internal_error_code: Option<u64>,
     ) -> Self {
         Self {
             sender,
             direction_switch,
             stream_switch,
             connection_switch,
+            internal_error_code,
             error: None,
         }
     }
@@ -150,6 +156,10 @@ impl<T> StreamSender<T> {
         }
     }
 
+    pub fn finish(self) {
+        drop(self)
+    }
+
     pub fn reset_stream(self, code: u64) {
         let _ = self.stream_switch.try_switch(code);
     }
@@ -168,6 +178,20 @@ impl<T> StreamSender<T> {
     }
 }
 
+impl<T> Drop for StreamSender<T> {
+    fn drop(&mut self) {
+        if thread::panicking()
+            && self.error.is_none()
+            && !self.connection_switch.is_switched()
+            && !self.direction_switch.is_switched()
+        {
+            if let Some(code) = self.internal_error_code {
+                let _ = self.stream_switch.try_switch(code);
+            }
+        }
+    }
+}
+
 
 #[derive(Debug)]
 pub struct StreamReceiver<T> {
@@ -177,7 +201,7 @@ pub struct StreamReceiver<T> {
     stream_switch: Switch<u64>,
     connection_switch: Switch<()>,
 
-    default_stop_sending_code: Option<u64>,
+    internal_error_code: Option<u64>,
     error: Option<ReadError>,
 }
 
@@ -187,14 +211,14 @@ impl<T> StreamReceiver<T> {
         direction_switch: Switch<u64>,
         stream_switch: Switch<u64>,
         connection_switch: Switch<()>,
-        default_stop_sending_code: Option<u64>,
+        internal_error_code: Option<u64>,
     ) -> Self {
         Self {
             receiver,
             direction_switch,
             stream_switch,
             connection_switch,
-            default_stop_sending_code,
+            internal_error_code,
             error: None,
         }
     }
@@ -284,16 +308,17 @@ impl<T> Drop for StreamReceiver<T> {
         if self.error.is_none()
             && !self.connection_switch.is_switched()
             && !self.stream_switch.is_switched()
-            && !self.direction_switch.is_switched()
         {
-            if let Some(default_code) = self.default_stop_sending_code {
+            if let Some(default_code) = self.internal_error_code {
                 let _ = self.direction_switch.try_switch(default_code);
             } else {
-                panic!(
-                    "attempt to drop StreamReceiver<{}> without invoking 'stop_sending()' first, \
-                    while 'default_stop_sending_code' is None",
-                    type_name::<T>()
-                )
+                if !self.direction_switch.is_switched() {
+                    warn!(
+                        "detected 'StreamReceiver<{}>.drop()' without invoking 'stop_sending(code)' first, \
+                        while 'internal_error_code' is None",
+                        type_name::<T>()
+                    )
+                }
             }
         }
     }
