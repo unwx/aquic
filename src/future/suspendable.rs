@@ -1,7 +1,8 @@
 use std::mem;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LockResult, Mutex};
 use std::task::{Context, Poll, Waker};
+use tracing::warn;
 
 #[derive(Debug, Default)]
 struct State {
@@ -10,7 +11,7 @@ struct State {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SuspensionController {
     state: Arc<Mutex<State>>,
 }
@@ -31,6 +32,23 @@ impl SuspensionController {
 
         if let Some(waker) = mem::replace(&mut guard.waker, None) {
             waker.wake();
+        }
+    }
+}
+
+impl Drop for SuspensionController {
+    fn drop(&mut self) {
+        match self.state.lock() {
+            Ok(guard) => {
+                if let Some(waker) = mem::replace(&mut guard.waker, None) {
+                    waker.wake();
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "unable to auto-wake SuspendableFuture on SuspensionController drop: mutex is poisoned: {e}"
+                );
+            }
         }
     }
 }
