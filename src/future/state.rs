@@ -53,3 +53,25 @@ impl<T: Clone> Default for Switch<T> {
         Self::new()
     }
 }
+
+
+#[derive(Debug, Clone)]
+pub struct SwitchWatch<T: Clone> {
+    inner: Switch<T>,
+}
+
+impl<T: Clone> SwitchWatch<T> {
+    pub async fn switched(&self) -> T {
+        self.inner.switched().await
+    }
+
+    pub fn is_switched(&self) -> bool {
+        self.inner.is_switched()
+    }
+}
+
+impl<T: Clone> From<Switch<T>> for SwitchWatch<T> {
+    fn from(inner: Switch<T>) -> Self {
+        Self { inner }
+    }
+}
