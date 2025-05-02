@@ -75,7 +75,7 @@ pub(crate) fn channel<T>(
 
 #[derive(Debug)]
 pub struct StreamSender<T> {
-    sender: Sender<T>,
+    sender: Sender<(T, bool)>,
 
     direction_state: Switch<u64>,
     stream_state: Switch<u64>,
@@ -87,7 +87,7 @@ pub struct StreamSender<T> {
 
 impl<T> StreamSender<T> {
     pub(crate) fn new(
-        sender: Sender<T>,
+        sender: Sender<(T, bool)>,
         direction_state: Switch<u64>,
         stream_state: Switch<u64>,
         connection_state: Switch<()>,
@@ -105,6 +105,18 @@ impl<T> StreamSender<T> {
 
 
     pub async fn send(&mut self, value: T) -> Result<(), WriteError> {
+        self.send_internal(value, false).await
+    }
+
+    pub async fn send_and_finish(mut self, value: T) -> Result<(), WriteError> {
+        self.send_internal(value, true).await
+    }
+
+    async fn send_internal(
+        &mut self,
+        value: T,
+        no_more_messages_hint: bool,
+    ) -> Result<(), WriteError> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -130,7 +142,7 @@ impl<T> StreamSender<T> {
             a = self.direction_state.switched() => {
                 Action::StopSending(a)
             }
-            a = self.sender.send(value) => {
+            a = self.sender.send((value, no_more_messages_hint)) => {
                 Action::Send(a.is_ok())
             }
         };
@@ -155,6 +167,7 @@ impl<T> StreamSender<T> {
             Ok(())
         }
     }
+
 
     pub fn finish(self) {
         drop(self)
@@ -195,7 +208,7 @@ impl<T> Drop for StreamSender<T> {
 
 #[derive(Debug)]
 pub struct StreamReceiver<T> {
-    receiver: Receiver<T>,
+    receiver: Receiver<(T, bool)>,
 
     direction_state: Switch<u64>,
     stream_state: Switch<u64>,
@@ -207,7 +220,7 @@ pub struct StreamReceiver<T> {
 
 impl<T> StreamReceiver<T> {
     pub(crate) fn new(
-        receiver: Receiver<T>,
+        receiver: Receiver<(T, bool)>,
         direction_state: Switch<u64>,
         stream_state: Switch<u64>,
         connection_state: Switch<()>,
@@ -225,6 +238,12 @@ impl<T> StreamReceiver<T> {
 
 
     pub async fn recv(&mut self) -> Result<T, ReadError> {
+        self.recv_with_hint()
+            .await
+            .map(|(value, _no_more_messages_hint)| value)
+    }
+
+    pub async fn recv_with_hint(&mut self) -> Result<(T, bool), ReadError> {
         if let Some(error) = self.error {
             if error == ReadError::Finish {
                 return Err(error);
@@ -236,7 +255,7 @@ impl<T> StreamReceiver<T> {
         }
 
         enum Action<T> {
-            Receive(Option<T>),
+            Receive(Option<(T, bool)>),
             ResetStream(u64),
             ConnectionClose,
         }
@@ -251,7 +270,7 @@ impl<T> StreamReceiver<T> {
                     // TODO(performance):
                     //  Too many polls, will moving it to the FuturesUnordered help?
                     a = self.connection_state.switched() => {
-                        Action::ConnectionClose,
+                        Action::ConnectionClose
                     }
                     a = self.stream_state.switched() => {
                         Action::ResetStream(a)
