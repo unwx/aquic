@@ -1,10 +1,12 @@
 use crate::future::state::{Switch, SwitchWatch};
 use std::any::type_name;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use tokio::select;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -45,6 +47,22 @@ impl Display for WriteError {
 }
 
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct StreamPriority {
+    pub urgency: u8,
+    pub incremental: bool,
+}
+
+impl StreamPriority {
+    pub fn new(urgency: u8, incremental: bool) -> Self {
+        Self {
+            urgency,
+            incremental,
+        }
+    }
+}
+
+
 pub(crate) fn channel<T>(
     buffer: usize,
     reset_stream_switch: Switch<u64>,
@@ -52,6 +70,7 @@ pub(crate) fn channel<T>(
     internal_error_code: Option<u64>,
 ) -> (StreamSender<T>, StreamReceiver<T>) {
     let (sender, receiver) = mpsc::channel(buffer);
+    let (priority_sender, priority_receiver) = watch::channel(None);
     let stop_sending_switch = Switch::new();
 
     let stream_sender = StreamSender::new(
@@ -59,6 +78,7 @@ pub(crate) fn channel<T>(
         stop_sending_switch.clone(),
         reset_stream_switch.clone(),
         connection_state_watch.clone(),
+        priority_sender,
         internal_error_code,
     );
     let stream_receiver = StreamReceiver::new(
@@ -66,6 +86,7 @@ pub(crate) fn channel<T>(
         stop_sending_switch.clone(),
         reset_stream_switch.clone(),
         connection_state_watch.clone(),
+        priority_receiver,
         internal_error_code,
     );
 
@@ -81,6 +102,7 @@ pub struct StreamSender<T> {
     reset_stream_switch: Switch<u64>,
     connection_state_watch: SwitchWatch<()>,
 
+    priority_sender: watch::Sender<Option<StreamPriority>>,
     internal_error_code: Option<u64>,
     error: Option<WriteError>,
 }
@@ -91,6 +113,7 @@ impl<T> StreamSender<T> {
         stop_sending_switch: Switch<u64>,
         reset_stream_switch: Switch<u64>,
         connection_state_watch: SwitchWatch<()>,
+        priority_sender: watch::Sender<Option<StreamPriority>>,
         internal_error_code: Option<u64>,
     ) -> Self {
         Self {
@@ -99,6 +122,7 @@ impl<T> StreamSender<T> {
             reset_stream_switch,
             connection_state_watch,
             internal_error_code,
+            priority_sender,
             error: None,
         }
     }
@@ -169,6 +193,11 @@ impl<T> StreamSender<T> {
     }
 
 
+    pub fn set_priority(&self, urgency: u8, incremental: bool) {
+        self.priority_sender
+            .send_replace(Some(StreamPriority::new(urgency, incremental)));
+    }
+
     pub fn finish(self) {
         drop(self)
     }
@@ -214,6 +243,7 @@ pub struct StreamReceiver<T> {
     reset_stream_switch: Switch<u64>,
     connection_state_watch: SwitchWatch<()>,
 
+    priority_receiver: watch::Receiver<Option<StreamPriority>>,
     internal_error_code: Option<u64>,
     error: Option<ReadError>,
 }
@@ -224,6 +254,7 @@ impl<T> StreamReceiver<T> {
         stop_sending_switch: Switch<u64>,
         reset_stream_switch: Switch<u64>,
         connection_state_watch: SwitchWatch<()>,
+        priority_receiver: watch::Receiver<Option<StreamPriority>>,
         internal_error_code: Option<u64>,
     ) -> Self {
         Self {
@@ -232,6 +263,7 @@ impl<T> StreamReceiver<T> {
             reset_stream_switch,
             connection_state_watch,
             internal_error_code,
+            priority_receiver,
             error: None,
         }
     }
@@ -308,6 +340,10 @@ impl<T> StreamReceiver<T> {
         let _ = self.stop_sending_switch.try_switch(code);
     }
 
+
+    pub(crate) fn priority(&self) -> Option<StreamPriority> {
+        self.priority_receiver.borrow().as_ref().copied()
+    }
 
     pub(crate) fn stop_sending_switch(&self) -> Switch<u64> {
         self.stop_sending_switch.clone()
