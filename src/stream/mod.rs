@@ -1,7 +1,11 @@
 use crate::stream::StreamType::{ClientBidi, ClientUni, ServerBidi, ServerUni};
 
-pub mod mapper;
 pub mod channel;
+pub mod mapper;
+
+
+mod buffer;
+mod unit;
 
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]

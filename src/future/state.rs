@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
-pub struct Switch<T: Clone> {
+pub struct Switch<T> {
     state: Arc<Mutex<Option<T>>>,
     notify: Arc<Notify>,
 }
@@ -29,10 +29,7 @@ impl<T: Clone> Switch<T> {
     }
 
     pub async fn switched(&self) -> T {
-        let get_state = || {
-            let guard = self.state.lock().unwrap();
-            guard.as_ref().cloned()
-        };
+        let get_state = || self.state.lock().unwrap().as_ref().cloned();
 
         if let Some(state) = get_state() {
             return state;
@@ -43,8 +40,7 @@ impl<T: Clone> Switch<T> {
     }
 
     pub fn is_switched(&self) -> bool {
-        let guard = self.state.lock().unwrap();
-        guard.is_some()
+        self.state.lock().unwrap().is_some()
     }
 }
 
@@ -56,11 +52,11 @@ impl<T: Clone> Default for Switch<T> {
 
 
 #[derive(Debug, Clone)]
-pub struct SwitchWatch<T: Clone> {
-    inner: Switch<T>,
+pub struct Observer<T> {
+    inner: T,
 }
 
-impl<T: Clone> SwitchWatch<T> {
+impl<T> Observer<Switch<T>> where T: Clone {
     pub async fn switched(&self) -> T {
         self.inner.switched().await
     }
@@ -70,7 +66,7 @@ impl<T: Clone> SwitchWatch<T> {
     }
 }
 
-impl<T: Clone> From<Switch<T>> for SwitchWatch<T> {
+impl<T: Clone> From<Switch<T>> for Observer<Switch<T>> {
     fn from(inner: Switch<T>) -> Self {
         Self { inner }
     }

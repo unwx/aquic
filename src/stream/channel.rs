@@ -1,47 +1,45 @@
-use crate::future::state::{Switch, SwitchWatch};
-use std::any::type_name;
+use crate::ApplicationError;
+use crate::future::state::{Observer, Switch};
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, watch};
-use tracing::warn;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum ReadError {
+pub enum RecvError<E> {
+    // TODO(docs):
+    //  Internal Error / Connection close...
+    HangUp,
     Finish,
-    ResetStream(u64),
-    ConnectionClose,
+    ResetStream(E),
+    StreamReader(E),
 }
 
-impl Display for ReadError {
+impl<E: Display> Display for RecvError<E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReadError::Finish => write!(f, "FIN"),
-            ReadError::ResetStream(code) => write!(f, "RESET_STREAM({code})"),
-            ReadError::ConnectionClose => write!(f, "Connection closed"),
+            RecvError::HangUp => write!(f, "Hang up"),
+            RecvError::Finish => write!(f, "FIN"),
+            RecvError::ResetStream(e) => write!(f, "RESET_STREAM({e})"),
+            RecvError::StreamReader(e) => write!(f, "StreamReader({e})"),
         }
     }
 }
 
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum WriteError {
+pub enum SendError<E> {
     HangUp,
-    StopSending(u64),
-    ResetStream(u64),
-    ConnectionClose,
+    StopSending(E),
+    StreamWriter(E),
 }
 
-impl Display for WriteError {
+impl<E: Display> Display for SendError<E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            WriteError::HangUp => write!(f, "Hang up"),
-            WriteError::StopSending(code) => write!(f, "STOP_SENDING({code})"),
-            WriteError::ResetStream(code) => write!(f, "RESET_STREAM({code})"),
-            WriteError::ConnectionClose => write!(f, "Connection closed"),
+            SendError::HangUp => write!(f, "Hang up"),
+            SendError::StopSending(e) => write!(f, "STOP_SENDING({e})"),
+            SendError::StreamWriter(e) => write!(f, "StreamWriter({e})"),
         }
     }
 }
@@ -54,7 +52,7 @@ pub(crate) struct StreamPriority {
 }
 
 impl StreamPriority {
-    pub fn new(urgency: u8, incremental: bool) -> Self {
+    fn new(urgency: u8, incremental: bool) -> Self {
         Self {
             urgency,
             incremental,
@@ -63,133 +61,153 @@ impl StreamPriority {
 }
 
 
-pub(crate) fn channel<T>(
-    buffer: usize,
-    reset_stream_switch: Switch<u64>,
-    connection_state_watch: SwitchWatch<()>,
-    internal_error_code: Option<u64>,
-) -> (StreamSender<T>, StreamReceiver<T>) {
-    let (sender, receiver) = mpsc::channel(buffer);
+pub(crate) fn channel<T, E: ApplicationError>(
+    capacity: usize,
+) -> (StreamSender<T, E>, StreamReceiver<T, E>) {
+    let (sender, receiver) = mpsc::channel(capacity);
     let (priority_sender, priority_receiver) = watch::channel(None);
-    let stop_sending_switch = Switch::new();
+
+    let sender_switch = Switch::new();
+    let receiver_switch = Switch::new();
 
     let stream_sender = StreamSender::new(
         sender,
-        stop_sending_switch.clone(),
-        reset_stream_switch.clone(),
-        connection_state_watch.clone(),
+        receiver_switch.clone(),
+        sender_switch.clone().into(),
         priority_sender,
-        internal_error_code,
     );
     let stream_receiver = StreamReceiver::new(
         receiver,
-        stop_sending_switch.clone(),
-        reset_stream_switch.clone(),
-        connection_state_watch.clone(),
+        sender_switch,
+        receiver_switch.into(),
         priority_receiver,
-        internal_error_code,
     );
 
     (stream_sender, stream_receiver)
 }
 
 
-#[derive(Debug)]
-pub struct StreamSender<T> {
-    sender: Sender<(T, bool)>,
+pub struct StreamSender<T, E: ApplicationError> {
+    sender: Sender<(Option<T>, bool)>,
 
-    stop_sending_switch: Switch<u64>,
-    reset_stream_switch: Switch<u64>,
-    connection_state_watch: SwitchWatch<()>,
-
+    receiver_error_switch: Switch<RecvError<E>>,
+    sender_error_observer: Observer<Switch<SendError<E>>>,
     priority_sender: watch::Sender<Option<StreamPriority>>,
-    internal_error_code: Option<u64>,
-    error: Option<WriteError>,
+
+    error: Option<SendError<E>>,
 }
 
-impl<T> StreamSender<T> {
-    pub(crate) fn new(
-        sender: Sender<(T, bool)>,
-        stop_sending_switch: Switch<u64>,
-        reset_stream_switch: Switch<u64>,
-        connection_state_watch: SwitchWatch<()>,
+impl<T, E: ApplicationError> StreamSender<T, E> {
+    fn new(
+        sender: Sender<(Option<T>, bool)>,
+        receiver_error_switch: Switch<RecvError<E>>,
+        sender_error_observer: Observer<Switch<SendError<E>>>,
         priority_sender: watch::Sender<Option<StreamPriority>>,
-        internal_error_code: Option<u64>,
     ) -> Self {
         Self {
             sender,
-            stop_sending_switch,
-            reset_stream_switch,
-            connection_state_watch,
-            internal_error_code,
+            receiver_error_switch,
+            sender_error_observer,
             priority_sender,
             error: None,
         }
     }
 
 
-    pub async fn send(&mut self, value: T) -> Result<(), WriteError> {
-        self.send_internal(value, false).await
+    pub async fn send(&mut self, value: T) -> Result<(), SendError<E>> {
+        self.send_internal(Some(value), false).await
     }
 
-    pub async fn send_and_finish(mut self, value: T) -> Result<(), WriteError> {
-        self.send_internal(value, true).await
+    pub async fn send_and_finish(mut self, value: T) -> Result<(), SendError<E>> {
+        self.send_and_finish_keep(value).await
     }
 
-    async fn send_internal(
-        &mut self,
-        value: T,
-        no_more_messages_hint: bool,
-    ) -> Result<(), WriteError> {
-        if let Some(error) = self.error {
-            return Err(error);
+    pub async fn finish(mut self) -> Result<(), SendError<E>> {
+        self.finish_keep().await
+    }
+
+    pub async fn send_and_finish_keep(&mut self, value: T) -> Result<(), SendError<E>> {
+        self.send_internal(Some(value), true).await
+    }
+
+    pub async fn finish_keep(&mut self) -> Result<(), SendError<E>> {
+        self.send_internal(None, true).await
+    }
+
+
+    pub fn reset_stream(mut self, code: E) {
+        self.reset_stream_keep(code);
+    }
+
+    pub(crate) fn stream_reader_error(mut self, code: E) {
+        self.stream_reader_error_keep(code);
+    }
+
+    pub fn reset_stream_keep(&mut self, code: E) {
+        if self.error.is_none() {
+            let _ = self
+                .receiver_error_switch
+                .try_switch(RecvError::ResetStream(code));
+        }
+    }
+
+    pub(crate) fn stream_reader_error_keep(&mut self, code: E) {
+        if self.error.is_none() {
+            let _ = self
+                .receiver_error_switch
+                .try_switch(RecvError::StreamReader(code));
+        }
+    }
+
+
+    // TODO(docs): cancel-safe
+    //  Therefore 'send_and_finish_keep()' and 'finish_keep()' cancel-safe.
+    async fn send_internal(&mut self, value: Option<T>, finish: bool) -> Result<(), SendError<E>> {
+        if let Some(e) = self.error {
+            return Err(e);
         }
 
-        enum Action {
-            Send(bool),
-            StopSending(u64),
-            ResetStream(u64),
-            ConnectionClose,
-        }
-
-        let action = select! {
+        select! {
             biased;
 
-            // TODO(performance):
-            //  Too many polls, will moving it to the FuturesUnordered help?
-            a = self.connection_state_watch.switched() => {
-                Action::ConnectionClose
-            }
-            a = self.reset_stream_switch.switched() => {
-                Action::ResetStream(a)
-            }
-            a = self.stop_sending_switch.switched() => {
-                Action::StopSending(a)
-            }
-            a = self.sender.send((value, no_more_messages_hint)) => {
-                Action::Send(a.is_ok())
-            }
-        };
-
-        let error = match action {
-            Action::Send(success) => {
-                if success {
-                    None
-                } else {
-                    Some(WriteError::HangUp)
-                }
-            }
-            Action::StopSending(code) => Some(WriteError::StopSending(code)),
-            Action::ResetStream(code) => Some(WriteError::ResetStream(code)),
-            Action::ConnectionClose => Some(WriteError::ConnectionClose),
-        };
-
-        if let Some(error) = error {
-            self.error = Some(error);
-            Err(error)
-        } else {
-            Ok(())
+            error = self.sender_error_observer.switched() => {
+                Err(error)
+            },
+            result = self.sender.send((value, finish)) => {
+                result
+                    .inspect(|_| {
+                        if finish {
+                            self.error = Some(SendError::HangUp);
+                            // But result itself is 'Ok' right now.
+                        }
+                    })
+                    .map_err(|_| SendError::HangUp)
+                    .inspect_err(|&e| self.error = Some(e))
+            },
         }
+    }
+
+
+    pub fn capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
+    pub fn error(&self) -> Option<SendError<E>> {
+        self.error
+    }
+
+    pub async fn error_waiting(&mut self) -> SendError<E> {
+        if let Some(e) = self.error {
+            return e;
+        }
+
+        self.error = Some(self.sender_error_observer.switched().await);
+        self.error.unwrap()
+    }
+
+    // TODO(visibility): should be public?
+    pub(crate) fn error_observer(&self) -> Observer<Switch<SendError<E>>> {
+        self.sender_error_observer.clone()
     }
 
 
@@ -197,184 +215,115 @@ impl<T> StreamSender<T> {
         self.priority_sender
             .send_replace(Some(StreamPriority::new(urgency, incremental)));
     }
-
-    pub fn finish(self) {
-        drop(self)
-    }
-
-    pub fn reset_stream(self, code: u64) {
-        let _ = self.reset_stream_switch.try_switch(code);
-    }
-
-
-    pub(crate) fn stop_sending_switch(&self) -> Switch<u64> {
-        self.stop_sending_switch.clone()
-    }
-
-    pub(crate) fn reset_stream_switch(&self) -> Switch<u64> {
-        self.reset_stream_switch.clone()
-    }
-
-    pub(crate) fn connection_state_watch(&self) -> SwitchWatch<()> {
-        self.connection_state_watch.clone()
-    }
 }
 
-impl<T> Drop for StreamSender<T> {
+impl<T, E: ApplicationError> Drop for StreamSender<T, E> {
     fn drop(&mut self) {
-        if thread::panicking()
-            && self.error.is_none()
-            && !self.connection_state_watch.is_switched()
-            && !self.stop_sending_switch.is_switched()
-        {
-            if let Some(code) = self.internal_error_code {
-                let _ = self.reset_stream_switch.try_switch(code);
-            }
+        if self.error.is_none() {
+            let _ = self.receiver_error_switch.try_switch(RecvError::HangUp);
         }
     }
 }
 
 
-#[derive(Debug)]
-pub struct StreamReceiver<T> {
-    receiver: Receiver<(T, bool)>,
+pub struct StreamReceiver<T, E: ApplicationError> {
+    receiver: Receiver<(Option<T>, bool)>,
 
-    stop_sending_switch: Switch<u64>,
-    reset_stream_switch: Switch<u64>,
-    connection_state_watch: SwitchWatch<()>,
-
+    sender_error_switch: Switch<SendError<E>>,
+    receiver_error_observer: Observer<Switch<RecvError<E>>>,
     priority_receiver: watch::Receiver<Option<StreamPriority>>,
-    internal_error_code: Option<u64>,
-    error: Option<ReadError>,
+
+    error: Option<RecvError<E>>,
 }
 
-impl<T> StreamReceiver<T> {
-    pub(crate) fn new(
-        receiver: Receiver<(T, bool)>,
-        stop_sending_switch: Switch<u64>,
-        reset_stream_switch: Switch<u64>,
-        connection_state_watch: SwitchWatch<()>,
+impl<T, E: ApplicationError> StreamReceiver<T, E> {
+    fn new(
+        receiver: Receiver<(Option<T>, bool)>,
+        sender_error_switch: Switch<SendError<E>>,
+        receiver_error_observer: Observer<Switch<RecvError<E>>>,
         priority_receiver: watch::Receiver<Option<StreamPriority>>,
-        internal_error_code: Option<u64>,
     ) -> Self {
         Self {
             receiver,
-            stop_sending_switch,
-            reset_stream_switch,
-            connection_state_watch,
-            internal_error_code,
+            sender_error_switch,
+            receiver_error_observer,
             priority_receiver,
             error: None,
         }
     }
 
 
-    pub async fn recv(&mut self) -> Result<T, ReadError> {
-        self.recv_with_hint()
-            .await
-            .map(|(value, _no_more_messages_hint)| value)
+    pub async fn recv(&mut self) -> Result<T, RecvError<E>> {
+        match self.recv_full().await? {
+            (Some(value), _) => Ok(value),
+            (None, true) => Err(RecvError::Finish),
+            (None, false) => {
+                unreachable!("received (None, false) which should never be sent by 'StreamSender'");
+            }
+        }
     }
 
-    pub async fn recv_with_hint(&mut self) -> Result<(T, bool), ReadError> {
-        if let Some(error) = self.error {
-            if error == ReadError::Finish {
-                return Err(error);
-            }
-
-            if self.receiver.sender_strong_count() == 0 && self.receiver.is_empty() {
-                return Err(error);
-            }
+    pub async fn recv_full(&mut self) -> Result<(Option<T>, bool), RecvError<E>> {
+        if let Some(e) = self.error {
+            return Err(e);
         }
 
-        enum Action<T> {
-            Receive(Option<(T, bool)>),
-            ResetStream(u64),
-            ConnectionClose,
-        }
+        let mut result = select! {
+            biased;
 
-        let action = {
-            if self.error.is_some() {
-                Action::Receive(self.receiver.recv().await)
-            } else {
-                select! {
-                    biased;
-
-                    // TODO(performance):
-                    //  Too many polls, will moving it to the FuturesUnordered help?
-                    a = self.connection_state_watch.switched() => {
-                        Action::ConnectionClose
-                    }
-                    a = self.reset_stream_switch.switched() => {
-                        Action::ResetStream(a)
-                    }
-                    a = self.receiver.recv() => {
-                        Action::Receive(a)
-                    }
-                }
-            }
+            error = self.receiver_error_observer.switched() => {
+                Err(error)
+            },
+            result = self.receiver.recv() => {
+                result.ok_or(RecvError::HangUp)
+            },
         };
 
-        let result = match action {
-            Action::Receive(message) => {
-                if let Some(message) = message {
-                    Ok(message)
-                } else {
-                    Err(ReadError::Finish)
-                }
-            }
-            Action::ResetStream(code) => Err(ReadError::ResetStream(code)),
-            Action::ConnectionClose => Err(ReadError::ConnectionClose),
-        };
+        if let Ok((message, finish)) = &result {
+            assert!(
+                message.is_some() || *finish,
+                "received (None, false) which should never be sent by 'StreamSender'"
+            );
 
-        result.map_err(|error| {
-            if let Some(existing_error) = self.error {
-                existing_error
-            } else {
-                self.error = Some(error);
-                error
-            }
-        })
-    }
-
-    pub fn stop_sending(self, code: u64) {
-        let _ = self.stop_sending_switch.try_switch(code);
-    }
-
-
-    pub(crate) fn priority(&self) -> Option<StreamPriority> {
-        self.priority_receiver.borrow().as_ref().copied()
-    }
-
-    pub(crate) fn stop_sending_switch(&self) -> Switch<u64> {
-        self.stop_sending_switch.clone()
-    }
-
-    pub(crate) fn reset_stream_switch(&self) -> Switch<u64> {
-        self.reset_stream_switch.clone()
-    }
-
-    pub(crate) fn connection_state_watch(&self) -> SwitchWatch<()> {
-        self.connection_state_watch.clone()
-    }
-}
-
-impl<T> Drop for StreamReceiver<T> {
-    fn drop(&mut self) {
-        if self.error.is_none()
-            && !self.connection_state_watch.is_switched()
-            && !self.reset_stream_switch.is_switched()
-        {
-            if let Some(default_code) = self.internal_error_code {
-                let _ = self.stop_sending_switch.try_switch(default_code);
-            } else {
-                if !self.stop_sending_switch.is_switched() {
-                    warn!(
-                        "detected 'StreamReceiver<{}>.drop()' without invoking 'stop_sending(code)' first, \
-                        while 'internal_error_code' is None",
-                        type_name::<T>()
-                    )
-                }
+            if message.is_none() && *finish {
+                result = Err(RecvError::Finish);
             }
         }
+
+        if let &Err(e) = &result {
+            self.error = Some(e)
+        }
+
+        result
+    }
+
+
+    pub fn stop_sending(mut self, code: E) {
+        self.stop_sending_keep(code);
+    }
+
+    pub fn stream_writer_error(mut self, code: E) {
+        self.stream_writer_error_keep(code);
+    }
+
+    pub fn stop_sending_keep(&mut self, code: E) {
+        if self.error.is_none() {
+            let _ = self
+                .sender_error_switch
+                .try_switch(SendError::StopSending(code));
+        }
+    }
+
+    pub(crate) fn stream_writer_error_keep(&mut self, code: E) {
+        if self.error.is_none() {
+            let _ = self
+                .sender_error_switch
+                .try_switch(SendError::StreamWriter(code));
+        }
+    }
+
+
+    pub(crate) fn priority_once(&mut self) -> Option<StreamPriority> {
+        self.priority_receiver.borrow_and_update().as_ref().copied()
     }
 }

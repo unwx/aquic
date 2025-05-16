@@ -12,6 +12,12 @@ impl From<Bytes> for BufView {
     }
 }
 
+impl Into<Bytes> for BufView {
+    fn into(self) -> Bytes {
+        self.bytes
+    }
+}
+
 impl AsRef<[u8]> for BufView {
     fn as_ref(&self) -> &[u8] {
         self.bytes.as_ref()
