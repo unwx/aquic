@@ -9,8 +9,8 @@ use quiche::{BufFactory, BufSplit, Connection, Error, Shutdown};
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::task::Poll;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedSender;
@@ -42,6 +42,17 @@ where
     inner: FutureResult<T, E, SR, SW>,
 }
 
+impl<T, E, SR, SW> From<FutureResult<T, E, SR, SW>> for ReadyFuture<T, E, SR, SW>
+where
+    E: ApplicationError,
+    SR: StreamReader<T, E>,
+    SW: StreamWriter<T, E>,
+{
+    fn from(inner: FutureResult<T, E, SR, SW>) -> Self {
+        Self { inner }
+    }
+}
+
 
 pub struct Stream<T, E, SR, SW, BF>
 where
@@ -56,10 +67,18 @@ where
     in_state: Option<InState<T, E, SR>>,
     out_state: Option<OutState<T, E, SW>>,
 
+    // Used only with 'out_state' present or in 'write_pending_bytes_to_wire()'.
+    out_buffer: Arc<Mutex<StreamBuffer>>,
+
     futures: JoinSet<()>,
     in_interrupt_switch: Switch<DirectionError<E>>,
     out_interrupt_switch: Switch<DirectionError<E>>,
-    ready_futures_sender: UnboundedSender<ReadyFuture<T, E, SR, SW>>,
+    ready_futures_sender: UnboundedSender<(u64, ReadyFuture<T, E, SR, SW>)>,
+
+    // TODO(docs): Approximate.
+    //  Buffer may use more than specified here,
+    //  depends on SW result.
+    out_max_buffer_length: usize,
 
     // A single stream cannot be used between different connections,
     // for simplicity quiche::BufFactory is declared here.
@@ -79,7 +98,8 @@ where
         id: u64,
         in_direction: Option<(SR, StreamSender<T, E>)>,
         out_direction: Option<(SW, StreamReceiver<T, E>)>,
-        ready_futures_sender: UnboundedSender<ReadyFuture<T, E, SR, SW>>,
+        ready_futures_sender: UnboundedSender<(u64, ReadyFuture<T, E, SR, SW>)>,
+        out_max_buffer_length: usize,
     ) -> Self {
         assert!(
             in_direction.is_some() || out_direction.is_some(),
@@ -97,13 +117,14 @@ where
             out_state: out_direction.map(|(writer, receiver)| OutState {
                 writer,
                 receiver,
-                buffer: StreamBuffer::new(id),
                 draining: false,
             }),
+            out_buffer: Arc::new(Mutex::new(StreamBuffer::new(id))),
             futures: JoinSet::new(),
             in_interrupt_switch: Switch::new(),
             out_interrupt_switch: Switch::new(),
             ready_futures_sender,
+            out_max_buffer_length,
             _phantom: PhantomData,
         };
 
@@ -117,43 +138,63 @@ where
         stream
     }
 
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
 
     // TODO(docs):
-    //  Returns whether this method should be called when 'connection.stream' become writable again.
+    //  Returns
+    //  1) Whether this method updated the connection.
+    //  2) Whether this method should be called when 'connection.stream' become writable again.
     pub fn write_pending_bytes_to_wire(
         &mut self,
         connection: &mut Connection<BF>,
-    ) -> Result<bool, ()> {
+    ) -> Result<(bool, bool), ()> {
         if !self.open.load(Ordering::SeqCst) {
             self.close_forced();
             return Err(());
         }
-        let Some(state) = &mut self.out_state else {
-            return Ok(false);
+
+        let (drain_result, length) = {
+            let mut buffer = self.lock_out_buffer();
+            (buffer.drain(connection), buffer.length())
         };
+        match drain_result {
+            Ok(drained_something) => {
+                if length < self.out_max_buffer_length {
+                    if let Some(state) = self.out_state.take() {
+                        if state.writer.has_buffer() {
+                            self.spawn_future(self.out_writer_next_future(state));
+                        } else {
+                            self.spawn_future(self.out_receive_future(state));
+                        }
+                    }
+                }
 
-        if let Err(e) = state.buffer.drain(connection) {
-            match e {
-                Error::StreamStopped(code) => {
-                    self.close_out_due_stop_sending(code.into(), None)?;
-                }
-                it => {
-                    error!(
-                        "failed to write outgoing QUIC stream({}) bytes into quiche::Connection: {}",
-                        self.id, it
-                    );
-                    self.close_out_due_internal_error(connection, None)?;
-                }
+                Ok((drained_something, length != 0))
             }
+            Err(e) => {
+                match e {
+                    Error::StreamStopped(code) => {
+                        self.close_out_due_stop_sending(code.into(), None)?;
+                    }
+                    it => {
+                        error!(
+                            "failed to write outgoing QUIC stream({}) bytes into quiche::Connection: {}",
+                            self.id, it
+                        );
+                        self.close_out_due_internal_error(connection, None)?;
+                    }
+                }
 
-            return Ok(false);
+                Ok((true, false))
+            }
         }
-
-        Ok(!state.buffer.is_empty())
     }
 
     // TODO(docs):
-    //  Returns whether this method should be called when 'connection.stream' become readable again.
+    //  Returns whether this method updated the connection.
     pub fn read_pending_bytes_from_wire(
         &mut self,
         connection: &mut Connection<BF>,
@@ -166,6 +207,7 @@ where
             return Ok(false);
         };
 
+        let mut read_something = false;
         loop {
             let buffer = state.reader.buffer();
             assert!(
@@ -178,11 +220,11 @@ where
 
                 Err(Error::Done) => {
                     self.in_state = Some(state);
-                    return Ok(true);
+                    return Ok(read_something);
                 }
                 Err(Error::StreamReset(code)) => {
                     self.close_in_due_reset_stream(code.into(), Some(state))?;
-                    return Ok(false);
+                    return Ok(true);
                 }
                 Err(e) => {
                     error!(
@@ -190,14 +232,16 @@ where
                         self.id, e
                     );
                     self.close_in_due_internal_error(connection, Some(state))?;
-                    return Ok(false);
+                    return Ok(true);
                 }
             };
 
             if read == 0 && !finish {
                 self.in_state = Some(state);
-                return Ok(true);
+                return Ok(read_something);
             }
+
+            read_something = true;
             if finish {
                 state.draining = true;
             }
@@ -216,7 +260,7 @@ where
             if let Some(it) = moved_state {
                 state = it
             } else {
-                return Ok(false);
+                return Ok(read_something);
             }
         }
     }
@@ -581,7 +625,7 @@ where
             }
             (None, true) => {
                 state.draining = true;
-                state.buffer.finish();
+                self.lock_out_buffer().finish();
                 Ok(OutStage::State(state))
             }
             (None, false) => {
@@ -614,7 +658,7 @@ where
             return Ok(OutStage::Future(self.out_writer_next_future(state)));
         }
         if state.draining {
-            state.buffer.finish();
+            self.lock_out_buffer().finish();
         }
 
         // If the state is not 'draining'
@@ -642,16 +686,25 @@ where
             }
         };
 
-        state.buffer.append(bytes);
-        if state.writer.has_buffer() {
-            return Ok(OutStage::Future(self.out_writer_next_future(state)));
-        }
+        let mut buffer = self.lock_out_buffer();
+        buffer.append(bytes);
 
-        if state.draining {
-            state.buffer.finish();
-            Ok(OutStage::Close)
-        } else {
-            Ok(OutStage::State(state))
+        match (state.draining, state.writer.has_buffer()) {
+            (true, false) => {
+                buffer.finish();
+                Ok(OutStage::Close)
+            }
+            (false, false) => {
+                // #[rustfmt::skip]
+                Ok(OutStage::State(state))
+            }
+            (_, true) => {
+                if buffer.length() < self.out_max_buffer_length {
+                    Ok(OutStage::Future(self.out_writer_next_future(state)))
+                } else {
+                    Ok(OutStage::State(state))
+                }
+            }
         }
     }
 
@@ -859,6 +912,7 @@ where
         // TODO(performance):
         //  What's the overhead?
         let open = self.open.clone();
+        let stream_id = self.id;
         let ready_futures_sender = self.ready_futures_sender.clone();
         let in_interrupt_switch = self.in_interrupt_switch.clone();
         let out_interrupt_switch = self.out_interrupt_switch.clone();
@@ -867,7 +921,7 @@ where
             let result = future.await;
 
             if ready_futures_sender
-                .send(ReadyFuture { inner: result })
+                .send((stream_id, result.into()))
                 .is_err()
             {
                 error!("failed to send QUIC stream 'ReadyFuture': channel hang-up");
@@ -1101,6 +1155,13 @@ where
     }
 
 
+    fn lock_out_buffer(&self) -> MutexGuard<'_, StreamBuffer> {
+        // TODO(refactor): close 'out' direction instead?
+        self.out_buffer
+            .lock()
+            .expect("failed to lock outgoing QUIC stream buffer: mutex is poisoned")
+    }
+
     fn shutdown_quiche_stream(
         &self,
         code: E,
@@ -1162,7 +1223,6 @@ where
 {
     writer: SW,
     receiver: StreamReceiver<T, E>,
-    buffer: StreamBuffer,
     draining: bool,
 }
 

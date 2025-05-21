@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 pub struct StreamBuffer {
     stream_id: u64,
     deque: VecDeque<Bytes>,
+    length: usize,
     finish: bool,
 }
 
@@ -14,12 +15,13 @@ impl StreamBuffer {
         Self {
             stream_id,
             deque: VecDeque::new(),
+            length: 0,
             finish: false,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.deque.is_empty()
+    pub fn length(&self) -> usize {
+        self.length
     }
 
     pub fn is_finished(&self) -> bool {
@@ -33,22 +35,19 @@ impl StreamBuffer {
 
     pub fn append(&mut self, bytes: Bytes) -> bool {
         if self.finish {
-            self.deque.push_back(bytes);
+            return false;
         }
 
-        self.finish
+        self.push_back(bytes);
+        true
     }
 
-    pub fn drain<BF>(
-        &mut self,
-        connection: &mut Connection<BF>,
-    ) -> Result<bool, Error>
+    pub fn drain<BF>(&mut self, connection: &mut Connection<BF>) -> Result<bool, Error>
     where
         BF: BufFactory,
         BF::Buf: BufSplit + From<Bytes> + Into<Bytes>,
     {
-        let mut drain_something = false;
-
+        let length = self.length;
         while let Some(bytes) = self.deque.pop_front() {
             match connection.stream_send_zc(
                 self.stream_id,
@@ -57,26 +56,42 @@ impl StreamBuffer {
                 self.finish && self.deque.is_empty(),
             ) {
                 Ok((_, None)) => {
-                    drain_something = true;
                     continue;
                 }
                 Ok((_, Some(bytes_left))) => {
-                    self.deque.push_front(bytes_left.into());
-                    drain_something = true;
+                    self.push_front(bytes_left.into());
                     break;
                 }
 
                 Err(Error::Done) => {
-                    self.deque.push_front(bytes);
+                    self.push_front(bytes);
                     break;
                 }
                 Err(e) => {
-                    self.deque.push_front(bytes);
+                    self.push_front(bytes);
                     return Err(e);
                 }
             }
         }
 
-        Ok(drain_something)
+        Ok(length != self.length)
+    }
+
+
+    fn push_front(&mut self, bytes: Bytes) {
+        self.length += bytes.len();
+        self.deque.push_front(bytes);
+    }
+
+    fn push_back(&mut self, bytes: Bytes) {
+        self.length += bytes.len();
+        self.deque.push_back(bytes);
+    }
+
+    fn pop_front(&mut self) -> Option<Bytes> {
+        self
+            .deque
+            .pop_front()
+            .inspect(|it| self.length -= it.len())
     }
 }
