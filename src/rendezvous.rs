@@ -1,10 +1,8 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let inner = Arc::new(Inner::default());
+    let inner = Arc::new(Inner::new());
     (inner.clone().into(), inner.into())
 }
 
@@ -15,17 +13,27 @@ pub struct Sender<T> {
 
 impl<T> Sender<T> {
     pub async fn send(&mut self, value: T) -> Result<(), T> {
-        self.inner.sender_notify.notified().await;
+        self.inner.recv_ready.notified().await;
+        let mut state = self.inner.state.lock().unwrap();
 
-        if !self.inner.open.load(Acquire) {
-            self.inner.sender_notify.notify_last();
-            return Err(value);
+        // Receiver::recv was cancelled
+        if state.value.is_some() {
+            state.open = false;
+            state.value = None;
         }
 
-        **self.inner.value.lock().unwrap() = Some(value);
-        self.inner.receiver_notify.notify_last();
+        if !state.open {
+            drop(state);
 
-        Ok(())
+            self.inner.recv_ready.notify_last();
+            Err(value)
+        } else {
+            state.value = Some(value);
+            drop(state);
+
+            self.inner.send_done.notify_last();
+            Ok(())
+        }
     }
 }
 
@@ -37,8 +45,13 @@ impl<T> From<Arc<Inner<T>>> for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.open.store(false, Release);
-        self.inner.receiver_notify.notify_last();
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .open = false;
+
+        self.inner.send_done.notify_last();
     }
 }
 
@@ -48,17 +61,26 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    // TODO(docs): not cancel-safe: risk of message loss.
     pub async fn recv(&mut self) -> Option<T> {
-        self.inner.sender_notify.notify_last();
-        self.inner.receiver_notify.notified().await;
+        self.inner.recv_ready.notify_last();
+        self.inner.send_done.notified().await;
 
-        if let Some(value) = self.inner.value.lock().unwrap().take() {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(value) = state.value.take() {
             return Some(value);
         }
 
-        debug_assert!(!self.inner.open.load(Acquire));
-        self.inner.receiver_notify.notify_last();
-        None
+        let open = state.open;
+        drop(state);
+
+        if open {
+            // Panic outside the 'state' mutex, because there is no need to poison it.
+            panic!("there must be a value after 'send_done' notification");
+        } else {
+            self.inner.send_done.notify_last();
+            None
+        }
     }
 }
 
@@ -70,26 +92,43 @@ impl<T> From<Arc<Inner<T>>> for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.inner.open.store(false, Release);
-        self.inner.sender_notify.notify_last();
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+
+            state.open = false;
+            state.value = None;
+        }
+
+        self.inner.recv_ready.notify_last();
     }
 }
 
 
 struct Inner<T> {
-    value: Mutex<Box<Option<T>>>,
-    sender_notify: Notify,
-    receiver_notify: Notify,
-    open: AtomicBool,
+    state: Mutex<State<T>>,
+    recv_ready: Notify,
+    send_done: Notify,
 }
 
-impl<T> Default for Inner<T> {
-    fn default() -> Self {
+impl<T> Inner<T> {
+    pub fn new() -> Self {
         Self {
-            value: Mutex::default(),
-            sender_notify: Notify::default(),
-            receiver_notify: Notify::default(),
-            open: AtomicBool::new(true),
+            state: Mutex::new(State {
+                value: None,
+                open: true,
+            }),
+            recv_ready: Notify::new(),
+            send_done: Notify::new(),
         }
     }
+}
+
+
+struct State<T> {
+    value: Option<T>,
+    open: bool,
 }
