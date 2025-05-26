@@ -4,12 +4,11 @@ use std::fmt::Display;
 use std::hash::Hash;
 
 mod buffer;
-mod future;
-mod rendezvous;
+mod sync;
 mod stream;
 
 pub trait ApplicationError:
-    Send + Copy + Eq + Hash + From<u64> + Into<u64> + Display + 'static
+    Send + Sync + Copy + Eq + Hash + From<u64> + Into<u64> + Display + 'static
 {
     fn internal() -> Self;
 }

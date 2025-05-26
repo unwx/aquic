@@ -1,19 +1,18 @@
 use crate::ApplicationError;
-use crate::future::poll;
-use crate::future::state::{Observer, Switch};
 use crate::stream::buffer::StreamBuffer;
 use crate::stream::channel::{RecvError, SendError, StreamReceiver, StreamSender};
 use crate::stream::mapper::{StreamReader, StreamWriter};
+use crate::sync::{poll, recv_init, send_once};
 use bytes::Bytes;
 use quiche::{BufFactory, BufSplit, Connection, Error, Shutdown};
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LockResult, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use tokio::select;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{error, warn};
 
@@ -53,7 +52,8 @@ where
     }
 }
 
-
+// TODO(refactor): code became too complex.
+//  Split in/out directions to different files?
 pub struct Stream<T, E, SR, SW, BF>
 where
     E: ApplicationError,
@@ -71,9 +71,12 @@ where
     out_buffer: Arc<Mutex<StreamBuffer>>,
 
     futures: JoinSet<()>,
-    in_interrupt_switch: Switch<DirectionError<E>>,
-    out_interrupt_switch: Switch<DirectionError<E>>,
-    ready_futures_sender: UnboundedSender<(u64, ReadyFuture<T, E, SR, SW>)>,
+    ready_futures_sender: mpsc::UnboundedSender<(u64, ReadyFuture<T, E, SR, SW>)>,
+
+    in_interrupt_sender: watch::Sender<Option<DirectionError<E>>>,
+    in_interrupt_receiver: watch::Receiver<Option<DirectionError<E>>>,
+    out_interrupt_sender: watch::Sender<Option<DirectionError<E>>>,
+    out_interrupt_receiver: watch::Receiver<Option<DirectionError<E>>>,
 
     // TODO(docs): Approximate.
     //  Buffer may use more than specified here,
@@ -98,13 +101,16 @@ where
         id: u64,
         in_direction: Option<(SR, StreamSender<T, E>)>,
         out_direction: Option<(SW, StreamReceiver<T, E>)>,
-        ready_futures_sender: UnboundedSender<(u64, ReadyFuture<T, E, SR, SW>)>,
+        ready_futures_sender: mpsc::UnboundedSender<(u64, ReadyFuture<T, E, SR, SW>)>,
         out_max_buffer_length: usize,
     ) -> Self {
         assert!(
             in_direction.is_some() || out_direction.is_some(),
             "at least one direction must be present"
         );
+
+        let (in_interrupt_sender, in_interrupt_receiver) = watch::channel(None);
+        let (out_interrupt_sender, out_interrupt_receiver) = watch::channel(None);
 
         let mut stream = Self {
             id,
@@ -121,15 +127,17 @@ where
             }),
             out_buffer: Arc::new(Mutex::new(StreamBuffer::new(id))),
             futures: JoinSet::new(),
-            in_interrupt_switch: Switch::new(),
-            out_interrupt_switch: Switch::new(),
+            in_interrupt_sender,
+            in_interrupt_receiver,
+            out_interrupt_sender,
+            out_interrupt_receiver,
             ready_futures_sender,
             out_max_buffer_length,
             _phantom: PhantomData,
         };
 
         if let Some(state) = &stream.in_state {
-            stream.spawn_future(stream.in_signal_future(state.sender.error_observer()));
+            stream.spawn_future(stream.in_signal_future(state.sender.error_receiver()));
         }
         if let Some(state) = stream.out_state.take() {
             stream.spawn_future(stream.out_receive_future(state));
@@ -308,7 +316,7 @@ where
 
 
     /*
-     * Handle future result
+     * Handle sync result
      */
 
     fn handle_in_future(
@@ -440,7 +448,7 @@ where
             }
         };
 
-        if self.in_interrupt_switch.try_switch(direction_error).is_ok() {
+        if send_once(&self.in_interrupt_sender, direction_error) {
             if let Some(state) = self.in_state.take() {
                 self.close_in_due_direction_error(direction_error, connection, state)?;
             }
@@ -639,7 +647,7 @@ where
         result: FutureResult<T, E, SR, SW>,
         connection: &mut Connection<BF>,
     ) -> Result<OutStage<T, E, SR, SW>, ()> {
-        let mut state = match result {
+        let state = match result {
             FutureResult::OutWriterWrite { state, result } => {
                 if let Err(code) = result {
                     self.close_out_due_mapper_error(code, connection, Some(state))?;
@@ -672,7 +680,7 @@ where
         result: FutureResult<T, E, SR, SW>,
         connection: &mut Connection<BF>,
     ) -> Result<OutStage<T, E, SR, SW>, ()> {
-        let (mut state, bytes) = match result {
+        let (state, bytes) = match result {
             FutureResult::OutWriterNext { state, result } => match result {
                 Ok(bytes) => (state, bytes),
                 Err(code) => {
@@ -741,24 +749,22 @@ where
 
     /*
      * Futures
-     *
-     * TODO(refactor): write macro to avoid 'observer.switched()' repetition?
      */
 
     fn in_signal_future(
         &self,
-        sender_error_observer: Observer<Switch<SendError<E>>>,
+        mut sender_error_observer: watch::Receiver<Option<SendError<E>>>,
     ) -> StreamFuture<T, E, SR, SW> {
-        let interruption_observer = self.in_interruption_observer();
+        let mut interrupt_receiver = self.in_interrupt_receiver.clone();
         Box::pin(async move {
             select! {
                 biased;
 
-                error = interruption_observer.switched() => {
-                    FutureResult::InSignal(Err(error))
+                error = recv_init(&mut interrupt_receiver) => {
+                    FutureResult::InSignal(Err(error.expect("'interrupt_sender' cannot outlive the future")))
                 },
-                error = sender_error_observer.switched() => {
-                    FutureResult::InSignal(Ok(error))
+                error = recv_init(&mut sender_error_observer) => {
+                    FutureResult::InSignal(Ok(error.expect("'in' message sender cannot outlive the future")))
                 }
             }
         })
@@ -769,13 +775,13 @@ where
         length: usize,
         mut state: InState<T, E, SR>,
     ) -> StreamFuture<T, E, SR, SW> {
-        let observer = self.in_interruption_observer();
+        let mut interrupt_receiver = self.in_interrupt_receiver.clone();
         Box::pin(async move {
             select! {
                 biased;
 
-                error = observer.switched() => {
-                    FutureResult::InInterrupt { state, error }
+                error = recv_init(&mut interrupt_receiver) => {
+                    FutureResult::InInterrupt { state, error: error.unwrap() }
                 },
                 result = state.reader.notify_read(length, state.draining) => {
                     FutureResult::InReaderNotify { state, result }
@@ -785,13 +791,13 @@ where
     }
 
     fn in_reader_next_future(&self, mut state: InState<T, E, SR>) -> StreamFuture<T, E, SR, SW> {
-        let observer = self.in_interruption_observer();
+        let mut interrupt_receiver = self.in_interrupt_receiver.clone();
         Box::pin(async move {
             select! {
                 biased;
 
-                error = observer.switched() => {
-                    FutureResult::InInterrupt { state, error }
+                error = recv_init(&mut interrupt_receiver) => {
+                    FutureResult::InInterrupt { state, error: error.unwrap() }
                 },
                 result = state.reader.next_message() => {
                     FutureResult::InReaderNext { state, result }
@@ -800,12 +806,13 @@ where
         })
     }
 
+    #[rustfmt::skip]
     fn in_send_future(
         &self,
         message: Option<T>,
         mut state: InState<T, E, SR>,
     ) -> StreamFuture<T, E, SR, SW> {
-        let observer = self.in_interruption_observer();
+        let mut interrupt_receiver = self.in_interrupt_receiver.clone();
         let finish_now = state.draining && !state.reader.has_message();
 
         match (message, finish_now) {
@@ -813,8 +820,8 @@ where
                 select! {
                     biased;
 
-                    error = observer.switched() => {
-                        FutureResult::InInterrupt { state, error }
+                    error = recv_init(&mut interrupt_receiver) => {
+                        FutureResult::InInterrupt { state, error: error.unwrap() }
                     },
                     result = state.sender.send(message) => {
                         FutureResult::InSend { state, result }
@@ -825,8 +832,8 @@ where
                 select! {
                     biased;
 
-                    error = observer.switched() => {
-                        FutureResult::InInterrupt { state, error }
+                    error = recv_init(&mut interrupt_receiver) => {
+                        FutureResult::InInterrupt { state, error: error.unwrap() }
                     },
                     result = state.sender.send_and_finish_keep(message) => {
                         FutureResult::InSend { state, result }
@@ -837,8 +844,8 @@ where
                 select! {
                     biased;
 
-                    error = observer.switched() => {
-                        FutureResult::InInterrupt { state, error }
+                    error = recv_init(&mut interrupt_receiver) => {
+                        FutureResult::InInterrupt { state, error: error.unwrap() }
                     },
                     result = state.sender.finish_keep() => {
                         FutureResult::InSend { state, result }
@@ -857,13 +864,13 @@ where
         message: T,
         mut state: OutState<T, E, SW>,
     ) -> StreamFuture<T, E, SR, SW> {
-        let observer = self.out_interruption_observer();
+        let mut interrupt_receiver = self.out_interrupt_receiver.clone();
         Box::pin(async move {
             select! {
                 biased;
 
-                error = observer.switched() => {
-                    FutureResult::OutInterrupt { state, error }
+                error = recv_init(&mut interrupt_receiver) => {
+                    FutureResult::OutInterrupt { state, error: error.unwrap() }
                 },
                 result = state.writer.write(message, state.draining) => {
                     FutureResult::OutWriterWrite { state, result }
@@ -873,13 +880,13 @@ where
     }
 
     fn out_writer_next_future(&self, mut state: OutState<T, E, SW>) -> StreamFuture<T, E, SR, SW> {
-        let observer = self.out_interruption_observer();
+        let mut interrupt_receiver = self.out_interrupt_receiver.clone();
         Box::pin(async move {
             select! {
                 biased;
 
-                error = observer.switched() => {
-                    FutureResult::OutInterrupt { state, error }
+                error = recv_init(&mut interrupt_receiver) => {
+                    FutureResult::OutInterrupt { state, error: error.unwrap() }
                 },
                 result = state.writer.next_buffer() => {
                     FutureResult::OutWriterNext { state, result }
@@ -889,13 +896,13 @@ where
     }
 
     fn out_receive_future(&self, mut state: OutState<T, E, SW>) -> StreamFuture<T, E, SR, SW> {
-        let observer = self.out_interruption_observer();
+        let mut interrupt_receiver = self.out_interrupt_receiver.clone();
         Box::pin(async move {
             select! {
                 biased;
 
-                error = observer.switched() => {
-                    FutureResult::OutInterrupt { state, error }
+                error = recv_init(&mut interrupt_receiver) => {
+                    FutureResult::OutInterrupt { state, error: error.unwrap() }
                 },
                 result = state.receiver.recv_full() => {
                     FutureResult::OutReceive { state, result }
@@ -914,8 +921,8 @@ where
         let open = self.open.clone();
         let stream_id = self.id;
         let ready_futures_sender = self.ready_futures_sender.clone();
-        let in_interrupt_switch = self.in_interrupt_switch.clone();
-        let out_interrupt_switch = self.out_interrupt_switch.clone();
+        let in_interrupt_sender = self.in_interrupt_sender.clone();
+        let out_interrupt_sender = self.out_interrupt_sender.clone();
 
         self.futures.spawn(async move {
             let result = future.await;
@@ -927,8 +934,8 @@ where
                 error!("failed to send QUIC stream 'ReadyFuture': channel hang-up");
                 open.store(false, Ordering::SeqCst);
 
-                let _ = in_interrupt_switch.try_switch(DirectionError::Internal);
-                let _ = out_interrupt_switch.try_switch(DirectionError::Internal);
+                send_once(&in_interrupt_sender, DirectionError::Internal);
+                send_once(&out_interrupt_sender, DirectionError::Internal);
             };
         });
     }
@@ -943,10 +950,7 @@ where
         connection: &mut Connection<BF>,
         state: Option<InState<T, E, SR>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .in_interrupt_switch
-            .try_switch(DirectionError::Internal);
-
+        send_once(&self.in_interrupt_sender, DirectionError::Internal);
         self.shutdown_quiche_stream(E::internal(), Shutdown::Read, connection);
         self.take_in_state(state); // HangUp
         self.close_stream_if_unused()
@@ -960,10 +964,7 @@ where
         connection: &mut Connection<BF>,
         state: Option<InState<T, E, SR>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .in_interrupt_switch
-            .try_switch(DirectionError::StreamMapper(code));
-
+        send_once(&self.in_interrupt_sender, DirectionError::StreamMapper(code));
         self.shutdown_quiche_stream(code, Shutdown::Read, connection);
         self.take_in_state(state).sender.stream_reader_error(code);
         self.close_stream_if_unused()
@@ -975,10 +976,7 @@ where
         code: E,
         state: Option<InState<T, E, SR>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .in_interrupt_switch
-            .try_switch(DirectionError::ResetStream(code));
-
+        send_once(&self.in_interrupt_sender, DirectionError::ResetStream(code));
         self.take_in_state(state).sender.reset_stream(code);
         self.close_stream_if_unused()
     }
@@ -990,10 +988,7 @@ where
         connection: &mut Connection<BF>,
         state: Option<InState<T, E, SR>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .in_interrupt_switch
-            .try_switch(DirectionError::StopSending(code));
-
+        send_once(&self.in_interrupt_sender, DirectionError::StopSending(code));
         self.shutdown_quiche_stream(code, Shutdown::Read, connection);
         self.take_in_state(state);
         self.close_stream_if_unused()
@@ -1038,10 +1033,7 @@ where
         connection: &mut Connection<BF>,
         state: Option<OutState<T, E, SW>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .out_interrupt_switch
-            .try_switch(DirectionError::Internal);
-
+        send_once(&self.out_interrupt_sender, DirectionError::Internal);
         self.shutdown_quiche_stream(E::internal(), Shutdown::Write, connection);
         self.take_out_state(state); // HangUp
         self.close_stream_if_unused()
@@ -1055,10 +1047,7 @@ where
         connection: &mut Connection<BF>,
         state: Option<OutState<T, E, SW>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .out_interrupt_switch
-            .try_switch(DirectionError::StreamMapper(code));
-
+        send_once(&self.out_interrupt_sender, DirectionError::StreamMapper(code));
         self.shutdown_quiche_stream(code, Shutdown::Write, connection);
         self.take_out_state(state).receiver.stream_writer_error(code);
         self.close_stream_if_unused()
@@ -1071,10 +1060,10 @@ where
         connection: &mut Connection<BF>,
         state: Option<OutState<T, E, SW>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .out_interrupt_switch
-            .try_switch(DirectionError::ResetStream(code));
-
+        send_once(
+            &self.out_interrupt_sender,
+            DirectionError::ResetStream(code),
+        );
         self.shutdown_quiche_stream(code, Shutdown::Write, connection);
         self.take_out_state(state);
         self.close_stream_if_unused()
@@ -1086,10 +1075,10 @@ where
         code: E,
         state: Option<OutState<T, E, SW>>,
     ) -> Result<(), ()> {
-        let _ = self
-            .out_interrupt_switch
-            .try_switch(DirectionError::StopSending(code));
-
+        send_once(
+            &self.out_interrupt_sender,
+            DirectionError::StopSending(code),
+        );
         self.take_out_state(state).receiver.stop_sending(code);
         self.close_stream_if_unused()
     }
@@ -1131,8 +1120,8 @@ where
     fn close_stream_if_unused(&mut self) -> Result<(), ()> {
         if self.in_state.is_none()
             && self.out_state.is_none()
-            && self.in_interrupt_switch.is_switched()
-            && self.out_interrupt_switch.is_switched()
+            && self.in_interrupt_receiver.borrow().is_some()
+            && self.out_interrupt_receiver.borrow().is_some()
         {
             self.open.store(false, Ordering::SeqCst);
             Err(())
@@ -1146,12 +1135,8 @@ where
         self.in_state = None;
         self.out_state = None;
 
-        let _ = self
-            .in_interrupt_switch
-            .try_switch(DirectionError::Internal);
-        let _ = self
-            .out_interrupt_switch
-            .try_switch(DirectionError::Internal);
+        send_once(&self.in_interrupt_sender, DirectionError::Internal);
+        send_once(&self.out_interrupt_sender, DirectionError::Internal);
     }
 
 
@@ -1185,19 +1170,6 @@ where
             [stream_id: {}]",
             direction, self.id
         )
-    }
-
-
-    /*
-     * Utils
-     */
-
-    fn in_interruption_observer(&self) -> Observer<Switch<DirectionError<E>>> {
-        self.in_interrupt_switch.clone().into()
-    }
-
-    fn out_interruption_observer(&self) -> Observer<Switch<DirectionError<E>>> {
-        self.out_interrupt_switch.clone().into()
     }
 }
 
