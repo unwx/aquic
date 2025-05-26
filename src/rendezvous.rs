@@ -1,9 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::Notify;
 
+#[rustfmt::skip]
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner::new());
-    (inner.clone().into(), inner.into())
+    let sender = Sender { inner: inner.clone(), };
+    let receiver = Receiver { inner };
+
+    (sender, receiver)
 }
 
 
@@ -12,46 +16,50 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
-    pub async fn send(&mut self, value: T) -> Result<(), T> {
-        self.inner.recv_ready.notified().await;
-        let mut state = self.inner.state.lock().unwrap();
+    // TODO(docs): not cancel-safe.
+    //  Please 'drop()' or 'close()' after a cancellation.
+    pub async fn send(&mut self, value: T) -> bool {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            if !state.open {
+                return false;
+            }
 
-        // Receiver::recv was cancelled
-        if state.value.is_some() {
-            state.open = false;
-            state.value = None;
-        }
+            if state.value.is_some() {
+                Self::close_with_mutex(state, &self.inner.send_done);
+                panic!("rendezvous::send is not cancel-safe: detected an attempt to rewrite sent value");
+            }
 
-        if !state.open {
-            drop(state);
-
-            self.inner.recv_ready.notify_last();
-            Err(value)
-        } else {
             state.value = Some(value);
-            drop(state);
-
-            self.inner.send_done.notify_last();
-            Ok(())
         }
-    }
-}
 
-impl<T> From<Arc<Inner<T>>> for Sender<T> {
-    fn from(inner: Arc<Inner<T>>) -> Self {
-        Self { inner }
+        self.inner.send_done.notify_last();
+        self.inner.recv_done.notified().await;
+
+        self.inner.state.lock().unwrap().delivered
+    }
+
+    pub fn close(&mut self) {
+        Self::close_with_mutex(
+            self.inner
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            &self.inner.send_done,
+        );
+    }
+
+    fn close_with_mutex(mut state: MutexGuard<State<T>>, notify: &Notify) {
+        state.open = false;
+        drop(state);
+
+        notify.notify_last();
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .open = false;
-
-        self.inner.send_done.notify_last();
+        self.close();
     }
 }
 
@@ -61,13 +69,18 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
-    // TODO(docs): not cancel-safe: risk of message loss.
+    // TODO(docs): cancel-safe.
     pub async fn recv(&mut self) -> Option<T> {
-        self.inner.recv_ready.notify_last();
         self.inner.send_done.notified().await;
 
         let mut state = self.inner.state.lock().unwrap();
+        state.delivered = false;
+
         if let Some(value) = state.value.take() {
+            state.delivered = true;
+            drop(state);
+
+            self.inner.recv_done.notify_last();
             return Some(value);
         }
 
@@ -75,23 +88,14 @@ impl<T> Receiver<T> {
         drop(state);
 
         if open {
-            // Panic outside the 'state' mutex, because there is no need to poison it.
             panic!("there must be a value after 'send_done' notification");
         } else {
             self.inner.send_done.notify_last();
             None
         }
     }
-}
 
-impl<T> From<Arc<Inner<T>>> for Receiver<T> {
-    fn from(inner: Arc<Inner<T>>) -> Self {
-        Self { inner }
-    }
-}
-
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
+    pub fn close(&mut self) {
         {
             let mut state = self
                 .inner
@@ -100,18 +104,25 @@ impl<T> Drop for Receiver<T> {
                 .unwrap_or_else(|poison| poison.into_inner());
 
             state.open = false;
+            state.delivered = state.value.is_none();
             state.value = None;
         }
 
-        self.inner.recv_ready.notify_last();
+        self.inner.recv_done.notify_last();
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
 
 struct Inner<T> {
     state: Mutex<State<T>>,
-    recv_ready: Notify,
     send_done: Notify,
+    recv_done: Notify,
 }
 
 impl<T> Inner<T> {
@@ -120,9 +131,10 @@ impl<T> Inner<T> {
             state: Mutex::new(State {
                 value: None,
                 open: true,
+                delivered: false,
             }),
-            recv_ready: Notify::new(),
             send_done: Notify::new(),
+            recv_done: Notify::new(),
         }
     }
 }
@@ -131,4 +143,5 @@ impl<T> Inner<T> {
 struct State<T> {
     value: Option<T>,
     open: bool,
+    delivered: bool,
 }
