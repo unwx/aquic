@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use std::fmt::Display;
 use std::hash::Hash;
 
