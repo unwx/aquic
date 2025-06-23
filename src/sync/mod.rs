@@ -1,18 +1,7 @@
 pub(crate) mod rendezvous;
 
 use std::any::type_name;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
 use tokio::sync::watch;
-
-pub(crate) fn poll<T, F>(future: &mut F) -> Poll<T>
-where
-    F: Future<Output = T> + Unpin,
-{
-    let pin = Pin::new(future);
-    let mut context = Context::from_waker(Waker::noop());
-    pin.poll(&mut context)
-}
 
 pub(crate) fn send_once<T>(sender: &watch::Sender<Option<T>>, value: T) -> bool {
     sender.send_if_modified(|current| {

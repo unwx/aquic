@@ -39,7 +39,9 @@ pub trait StreamReader<T, E> {
 }
 
 pub trait StreamWriter<T, E> {
-    fn write(&mut self, message: T, finish: bool) -> impl Future<Output = Result<(), E>> + Send;
+    // TODO(docs):
+    //  `message` can be `None` if `finish` is 'true'.
+    fn write(&mut self, message: Option<T>, finish: bool) -> impl Future<Output = Result<(), E>> + Send;
 
     fn has_buffer(&self) -> bool;
 

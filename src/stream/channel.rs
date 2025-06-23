@@ -222,7 +222,7 @@ impl<T, E> Drop for StreamSender<T, E> {
 }
 
 
-pub struct StreamReceiver<T, E: ApplicationError> {
+pub struct StreamReceiver<T, E> {
     message_receiver: rendezvous::Receiver<(Option<T>, bool)>,
 
     direction_error_sender: watch::Sender<Option<SendError<E>>>,
@@ -319,5 +319,13 @@ impl<T, E: ApplicationError> StreamReceiver<T, E> {
         debug_assert!(self.error.is_none());
         self.message_receiver.close();
         self.error = Some(error);
+    }
+}
+
+impl<T, E> Drop for StreamReceiver<T, E> {
+    fn drop(&mut self) {
+        if self.error.is_none() {
+            send_once(&self.direction_error_sender, SendError::HangUp);
+        }
     }
 }
