@@ -4,9 +4,9 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.44.1", features = ["macros", "rt", "net", "sync"] }
-quiche = "0.24.1"
+tokio = { version = "1.48.0", features = ["macros", "rt", "net", "sync"] }
+quiche = "0.24.6"
 
-tracing = "0.1.41"
+tracing = "0.1.43"
 futures = "0.3.31"
-bytes = "1.10.1"
+bytes = "1.11.0"
