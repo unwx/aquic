@@ -1,10 +1,10 @@
 use crate::ApplicationError;
 use crate::stream::direction::DirectionError;
-use crate::sync::{recv_init, send_once};
+use crate::sync::oneshot;
 use futures::FutureExt;
 use std::cell::UnsafeCell;
 use tokio::select;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tracing::debug;
 
 pub trait PreparedFuture<S, R> {
@@ -27,13 +27,13 @@ pub enum OrchestrateResult<S, E> {
 pub struct Executor<CF, E> {
     stream_id: u64,
     completed_future_sender: mpsc::UnboundedSender<(u64, CF)>,
-    cancel_sender: watch::Sender<Option<DirectionError<E>>>,
-    cancel_receiver: watch::Receiver<Option<DirectionError<E>>>,
+    cancel_sender: oneshot::Sender<DirectionError<E>>,
+    cancel_receiver: oneshot::Receiver<DirectionError<E>>,
 }
 
 impl<CF, E> Executor<CF, E> {
     pub fn new(stream_id: u64, completed_future_sender: mpsc::UnboundedSender<(u64, CF)>) -> Self {
-        let cancel_channel = watch::channel(None);
+        let cancel_channel = oneshot::channel();
 
         Self {
             stream_id,
@@ -43,11 +43,11 @@ impl<CF, E> Executor<CF, E> {
         }
     }
 
-    pub fn cancel_sender(&self) -> watch::Sender<Option<DirectionError<E>>> {
+    pub fn cancel_sender(&self) -> oneshot::Sender<DirectionError<E>> {
         self.cancel_sender.clone()
     }
 
-    pub fn cancel_receiver(&self) -> watch::Receiver<Option<DirectionError<E>>> {
+    pub fn cancel_receiver(&self) -> oneshot::Receiver<DirectionError<E>> {
         self.cancel_receiver.clone()
     }
 }
@@ -129,9 +129,9 @@ where
         return Some(CF::from(state.into_inner(), Ok(result)));
     }
 
-    let mut executor = executor.clone();
+    let executor = executor.clone();
     tokio::spawn(async move {
-        let result = exec_cancellable(future, &mut executor.cancel_receiver).await;
+        let result = exec_cancellable(future, executor.cancel_receiver.clone()).await;
 
         // `future` is dropped.
         let state = state.into_inner();
@@ -142,7 +142,7 @@ where
             .is_err()
         {
             debug!("detected 'completed_future' channel hang-up");
-            send_once(&executor.cancel_sender, DirectionError::Internal);
+            let _ = executor.cancel_sender.send(DirectionError::Internal);
         };
     });
 
@@ -151,7 +151,7 @@ where
 
 pub async fn exec_cancellable<T, F, E>(
     future: F,
-    cancel_receiver: &mut watch::Receiver<Option<DirectionError<E>>>,
+    cancel_receiver: oneshot::Receiver<DirectionError<E>>,
 ) -> Result<T, DirectionError<E>>
 where
     E: Clone,
@@ -160,7 +160,7 @@ where
     select! {
         biased;
 
-        error = recv_init(cancel_receiver) => {
+        error = cancel_receiver.recv() => {
             Err(error.unwrap_or_else(|| {
                 debug!("detected 'cancel_receiver' channel hang-up");
                 DirectionError::Internal

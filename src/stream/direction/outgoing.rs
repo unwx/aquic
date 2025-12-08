@@ -6,7 +6,6 @@ use crate::stream::channel::{RecvError, StreamReceiver};
 use crate::stream::direction::exec::{Executor, OrchestrateResult, orchestrate_futures};
 use crate::stream::direction::{DirectionError, exec};
 use crate::stream::mapper::StreamWriter;
-use crate::sync::send_once;
 use bytes::Bytes;
 use quiche::Error;
 use tracing::{debug, error};
@@ -256,7 +255,7 @@ where
         stream: &mut WriteStream<BufViewFactory>,
     ) {
         self.open = false;
-        send_once(&self.executor.cancel_sender(), error);
+        let _ = self.executor.cancel_sender().send(error);
 
         match error {
             DirectionError::Finish => {}

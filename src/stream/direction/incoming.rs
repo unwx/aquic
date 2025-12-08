@@ -7,7 +7,6 @@ use crate::stream::direction::exec::{
 };
 use crate::stream::direction::{DirectionError, exec};
 use crate::stream::mapper::StreamReader;
-use crate::sync::{recv_init, send_once};
 use quiche::Error;
 use std::any::type_name;
 use tracing::{debug, error};
@@ -53,17 +52,18 @@ where
         executor: Executor<CompletedFuture<T, SR, E>, E>,
     ) -> Self {
         {
-            let mut sender_error_receiver = stream_sender.error_receiver();
+            let sender_error_receiver = stream_sender.error_receiver();
             let executor = executor.clone();
 
             tokio::spawn(async move {
                 let result = exec_cancellable(
                     async {
-                        recv_init(&mut sender_error_receiver)
+                        sender_error_receiver
+                            .recv()
                             .await
                             .unwrap_or(SendError::HangUp)
                     },
-                    &mut executor.cancel_receiver(),
+                    executor.cancel_receiver().clone(),
                 )
                 .await;
 
@@ -72,7 +72,7 @@ where
                     Err(e) => e,
                 };
 
-                send_once(&executor.cancel_sender(), error);
+                let _ = executor.cancel_sender().send(error);
             });
         }
 
@@ -266,7 +266,7 @@ where
         stream: &mut ReadStream<BufViewFactory>,
     ) {
         self.open = false;
-        send_once(&self.executor.cancel_sender(), error);
+        let _ = self.executor.cancel_sender().send(error);
 
         match error {
             DirectionError::Finish => {}

@@ -1,5 +1,5 @@
 use crate::ApplicationError;
-use crate::sync::{recv_init, rendezvous, send_once};
+use crate::sync::{oneshot, rendezvous};
 use std::fmt::{Display, Formatter};
 use tokio::select;
 use tokio::sync::watch;
@@ -62,8 +62,8 @@ impl StreamPriority {
 
 pub(crate) fn channel<T, E: ApplicationError>() -> (StreamSender<T, E>, StreamReceiver<T, E>) {
     let (message_sender, message_receiver) = rendezvous::channel();
-    let (sender_error_sender, sender_error_receiver) = watch::channel(None);
-    let (receiver_error_sender, receiver_error_receiver) = watch::channel(None);
+    let (sender_error_sender, sender_error_receiver) = oneshot::channel();
+    let (receiver_error_sender, receiver_error_receiver) = oneshot::channel();
     let (priority_sender, priority_receiver) = watch::channel(None);
 
     let stream_sender = StreamSender {
@@ -88,8 +88,8 @@ pub(crate) fn channel<T, E: ApplicationError>() -> (StreamSender<T, E>, StreamRe
 pub struct StreamSender<T, E> {
     message_sender: rendezvous::Sender<(Option<T>, bool)>,
 
-    direction_error_sender: watch::Sender<Option<RecvError<E>>>,
-    direction_error_receiver: watch::Receiver<Option<SendError<E>>>,
+    direction_error_sender: oneshot::Sender<RecvError<E>>,
+    direction_error_receiver: oneshot::Receiver<SendError<E>>,
 
     priority_sender: watch::Sender<Option<StreamPriority>>,
     error: Option<SendError<E>>,
@@ -127,22 +127,18 @@ impl<T, E: ApplicationError> StreamSender<T, E> {
 
     pub fn reset_stream_keep(&mut self, code: E) {
         if self.error.is_none() {
-            send_once(
-                &mut self.direction_error_sender,
-                RecvError::ResetStream(code),
-            );
-
+            let _ = self
+                .direction_error_sender
+                .send(RecvError::ResetStream(code));
             self.close_with_error(SendError::HangUp);
         }
     }
 
     pub(crate) fn stream_reader_error_keep(&mut self, code: E) {
         if self.error.is_none() {
-            send_once(
-                &mut self.direction_error_sender,
-                RecvError::StreamReader(code),
-            );
-
+            let _ = self
+                .direction_error_sender
+                .send(RecvError::StreamReader(code));
             self.close_with_error(SendError::HangUp);
         }
     }
@@ -158,7 +154,7 @@ impl<T, E: ApplicationError> StreamSender<T, E> {
         select! {
             biased;
 
-            maybe_error = recv_init(&mut self.direction_error_receiver) => {
+            maybe_error = self.direction_error_receiver.recv() => {
                 self.close_with_error(maybe_error.unwrap_or(SendError::HangUp));
                 Err(self.error().unwrap())
             },
@@ -189,14 +185,15 @@ impl<T, E: ApplicationError> StreamSender<T, E> {
         }
 
         self.error = Some(
-            recv_init(&mut self.direction_error_receiver)
+            self.direction_error_receiver
+                .recv()
                 .await
                 .unwrap_or(SendError::HangUp),
         );
         self.error.unwrap()
     }
 
-    pub fn error_receiver(&self) -> watch::Receiver<Option<SendError<E>>> {
+    pub fn error_receiver(&self) -> oneshot::Receiver<SendError<E>> {
         self.direction_error_receiver.clone()
     }
 
@@ -216,7 +213,7 @@ impl<T, E: ApplicationError> StreamSender<T, E> {
 impl<T, E> Drop for StreamSender<T, E> {
     fn drop(&mut self) {
         if self.error.is_none() {
-            send_once(&self.direction_error_sender, RecvError::HangUp);
+            let _ = self.direction_error_sender.send(RecvError::HangUp);
         }
     }
 }
@@ -225,8 +222,8 @@ impl<T, E> Drop for StreamSender<T, E> {
 pub struct StreamReceiver<T, E> {
     message_receiver: rendezvous::Receiver<(Option<T>, bool)>,
 
-    direction_error_sender: watch::Sender<Option<SendError<E>>>,
-    direction_error_receiver: watch::Receiver<Option<RecvError<E>>>,
+    direction_error_sender: oneshot::Sender<SendError<E>>,
+    direction_error_receiver: oneshot::Receiver<RecvError<E>>,
 
     priority_receiver: watch::Receiver<Option<StreamPriority>>,
     error: Option<RecvError<E>>,
@@ -252,7 +249,7 @@ impl<T, E: ApplicationError> StreamReceiver<T, E> {
         let mut result = select! {
             biased;
 
-            maybe_error = recv_init(&mut self.direction_error_receiver) => {
+            maybe_error = self.direction_error_receiver.recv() => {
                 self.close_with_error(maybe_error.unwrap_or(RecvError::HangUp));
                 Err(self.error.unwrap())
             },
@@ -290,22 +287,18 @@ impl<T, E: ApplicationError> StreamReceiver<T, E> {
 
     pub fn stop_sending_keep(&mut self, code: E) {
         if self.error.is_none() {
-            send_once(
-                &mut self.direction_error_sender,
-                SendError::StopSending(code),
-            );
-
+            let _ = self
+                .direction_error_sender
+                .send(SendError::StopSending(code));
             self.close_with_error(RecvError::HangUp);
         }
     }
 
     pub(crate) fn stream_writer_error_keep(&mut self, code: E) {
         if self.error.is_none() {
-            send_once(
-                &mut self.direction_error_sender,
-                SendError::StreamWriter(code),
-            );
-
+            let _ = self
+                .direction_error_sender
+                .send(SendError::StreamWriter(code));
             self.close_with_error(RecvError::HangUp);
         }
     }
@@ -325,7 +318,7 @@ impl<T, E: ApplicationError> StreamReceiver<T, E> {
 impl<T, E> Drop for StreamReceiver<T, E> {
     fn drop(&mut self) {
         if self.error.is_none() {
-            send_once(&self.direction_error_sender, SendError::HangUp);
+            let _ = self.direction_error_sender.send(SendError::HangUp);
         }
     }
 }
