@@ -236,9 +236,13 @@ where
         }
     }
 
-    fn handle_mapper_next(result: Result<T, E>) -> StageResult<T, E> {
+    fn handle_mapper_next(result: Result<Option<T>, E>) -> StageResult<T, E> {
         let message = result.map_err(|code| DirectionError::StreamMapper(code))?;
-        Ok(Some(PreparedFuture::SenderSend(Some(message))))
+
+        match message {
+            Some(it) => Ok(Some(PreparedFuture::SenderSend(Some(it)))),
+            None => Ok(None),
+        }
     }
 
     fn handle_sender_send(
@@ -325,7 +329,7 @@ enum PreparedFuture<T> {
 
 enum FutureResult<T, E> {
     MapperNotify(Result<(), E>),
-    MapperNext(Result<T, E>),
+    MapperNext(Result<Option<T>, E>),
     SenderSend(Result<(), SendError<E>>),
 }
 
