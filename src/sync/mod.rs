@@ -1,2 +1,2 @@
-pub(crate) mod oneshot;
-pub(crate) mod rendezvous;
+pub mod oneshot;
+pub mod rendezvous;
