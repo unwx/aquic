@@ -80,20 +80,6 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
-    /// Wait for a message and consume the original,
-    /// automatically closes the channel.
-    ///
-    /// All other receivers won't receive the message.
-    ///
-    /// Returns `None` if no messages were sent and the channel is closed.
-    pub async fn consume(self) -> Option<T> {
-        self.shared.callback.cancelled().await;
-
-        let mut state = self.shared.state.write().unwrap();
-        state.open = false;
-        state.value.take()
-    }
-
     /// Close the channel.
     ///
     /// Keeps the message untouched and ready to collect anytime.
