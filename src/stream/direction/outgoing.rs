@@ -5,27 +5,27 @@ use crate::stream::buffer::StreamBuffer;
 use crate::stream::channel::{RecvError, StreamReceiver};
 use crate::stream::direction::exec::{Executor, OrchestrateResult, orchestrate_futures};
 use crate::stream::direction::{DirectionError, exec};
-use crate::stream::mapper::StreamWriter;
+use crate::stream::codec::StreamEncoder;
 use bytes::Bytes;
 use quiche::Error;
 use tracing::{debug, error};
 
-pub struct CompletedFuture<T, SW, E> {
-    state: State<T, SW, E>,
+pub struct CompletedFuture<T, SE, E> {
+    state: State<T, SE, E>,
     result: Result<FutureResult<T, E>, DirectionError<E>>,
 }
 
-impl<T, SW, E> exec::CompletedFuture<State<T, SW, E>, FutureResult<T, E>, E>
-    for CompletedFuture<T, SW, E>
+impl<T, SE, E> exec::CompletedFuture<State<T, SE, E>, FutureResult<T, E>, E>
+    for CompletedFuture<T, SE, E>
 {
-    fn from(state: State<T, SW, E>, result: Result<FutureResult<T, E>, DirectionError<E>>) -> Self {
+    fn from(state: State<T, SE, E>, result: Result<FutureResult<T, E>, DirectionError<E>>) -> Self {
         Self { state, result }
     }
 
     fn into_tuple(
         self,
     ) -> (
-        State<T, SW, E>,
+        State<T, SE, E>,
         Result<FutureResult<T, E>, DirectionError<E>>,
     ) {
         (self.state, self.result)
@@ -33,26 +33,26 @@ impl<T, SW, E> exec::CompletedFuture<State<T, SW, E>, FutureResult<T, E>, E>
 }
 
 
-pub struct Outgoing<T, SW, E> {
-    state: Option<State<T, SW, E>>,
-    executor: Executor<CompletedFuture<T, SW, E>, E>,
+pub struct Outgoing<T, SE, E> {
+    state: Option<State<T, SE, E>>,
+    executor: Executor<CompletedFuture<T, SE, E>, E>,
     open: bool,
 }
 
-impl<T, SW, E> Outgoing<T, SW, E>
+impl<T, SE, E> Outgoing<T, SE, E>
 where
     T: Send + 'static,
     E: ApplicationError,
-    SW: StreamWriter<T, E> + Send + 'static,
+    SE: StreamEncoder<T, E> + Send + 'static,
 {
     pub fn new(
-        stream_writer: SW,
+        stream_encoder: SE,
         stream_receiver: StreamReceiver<T, E>,
-        executor: Executor<CompletedFuture<T, SW, E>, E>,
+        executor: Executor<CompletedFuture<T, SE, E>, E>,
     ) -> Self {
         Self {
             state: Some(State {
-                mapper: stream_writer,
+                encoder: stream_encoder,
                 receiver: stream_receiver,
                 buffer: StreamBuffer::new(),
                 finish: false,
@@ -124,7 +124,7 @@ where
     //  Err(()): direction is closed.
     pub fn consume_completed_future(
         &mut self,
-        completed_future: CompletedFuture<T, SW, E>,
+        completed_future: CompletedFuture<T, SE, E>,
         stream: &mut WriteStream<BufViewFactory>,
     ) -> Result<bool, ()> {
         debug_assert!(self.state.is_none());
@@ -163,7 +163,7 @@ where
 
     fn handle_future_result(
         result: FutureResult<T, E>,
-        state: &mut State<T, SW, E>,
+        state: &mut State<T, SE, E>,
     ) -> StageResult<T, E> {
         match result {
             FutureResult::ReceiverRecv(result) => Self::handle_receiver_recv(result, state),
@@ -174,7 +174,7 @@ where
 
     fn handle_receiver_recv(
         result: Result<Option<T>, RecvError<E>>,
-        state: &State<T, SW, E>,
+        state: &State<T, SE, E>,
     ) -> StageResult<T, E> {
         let message = match result {
             Ok(it) => it,
@@ -212,16 +212,16 @@ where
 
     fn handle_mapper_write(
         result: Result<(), E>,
-        state: &mut State<T, SW, E>,
+        state: &mut State<T, SE, E>,
     ) -> StageResult<T, E> {
         result.map_err(|code| DirectionError::StreamMapper(code))?;
 
-        if state.finish && !state.mapper.has_buffer() {
+        if state.finish && !state.encoder.has_buffer() {
             state.buffer.finish();
             return Ok(None);
         }
 
-        if state.mapper.has_buffer() {
+        if state.encoder.has_buffer() {
             Ok(Some(PreparedFuture::MapperNext))
         } else {
             Ok(None)
@@ -230,17 +230,17 @@ where
 
     fn handle_mapper_next(
         result: Result<Bytes, E>,
-        state: &mut State<T, SW, E>,
+        state: &mut State<T, SE, E>,
     ) -> StageResult<T, E> {
         let bytes = result.map_err(|code| DirectionError::StreamMapper(code))?;
         state.buffer.append(bytes);
 
-        if state.finish && !state.mapper.has_buffer() {
+        if state.finish && !state.encoder.has_buffer() {
             state.buffer.finish();
             return Ok(None);
         }
 
-        if state.mapper.has_buffer() {
+        if state.encoder.has_buffer() {
             Ok(Some(PreparedFuture::MapperNext))
         } else {
             Ok(None)
@@ -251,7 +251,7 @@ where
     fn close(
         &mut self,
         error: DirectionError<E>,
-        state: State<T, SW, E>,
+        state: State<T, SE, E>,
         stream: &mut WriteStream<BufViewFactory>,
     ) {
         self.open = false;
@@ -286,8 +286,8 @@ where
 
 type StageResult<T, E> = Result<Option<PreparedFuture<T>>, DirectionError<E>>;
 
-struct State<T, SW, E> {
-    mapper: SW,
+struct State<T, SE, E> {
+    encoder: SE,
     receiver: StreamReceiver<T, E>,
     buffer: StreamBuffer,
     finish: bool,
@@ -305,13 +305,13 @@ enum FutureResult<T, E> {
     MapperNext(Result<Bytes, E>),
 }
 
-impl<T, SW, E> exec::PreparedFuture<State<T, SW, E>, FutureResult<T, E>> for PreparedFuture<T>
+impl<T, SE, E> exec::PreparedFuture<State<T, SE, E>, FutureResult<T, E>> for PreparedFuture<T>
 where
     T: Send,
     E: ApplicationError,
-    SW: StreamWriter<T, E> + Send,
+    SE: StreamEncoder<T, E> + Send,
 {
-    async fn run(self, state: &mut State<T, SW, E>) -> FutureResult<T, E> {
+    async fn run(self, state: &mut State<T, SE, E>) -> FutureResult<T, E> {
         match self {
             PreparedFuture::ReceiverRecv => FutureResult::ReceiverRecv(
                 state
@@ -330,11 +330,11 @@ where
             ),
 
             PreparedFuture::MapperWrite(message) => {
-                FutureResult::MapperWrite(state.mapper.write(message, state.finish).await)
+                FutureResult::MapperWrite(state.encoder.write(message, state.finish).await)
             }
 
             PreparedFuture::MapperNext => {
-                FutureResult::MapperNext(state.mapper.next_buffer().await)
+                FutureResult::MapperNext(state.encoder.next_buffer().await)
             }
         }
     }

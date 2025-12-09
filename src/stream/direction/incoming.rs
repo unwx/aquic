@@ -6,27 +6,27 @@ use crate::stream::direction::exec::{
     Executor, OrchestrateResult, exec_cancellable, orchestrate_futures, try_complete_now,
 };
 use crate::stream::direction::{DirectionError, exec};
-use crate::stream::mapper::StreamReader;
+use crate::stream::codec::StreamDecoder;
 use quiche::Error;
 use std::any::type_name;
 use tracing::{debug, error};
 
-pub struct CompletedFuture<T, SR, E> {
-    state: State<T, SR, E>,
+pub struct CompletedFuture<T, SD, E> {
+    state: State<T, SD, E>,
     result: Result<FutureResult<T, E>, DirectionError<E>>,
 }
 
-impl<T, SR, E> exec::CompletedFuture<State<T, SR, E>, FutureResult<T, E>, E>
-    for CompletedFuture<T, SR, E>
+impl<T, SD, E> exec::CompletedFuture<State<T, SD, E>, FutureResult<T, E>, E>
+    for CompletedFuture<T, SD, E>
 {
-    fn from(state: State<T, SR, E>, result: Result<FutureResult<T, E>, DirectionError<E>>) -> Self {
+    fn from(state: State<T, SD, E>, result: Result<FutureResult<T, E>, DirectionError<E>>) -> Self {
         Self { state, result }
     }
 
     fn into_tuple(
         self,
     ) -> (
-        State<T, SR, E>,
+        State<T, SD, E>,
         Result<FutureResult<T, E>, DirectionError<E>>,
     ) {
         (self.state, self.result)
@@ -34,22 +34,22 @@ impl<T, SR, E> exec::CompletedFuture<State<T, SR, E>, FutureResult<T, E>, E>
 }
 
 
-pub struct Incoming<T, SR, E> {
-    state: Option<State<T, SR, E>>,
-    executor: Executor<CompletedFuture<T, SR, E>, E>,
+pub struct Incoming<T, SD, E> {
+    state: Option<State<T, SD, E>>,
+    executor: Executor<CompletedFuture<T, SD, E>, E>,
     open: bool,
 }
 
-impl<T, SR, E> Incoming<T, SR, E>
+impl<T, SD, E> Incoming<T, SD, E>
 where
     T: Send + 'static,
     E: ApplicationError,
-    SR: StreamReader<T, E> + Send + 'static,
+    SD: StreamDecoder<T, E> + Send + 'static,
 {
     pub fn new(
-        stream_reader: SR,
+        stream_decoder: SD,
         stream_sender: StreamSender<T, E>,
-        executor: Executor<CompletedFuture<T, SR, E>, E>,
+        executor: Executor<CompletedFuture<T, SD, E>, E>,
     ) -> Self {
         {
             let sender_error_receiver = stream_sender.error_receiver();
@@ -78,7 +78,7 @@ where
 
         Self {
             state: Some(State {
-                mapper: stream_reader,
+                decoder: stream_decoder,
                 sender: stream_sender,
                 finish: false,
             }),
@@ -111,11 +111,11 @@ where
                 return Err(());
             }
 
-            let buffer = state.mapper.buffer();
+            let buffer = state.decoder.buffer();
             assert!(
                 buffer.len() > 0,
                 "'{}' must not produce empty buffers",
-                type_name::<SR>()
+                type_name::<SD>()
             );
 
             let (read, finish) = match stream.recv(buffer) {
@@ -174,7 +174,7 @@ where
     //  Err(()): direction is closed.
     pub fn consume_completed_future(
         &mut self,
-        completed_future: CompletedFuture<T, SR, E>,
+        completed_future: CompletedFuture<T, SD, E>,
         stream: &mut ReadStream<BufViewFactory>,
     ) -> Result<bool, ()> {
         debug_assert!(self.state.is_none());
@@ -213,7 +213,7 @@ where
 
     fn handle_future_result(
         result: FutureResult<T, E>,
-        state: &mut State<T, SR, E>,
+        state: &mut State<T, SD, E>,
     ) -> StageResult<T, E> {
         match result {
             FutureResult::MapperNotify(result) => Self::handle_mapper_notify(result, state),
@@ -222,10 +222,10 @@ where
         }
     }
 
-    fn handle_mapper_notify(result: Result<(), E>, state: &State<T, SR, E>) -> StageResult<T, E> {
+    fn handle_mapper_notify(result: Result<(), E>, state: &State<T, SD, E>) -> StageResult<T, E> {
         result.map_err(|code| DirectionError::StreamMapper(code))?;
 
-        if state.mapper.has_message() {
+        if state.decoder.has_message() {
             return Ok(Some(PreparedFuture::MapperNext));
         }
 
@@ -247,11 +247,11 @@ where
 
     fn handle_sender_send(
         result: Result<(), SendError<E>>,
-        state: &State<T, SR, E>,
+        state: &State<T, SD, E>,
     ) -> StageResult<T, E> {
         result.map_err(Self::send_to_direction_err)?;
 
-        if state.mapper.has_message() {
+        if state.decoder.has_message() {
             Ok(Some(PreparedFuture::MapperNext))
         } else {
             Ok(None)
@@ -262,7 +262,7 @@ where
     fn close(
         &mut self,
         error: DirectionError<E>,
-        state: State<T, SR, E>,
+        state: State<T, SD, E>,
         stream: &mut ReadStream<BufViewFactory>,
     ) {
         self.open = false;
@@ -315,8 +315,8 @@ where
 
 type StageResult<T, E> = Result<Option<PreparedFuture<T>>, DirectionError<E>>;
 
-struct State<T, SR, E> {
-    mapper: SR,
+struct State<T, SD, E> {
+    decoder: SD,
     sender: StreamSender<T, E>,
     finish: bool,
 }
@@ -333,24 +333,24 @@ enum FutureResult<T, E> {
     SenderSend(Result<(), SendError<E>>),
 }
 
-impl<T, SR, E> exec::PreparedFuture<State<T, SR, E>, FutureResult<T, E>> for PreparedFuture<T>
+impl<T, SD, E> exec::PreparedFuture<State<T, SD, E>, FutureResult<T, E>> for PreparedFuture<T>
 where
     T: Send,
     E: ApplicationError,
-    SR: StreamReader<T, E> + Send,
+    SD: StreamDecoder<T, E> + Send,
 {
-    async fn run(self, state: &mut State<T, SR, E>) -> FutureResult<T, E> {
+    async fn run(self, state: &mut State<T, SD, E>) -> FutureResult<T, E> {
         match self {
             PreparedFuture::MapperNotify(length) => {
-                FutureResult::MapperNotify(state.mapper.notify_read(length, state.finish).await)
+                FutureResult::MapperNotify(state.decoder.notify_read(length, state.finish).await)
             }
 
             PreparedFuture::MapperNext => {
-                FutureResult::MapperNext(state.mapper.next_message().await)
+                FutureResult::MapperNext(state.decoder.next_message().await)
             }
 
             PreparedFuture::SenderSend(message) => {
-                let finish = state.finish && !state.mapper.has_message();
+                let finish = state.finish && !state.decoder.has_message();
 
                 let result = match (message, finish) {
                     (Some(message), false) => state.sender.send(message).await,

@@ -2,7 +2,7 @@ use crate::stream::StreamType::{ClientBidi, ClientUni, ServerBidi, ServerUni};
 use quiche::{BufFactory, BufSplit, Connection, Shutdown};
 
 pub mod channel;
-pub mod mapper;
+pub mod codec;
 
 
 mod buffer;
