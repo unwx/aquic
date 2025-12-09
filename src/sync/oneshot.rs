@@ -91,7 +91,11 @@ impl<T> Receiver<T> {
 impl<T: Clone> Receiver<T> {
     /// Wait for a message and get its clone.
     ///
-    /// Returns `None` if no messages were sent and the channel is closed.
+    /// Returns `None` if the channel is closed and no message is available.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel safe.
     pub async fn recv(&self) -> Option<T> {
         self.shared.callback.cancelled().await;
         self.shared.state.read().unwrap().value.clone()
