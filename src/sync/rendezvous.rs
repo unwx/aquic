@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 //noinspection DuplicatedCode
-/// Creates a new synchronous (rendezvous) channel.
+/// Creates a new synchronous, `SPSC` rendezvous channel.
 ///
 /// # What is a Rendezvous Channel?
 ///
@@ -48,7 +48,8 @@ impl<T> Sender<T> {
     ///
     /// # Cancel Safety
     ///
-    /// Canceling this future breaks the strict rendezvous guarantee.
+    /// Canceling this future breaks the strict rendezvous guarantee,
+    /// but will not lose the message.
     ///
     /// If this method is canceled while waiting for the receiver, the message remains
     /// in the queue. Consequently, subsequent calls to [`Sender::send()`] may complete
