@@ -1,28 +1,28 @@
 use bytes::Bytes;
 
 
-/// A factory for creating new instances of [`StreamDecoder`].
-pub trait StreamDecoderFactory<T, E, SD>
+/// A factory for creating new instances of [`Decoder`].
+pub trait DecoderFactory<T, E, SD>
 where
-    SD: StreamDecoder<T, E>,
+    SD: Decoder<T, E>,
 {
-    /// Creates a new [`StreamDecoder`].
+    /// Creates a new [`Decoder`].
     fn new_decoder(&self) -> SD;
 }
 
-/// A factory for creating new instances of [`StreamEncoder`].
-pub trait StreamEncoderFactory<T, E, SE>
+/// A factory for creating new instances of [`Encoder`].
+pub trait EncoderFactory<T, E, SE>
 where
-    SE: StreamEncoder<T, E>,
+    SE: Encoder<T, E>,
 {
-    /// Creates a new [`StreamEncoder`].
+    /// Creates a new [`Encoder`].
     fn new_encoder(&self) -> SE;
 }
 
 
 /// A QUIC connection consists of multiple streams where data flows.
 ///
-/// [`StreamDecoder`] is a stateful object responsible for a single incoming QUIC stream.
+/// [`Decoder`] is a stateful object responsible for a single incoming QUIC stream.
 /// Its primary goal is to decode the raw byte stream into meaningful messages of type [`T`].
 ///
 /// # Non-blocking implementation
@@ -32,7 +32,7 @@ where
 /// expensive I/O operations).
 ///
 /// The library is optimized for both blocking and non-blocking implementations.
-pub trait StreamDecoder<T, E> {
+pub trait Decoder<T, E> {
     /// Returns a buffer to store incoming raw data.
     ///
     /// The buffer may be uninitialized (e.g., not filled with zeros).
@@ -41,7 +41,7 @@ pub trait StreamDecoder<T, E> {
     /// - The returned slice is **never empty**.
     fn buffer(&mut self) -> &mut [u8];
 
-    /// Notifies the decoder that data was written into [`StreamDecoder::buffer()`].
+    /// Notifies the decoder that data was written into [`Decoder::buffer()`].
     ///
     /// If an error occurs, `Err(E)` should be returned, which will be delivered to the peer.
     ///
@@ -56,20 +56,20 @@ pub trait StreamDecoder<T, E> {
     ///
     /// This method is **not required** to be cancel-safe.
     ///
-    /// If the future is dropped before completion, the [`StreamDecoder`] may be left
+    /// If the future is dropped before completion, the [`Decoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`StreamDecoder`] will not be used again after cancellation.
+    /// [`Decoder`] will not be used again after cancellation.
     fn notify_read(
         &mut self,
         length: usize,
         finish: bool,
     ) -> impl Future<Output = Result<(), E>> + Send;
 
-    /// Returns `true` if the [`StreamDecoder`] has a message available
-    /// and is ready to yield it via [`StreamDecoder::next_message()`].
+    /// Returns `true` if the [`Decoder`] has a message available
+    /// and is ready to yield it via [`Decoder::next_message()`].
     fn has_message(&self) -> bool;
 
-    /// Returns the next mapped message, or `None` if [`StreamDecoder::has_message`] is false.
+    /// Returns the next mapped message, or `None` if [`Decoder::has_message`] is false.
     ///
     /// A specific message will not be returned twice (unless it was explicitly received twice).
     ///
@@ -77,13 +77,13 @@ pub trait StreamDecoder<T, E> {
     ///
     /// This method is **not required** to be cancel-safe.
     ///
-    /// If the future is dropped before completion, the [`StreamDecoder`] may be left
+    /// If the future is dropped before completion, the [`Decoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`StreamDecoder`] will not be used again after cancellation.
+    /// [`Decoder`] will not be used again after cancellation.
     fn next_message(&mut self) -> impl Future<Output = Result<Option<T>, E>> + Send;
 }
 
-/// [`StreamEncoder`] is a stateful object responsible for a single outgoing QUIC stream.
+/// [`Encoder`] is a stateful object responsible for a single outgoing QUIC stream.
 /// Its primary goal is to encode meaningful messages of type [`T`] into a raw byte stream.
 ///
 /// # Non-blocking implementation
@@ -93,7 +93,7 @@ pub trait StreamDecoder<T, E> {
 /// expensive I/O operations or serialization).
 ///
 /// The library is optimized for both blocking and non-blocking implementations.
-pub trait StreamEncoder<T, E> {
+pub trait Encoder<T, E> {
     /// Queues a message to be written to the stream.
     ///
     /// # Arguments
@@ -105,28 +105,28 @@ pub trait StreamEncoder<T, E> {
     ///
     /// This method is **not required** to be cancel-safe.
     ///
-    /// If the future is dropped before completion, the [`StreamEncoder`] may be left
+    /// If the future is dropped before completion, the [`Encoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`StreamEncoder`] will not be used again after cancellation.
+    /// [`Encoder`] will not be used again after cancellation.
     fn write(
         &mut self,
         message: Option<T>,
         finish: bool,
     ) -> impl Future<Output = Result<(), E>> + Send;
 
-    /// Returns `true` if the [`StreamEncoder`] has raw data available
-    /// and is ready to yield it via [`StreamEncoder::next_buffer()`].
+    /// Returns `true` if the [`Encoder`] has raw data available
+    /// and is ready to yield it via [`Encoder::next_buffer()`].
     fn has_buffer(&self) -> bool;
 
     /// Returns the next chunk of raw bytes to be sent to the peer,
-    /// or [`Bytes::new`] if [`StreamEncoder::has_buffer`] is `false`.
+    /// or [`Bytes::new`] if [`Encoder::has_buffer`] is `false`.
     ///
     /// # Cancel Safety
     ///
     /// This method is **not required** to be cancel-safe.
     ///
-    /// If the future is dropped before completion, the [`StreamEncoder`] may be left
+    /// If the future is dropped before completion, the [`Encoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`StreamEncoder`] will not be used again after cancellation.
+    /// [`Encoder`] will not be used again after cancellation.
     fn next_buffer(&mut self) -> impl Future<Output = Result<Bytes, E>> + Send;
 }

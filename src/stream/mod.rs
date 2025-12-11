@@ -7,6 +7,7 @@ mod direction;
 mod sync;
 
 pub use sync::*;
+pub use codec::*;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum StreamType {

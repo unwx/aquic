@@ -1,10 +1,9 @@
 use crate::ApplicationError;
 use crate::buffer::BufViewFactory;
-use crate::stream::{Outcome, Receiver, WriteStream};
+use crate::stream::{Encoder, Outcome, Receiver, WriteStream};
 use crate::stream::buffer::StreamBuffer;
 use crate::stream::direction::exec::{Executor, OrchestrateResult, orchestrate_futures};
 use crate::stream::direction::{DirectionError, exec};
-use crate::stream::codec::StreamEncoder;
 use bytes::Bytes;
 use quiche::Error;
 use tracing::{debug, error};
@@ -42,7 +41,7 @@ impl<T, SE, E> Outgoing<T, SE, E>
 where
     T: Send + 'static,
     E: ApplicationError,
-    SE: StreamEncoder<T, E> + Send + 'static,
+    SE: Encoder<T, E> + Send + 'static,
 {
     pub fn new(
         stream_encoder: SE,
@@ -292,7 +291,7 @@ impl<T, SE, E> exec::PreparedFuture<State<T, SE, E>, FutureResult<T, E>> for Pre
 where
     T: Send,
     E: ApplicationError,
-    SE: StreamEncoder<T, E> + Send,
+    SE: Encoder<T, E> + Send,
 {
     async fn run(self, state: &mut State<T, SE, E>) -> FutureResult<T, E> {
         match self {
