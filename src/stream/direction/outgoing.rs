@@ -1,8 +1,7 @@
 use crate::ApplicationError;
 use crate::buffer::BufViewFactory;
-use crate::stream::WriteStream;
+use crate::stream::{Outcome, Receiver, WriteStream};
 use crate::stream::buffer::StreamBuffer;
-use crate::stream::channel::{RecvError, StreamReceiver};
 use crate::stream::direction::exec::{Executor, OrchestrateResult, orchestrate_futures};
 use crate::stream::direction::{DirectionError, exec};
 use crate::stream::codec::StreamEncoder;
@@ -47,7 +46,7 @@ where
 {
     pub fn new(
         stream_encoder: SE,
-        stream_receiver: StreamReceiver<T, E>,
+        stream_receiver: Receiver<T, E>,
         executor: Executor<CompletedFuture<T, SE, E>, E>,
     ) -> Self {
         Self {
@@ -173,32 +172,16 @@ where
     }
 
     fn handle_receiver_recv(
-        result: Result<Option<T>, RecvError<E>>,
+        result: Result<Option<T>, Outcome<E>>,
         state: &State<T, SE, E>,
     ) -> StageResult<T, E> {
         let message = match result {
             Ok(it) => it,
-            Err(RecvError::Finish) => None,
+            Err(Outcome::Finish) => None,
 
             Err(e) => {
                 #[rustfmt::skip]
-                let error = match e {
-                    RecvError::HangUp => {
-                        debug!("detected outgoing QUIC stream inter-thread channel hang-up");
-                        DirectionError::Internal
-                    }
-                    RecvError::ResetStream(code) => {
-                        DirectionError::ResetStream(code)
-                    }
-
-                    RecvError::StreamReader(_) => {
-                        unreachable!("this library only produces 'StreamReader' error");
-                    }
-                    RecvError::Finish => {
-                        unreachable!("handled above");
-                    }
-                };
-
+                let error = todo!();
                 return Err(error);
             }
         };
@@ -266,7 +249,7 @@ where
 
             // wire >>> STOP_SENDING(code) >>> our application
             DirectionError::StopSending(code) => {
-                state.receiver.stop_sending(code);
+                state.receiver.terminate(code);
             }
 
             // wire <<< RESET_STREAM(code) <<< our application
@@ -276,7 +259,7 @@ where
 
             // StreamWriter error <<< message <<< our application
             DirectionError::StreamMapper(code) => {
-                state.receiver.stream_writer_error(code);
+                state.receiver.terminate_codec(code);
                 let _ = stream.shutdown(code);
             }
         }
@@ -288,7 +271,7 @@ type StageResult<T, E> = Result<Option<PreparedFuture<T>>, DirectionError<E>>;
 
 struct State<T, SE, E> {
     encoder: SE,
-    receiver: StreamReceiver<T, E>,
+    receiver: Receiver<T, E>,
     buffer: StreamBuffer,
     finish: bool,
 }
@@ -300,7 +283,7 @@ enum PreparedFuture<T> {
 }
 
 enum FutureResult<T, E> {
-    ReceiverRecv(Result<Option<T>, RecvError<E>>),
+    ReceiverRecv(Result<Option<T>, Outcome<E>>),
     MapperWrite(Result<(), E>),
     MapperNext(Result<Bytes, E>),
 }
@@ -316,14 +299,14 @@ where
             PreparedFuture::ReceiverRecv => FutureResult::ReceiverRecv(
                 state
                     .receiver
-                    .recv_full()
+                    .recv()
                     .await
-                    .map(|(message, finish)| {
-                        state.finish = state.finish || finish;
-                        message
+                    .map(|item| {
+                        state.finish = state.finish || item.is_finish();
+                        item.into_inner()
                     })
-                    .inspect_err(|&e| {
-                        if e == RecvError::Finish {
+                    .inspect_err(|e| {
+                        if matches!(e, Outcome::Finish) {
                             state.finish = true;
                         }
                     }),

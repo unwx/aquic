@@ -1,7 +1,6 @@
 use crate::ApplicationError;
 use crate::buffer::BufViewFactory;
-use crate::stream::ReadStream;
-use crate::stream::channel::{SendError, StreamSender};
+use crate::stream::{Outcome, ReadStream, Sender};
 use crate::stream::direction::exec::{
     Executor, OrchestrateResult, exec_cancellable, orchestrate_futures, try_complete_now,
 };
@@ -9,6 +8,7 @@ use crate::stream::direction::{DirectionError, exec};
 use crate::stream::codec::StreamDecoder;
 use quiche::Error;
 use std::any::type_name;
+use std::borrow::Cow;
 use tracing::{debug, error};
 
 pub struct CompletedFuture<T, SD, E> {
@@ -48,11 +48,11 @@ where
 {
     pub fn new(
         stream_decoder: SD,
-        stream_sender: StreamSender<T, E>,
+        stream_sender: Sender<T, E>,
         executor: Executor<CompletedFuture<T, SD, E>, E>,
     ) -> Self {
         {
-            let sender_error_receiver = stream_sender.error_receiver();
+            let sender_error_receiver = stream_sender.outcome_receiver();
             let executor = executor.clone();
 
             tokio::spawn(async move {
@@ -61,7 +61,7 @@ where
                         sender_error_receiver
                             .recv()
                             .await
-                            .unwrap_or(SendError::HangUp)
+                            .unwrap_or(Outcome::HangUp(Cow::Borrowed("StreamSender became unavailable")))
                     },
                     executor.cancel_receiver().clone(),
                 )
@@ -246,7 +246,7 @@ where
     }
 
     fn handle_sender_send(
-        result: Result<(), SendError<E>>,
+        result: Result<(), Outcome<E>>,
         state: &State<T, SD, E>,
     ) -> StageResult<T, E> {
         result.map_err(Self::send_to_direction_err)?;
@@ -282,33 +282,20 @@ where
 
             // wire >>> RESET_STREAM(code) >>> our application
             DirectionError::ResetStream(code) => {
-                state.sender.reset_stream(code);
+                state.sender.terminate(code);
             }
 
             // wire >>> bytes >>> our application >>> StreamReader error
             DirectionError::StreamMapper(code) => {
-                state.sender.stream_reader_error(code);
+                state.sender.terminate_codec(code);
                 let _ = stream.shutdown(code);
             }
         }
     }
 
     #[rustfmt::skip]
-    fn send_to_direction_err(error: SendError<E>) -> DirectionError<E> {
-        match error {
-            SendError::HangUp => {
-                // TODO(troubleshooting): provide a `stream_id` for logs?
-                //  Is it possible to trace every log with the `stream_id`?
-                debug!("detected incoming QUIC stream inter-thread channel hang-up");
-                DirectionError::Internal
-            }
-            SendError::StopSending(code) => {
-                DirectionError::StopSending(code)
-            }
-            SendError::StreamWriter(_) => {
-                unreachable!("this library only produces 'StreamWriter' error");
-            }
-        }
+    fn send_to_direction_err(error: Outcome<E>) -> DirectionError<E> {
+        todo!()
     }
 }
 
@@ -317,7 +304,7 @@ type StageResult<T, E> = Result<Option<PreparedFuture<T>>, DirectionError<E>>;
 
 struct State<T, SD, E> {
     decoder: SD,
-    sender: StreamSender<T, E>,
+    sender: Sender<T, E>,
     finish: bool,
 }
 
@@ -330,7 +317,7 @@ enum PreparedFuture<T> {
 enum FutureResult<T, E> {
     MapperNotify(Result<(), E>),
     MapperNext(Result<Option<T>, E>),
-    SenderSend(Result<(), SendError<E>>),
+    SenderSend(Result<(), Outcome<E>>),
 }
 
 impl<T, SD, E> exec::PreparedFuture<State<T, SD, E>, FutureResult<T, E>> for PreparedFuture<T>
@@ -354,8 +341,8 @@ where
 
                 let result = match (message, finish) {
                     (Some(message), false) => state.sender.send(message).await,
-                    (Some(message), true) => state.sender.send_and_finish_keep(message).await,
-                    (None, true) => state.sender.finish_keep().await,
+                    (Some(message), true) => todo!(),
+                    (None, true) => todo!(),
                     (None, false) => panic!("cannot send (message:None, finish:false)"),
                 };
 
