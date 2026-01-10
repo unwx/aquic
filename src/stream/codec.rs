@@ -1,29 +1,30 @@
-use bytes::Bytes;
-
+use crate::executor::SendIfRt;
+use crate::stream::Payload;
+use bytes::{Bytes, BytesMut};
+use std::future::Future;
 
 /// A factory for creating new instances of [`Decoder`].
-pub trait DecoderFactory<T, E, SD>
-where
-    SD: Decoder<T, E>,
-{
-    /// Creates a new [`Decoder`].
-    fn new_decoder(&self) -> SD;
+pub trait DecoderFactory {
+    /// The concrete [`Decoder`] implementation created by this factory.
+    type Decoder: Decoder;
+
+    /// Creates a new [`Decoder`] instance.
+    fn new_decoder() -> Self::Decoder;
 }
 
 /// A factory for creating new instances of [`Encoder`].
-pub trait EncoderFactory<T, E, SE>
-where
-    SE: Encoder<T, E>,
-{
-    /// Creates a new [`Encoder`].
-    fn new_encoder(&self) -> SE;
-}
+pub trait EncoderFactory {
+    /// The concrete [`Encoder`] implementation created by this factory.
+    type Encoder: Encoder;
 
+    /// Creates a new [`Encoder`] instance.
+    fn new_encoder() -> Self::Encoder;
+}
 
 /// A QUIC connection consists of multiple streams where data flows.
 ///
 /// [`Decoder`] is a stateful object responsible for a single incoming QUIC stream.
-/// Its primary goal is to decode the raw byte stream into meaningful messages of type [`T`].
+/// Its primary goal is to decode the raw byte stream into meaningful entities of type [`Self::Item`].
 ///
 /// # Non-blocking implementation
 ///
@@ -32,25 +33,34 @@ where
 /// expensive I/O operations).
 ///
 /// The library is optimized for both blocking and non-blocking implementations.
-pub trait Decoder<T, E> {
-    /// Returns a buffer to store incoming raw data.
-    ///
-    /// The buffer may be uninitialized (e.g., not filled with zeros).
-    ///
-    /// - Only one buffer may exist at a time.
-    /// - The returned slice is **never empty**.
-    fn buffer(&mut self) -> &mut [u8];
+pub trait Decoder {
+    /// The type of the decoded entity.
+    type Item: SendIfRt + 'static;
 
-    /// Notifies the decoder that data was written into [`Decoder::buffer()`].
+    /// The type of error in case of decoding failures.
     ///
-    /// If an error occurs, `Err(E)` should be returned, which will be delivered to the peer.
+    /// Clones should be cheap.
+    type Error: std::error::Error + Clone + Send + Sync + 'static;
+
+    /// Returns a mutable buffer to store incoming raw data.
+    ///
+    /// It is guaranteed to not store more than [BytesMut::len] bytes.
+    ///
+    /// Must be not empty.
+    fn buffer(&mut self) -> BytesMut;
+
+    /// Notifies the decoder that data was written into the buffer returned by [`Decoder::buffer()`].
     ///
     /// # Arguments
     ///
-    /// - `length`: The number of bytes written.
+    /// - `buffer` The buffer that was previously returned by [`Decoder::buffer`].
+    /// - `length`: The number of bytes actually written to the buffer.
     /// - `finish`: If `true`, indicates the successful end of the stream; no further data will arrive.
     ///
-    /// `length` is never `0`, unless `finish` is `true`.
+    /// # Panics
+    ///
+    /// Implementations may panic if
+    /// `length` exceeds the size of the slice previously returned by [`buffer()`](Self::buffer).
     ///
     /// # Cancel Safety
     ///
@@ -61,17 +71,14 @@ pub trait Decoder<T, E> {
     /// [`Decoder`] will not be used again after cancellation.
     fn notify_read(
         &mut self,
+        buffer: BytesMut,
         length: usize,
         finish: bool,
-    ) -> impl Future<Output = Result<(), E>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Error>> + SendIfRt;
 
-    /// Returns `true` if the [`Decoder`] has a message available
-    /// and is ready to yield it via [`Decoder::next_message()`].
-    fn has_message(&self) -> bool;
-
-    /// Returns the next mapped message, or `None` if [`Decoder::has_message`] is false.
+    /// Returns the next decoded item, or `None` if there is no item available.
     ///
-    /// A specific message will not be returned twice (unless it was explicitly received twice).
+    /// A specific item will not be returned twice (unless it was explicitly received twice).
     ///
     /// # Cancel Safety
     ///
@@ -80,11 +87,13 @@ pub trait Decoder<T, E> {
     /// If the future is dropped before completion, the [`Decoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
     /// [`Decoder`] will not be used again after cancellation.
-    fn next_message(&mut self) -> impl Future<Output = Result<Option<T>, E>> + Send;
+    fn next_item(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<Self::Item>, Self::Error>> + SendIfRt;
 }
 
 /// [`Encoder`] is a stateful object responsible for a single outgoing QUIC stream.
-/// Its primary goal is to encode meaningful messages of type [`T`] into a raw byte stream.
+/// Its primary goal is to encode meaningful entities of type [`Self::Item`] into a raw byte stream.
 ///
 /// # Non-blocking implementation
 ///
@@ -93,13 +102,16 @@ pub trait Decoder<T, E> {
 /// expensive I/O operations or serialization).
 ///
 /// The library is optimized for both blocking and non-blocking implementations.
-pub trait Encoder<T, E> {
-    /// Queues a message to be written to the stream.
+pub trait Encoder {
+    /// The type of the entity to be encoded.
+    type Item: SendIfRt + 'static;
+
+    /// The type of error in case of encoding failures.
     ///
-    /// # Arguments
-    ///
-    /// - `message`: The message to write. This can be `None` **only if** `finish` is `true`.
-    /// - `finish`: If `true`, indicates the successful end of the stream; no further messages will be sent.
+    /// Clones should be cheap.
+    type Error: std::error::Error + Clone + Send + Sync + 'static;
+
+    /// Queues an item to be written to the stream.
     ///
     /// # Cancel Safety
     ///
@@ -110,16 +122,11 @@ pub trait Encoder<T, E> {
     /// [`Encoder`] will not be used again after cancellation.
     fn write(
         &mut self,
-        message: Option<T>,
-        finish: bool,
-    ) -> impl Future<Output = Result<(), E>> + Send;
-
-    /// Returns `true` if the [`Encoder`] has raw data available
-    /// and is ready to yield it via [`Encoder::next_buffer()`].
-    fn has_buffer(&self) -> bool;
+        payload: Payload<Self::Item>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + SendIfRt;
 
     /// Returns the next chunk of raw bytes to be sent to the peer,
-    /// or [`Bytes::new`] if [`Encoder::has_buffer`] is `false`.
+    /// or empty if there is nothing to send.
     ///
     /// # Cancel Safety
     ///
@@ -128,5 +135,5 @@ pub trait Encoder<T, E> {
     /// If the future is dropped before completion, the [`Encoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
     /// [`Encoder`] will not be used again after cancellation.
-    fn next_buffer(&mut self) -> impl Future<Output = Result<Bytes, E>> + Send;
+    fn next_buffer(&mut self) -> impl Future<Output = Result<Bytes, Self::Error>> + SendIfRt;
 }

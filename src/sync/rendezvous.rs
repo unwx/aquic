@@ -43,8 +43,8 @@ pub struct Sender<T> {
 impl<T> Sender<T> {
     /// Sends a message and waits until it is received.
     ///
-    /// Returns `true` if the message was delivered successfully, or `false`
-    /// if the channel is closed.
+    /// Returns `Ok` if the message was delivered successfully, or `Err`
+    /// with the original message inside if the channel is closed.
     ///
     /// # Cancel Safety
     ///
@@ -55,22 +55,20 @@ impl<T> Sender<T> {
     /// in the queue. Consequently, subsequent calls to [`Sender::send()`] may complete
     /// immediately (behaving like a buffered channel) until the [`Receiver`] drains
     /// the backlog.
-    pub async fn send(&mut self, value: T) -> bool {
+    pub async fn send(&mut self, value: T) -> Result<(), T> {
         {
             let mut state = self.shared.state.lock().unwrap();
             if !state.open {
-                return false;
+                return Err(value);
             }
 
             state.messages.push_back(value);
         };
 
-        self.shared.send_callback.add_permits(1);
-        if let Ok(permit) = self.shared.recv_callback.acquire().await {
-            permit.forget();
-        }
+        self.shared.send_callback.call();
+        self.shared.recv_callback.wait().await;
 
-        true
+        Ok(())
     }
 
     /// Closes the channel.
@@ -110,19 +108,18 @@ impl<T> Receiver<T> {
     /// This method is cancel-safe. If the future is dropped before completion,
     /// no message is lost and the channel state remains consistent.
     pub async fn recv(&mut self) -> Option<T> {
-        if let Ok(permit) = self.shared.send_callback.acquire().await {
-            permit.forget();
+        self.shared.send_callback.wait().await;
+
+        let message = {
+            let mut state = self.shared.state.lock().unwrap();
+            state.messages.pop_front()
+        };
+
+        if message.is_some() {
+            self.shared.recv_callback.call();
         }
 
-        self.shared
-            .state
-            .lock()
-            .unwrap()
-            .messages
-            .pop_front()
-            .inspect(|_| {
-                self.shared.recv_callback.add_permits(1);
-            })
+        message
     }
 
     /// Closes the channel.
@@ -145,11 +142,11 @@ impl<T> Drop for Receiver<T> {
 struct Shared<T> {
     state: Mutex<State<T>>,
 
-    /// Semaphore used to notify that a message was sent.
-    send_callback: Semaphore,
+    /// Callback used to notify that a message was sent.
+    send_callback: Callback,
 
-    /// Semaphore used to notify that a message was received.
-    recv_callback: Semaphore,
+    /// Callback used to notify that a message was received.
+    recv_callback: Callback,
 }
 
 impl<T> Shared<T> {
@@ -159,8 +156,8 @@ impl<T> Shared<T> {
                 messages: VecDeque::with_capacity(1),
                 open: true,
             }),
-            send_callback: Semaphore::new(0),
-            recv_callback: Semaphore::new(0),
+            send_callback: Callback::new(),
+            recv_callback: Callback::new(),
         }
     }
 
@@ -169,7 +166,10 @@ impl<T> Shared<T> {
             let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
+                // Poisoned state may indicate that some messages could be lost.
+                // To avoid sophisticated vulnerabilities on missing messages,
+                // we better panic here, than recover.
+                .unwrap();
 
             state.open = false;
         }
@@ -185,8 +185,40 @@ struct State<T> {
     ///
     /// In strict rendezvous operation, this contains at most one element.
     /// It may contain more if `send` futures are canceled.
-    messages: VecDeque<T>,
+    pub messages: VecDeque<T>,
 
     /// Whether the channel is open.
-    open: bool,
+    pub open: bool,
+}
+
+#[derive(Debug)]
+struct Callback {
+    /// We use Semaphore to make & listen for callbacks.
+    ///
+    /// - `semaphore.acquire().forget()` to wait for a callback.
+    /// - `semaphore.add_permits(1)` to make one.
+    /// - `semaphore.close()` to make a callback and close.
+    semaphore: Semaphore,
+}
+
+impl Callback {
+    pub fn new() -> Self {
+        Self {
+            semaphore: Semaphore::new(0),
+        }
+    }
+
+    pub async fn wait(&self) {
+        if let Ok(permit) = self.semaphore.acquire().await {
+            permit.forget();
+        }
+    }
+
+    pub fn call(&self) {
+        self.semaphore.add_permits(1)
+    }
+
+    pub fn close(&self) {
+        self.semaphore.close();
+    }
 }

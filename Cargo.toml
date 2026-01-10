@@ -3,11 +3,24 @@ name = "aquic"
 version = "0.0.0"
 edition = "2024"
 
-[dependencies]
-tokio = { version = "1.48.0", features = ["macros", "rt", "net", "sync"] }
-tokio-util = "0.7.17"
-quiche = "0.24.6"
 
-tracing = "0.1.43"
-futures = "0.3.31"
-bytes = "1.11.0"
+[features]
+quiche = ["dep:quiche"]
+tokio-rt = ["tokio/rt"]
+monoio-rt = ["dep:monoio"]
+default = ["quiche", "tokio-rt"]
+
+
+[dependencies]
+# Note: we always use tokio sync & macros, but the tokio async runtime requires `tokio-rt` feature to be enabled.
+tokio = { version = "1.49", features = ["sync", "macros"], default-features = false }
+monoio = { version = "0.2", optional = true }
+
+quiche = { version = "0.24", optional = true }
+
+tracing = "0.1"
+bytes = "1.11"
+
+
+[build-dependencies]
+cfg_aliases = "0.2"
