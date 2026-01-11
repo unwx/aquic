@@ -1,10 +1,10 @@
-use crate::executor::SendIfRt;
+use crate::exec::SendIfRt;
 use crate::stream::codec::{Decoder, DecoderFactory, Encoder, EncoderFactory};
 use std::fmt::Debug;
 use std::hash::Hash;
 
 mod backend;
-mod executor;
+mod exec;
 mod stream;
 mod sync;
 

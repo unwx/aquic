@@ -1,6 +1,6 @@
 use crate::Spec;
 use crate::backend::StreamError;
-use crate::executor::Executor;
+use crate::exec::Executor;
 use crate::stream::shared::InStreamBackend;
 use crate::stream::{Decoder, Error, Payload};
 use crate::sync::oneshot;
