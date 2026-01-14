@@ -6,18 +6,21 @@ edition = "2024"
 
 [features]
 quiche = ["dep:quiche"]
-tokio-rt = ["tokio/rt"]
-monoio-rt = ["dep:monoio"]
-default = ["quiche", "tokio-rt"]
+tokio = ["dep:tokio", "dep:crossfire"]
+monoio = ["dep:monoio"]
+default = []
 
 
 [dependencies]
-# Note: we always use tokio sync & macros, but the tokio async runtime requires `tokio-rt` feature to be enabled.
-tokio = { version = "1.49", features = ["sync", "macros"], default-features = false }
+tokio = { version = "1.49", features = ["rt"], optional = true }
 monoio = { version = "0.2", optional = true }
 
 quiche = { version = "0.24", optional = true }
 
+event-listener = { version = "5.4" } # TODO: make optional in the future, enable it only for Send runtimes.
+crossfire = { version = "2.1", optional = true }
+
+futures = "0.3"
 tracing = "0.1"
 bytes = "1.11"
 

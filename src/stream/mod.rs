@@ -1,5 +1,5 @@
-use crate::Spec;
 use crate::stream::codec::{Decoder, Encoder};
+use crate::{Estimate, Spec};
 use std::borrow::Cow;
 use std::fmt::{Debug, Display, Formatter};
 use std::io;
@@ -43,8 +43,8 @@ impl<S: Spec> Clone for Error<S> {
     fn clone(&self) -> Self {
         match self {
             Self::Finish => Self::Finish,
-            Self::StopSending(e) => Self::StopSending(e.clone()),
-            Self::ResetSending(e) => Self::ResetSending(e.clone()),
+            Self::StopSending(e) => Self::StopSending(*e),
+            Self::ResetSending(e) => Self::ResetSending(*e),
             Self::Decoder(e) => Self::Decoder(e.clone()),
             Self::Encoder(e) => Self::Encoder(e.clone()),
             Self::Connection(e) => Self::Connection(e.clone()),
@@ -135,6 +135,16 @@ impl<T> Payload<T> {
             Self::Last(t) => Payload::Last(f(t)?),
             Self::Done => Payload::Done,
         })
+    }
+}
+
+impl<T: Estimate> Estimate for Payload<T> {
+    fn estimate(&self) -> usize {
+        match self {
+            Payload::Chunk(it) => it.estimate(),
+            Payload::Last(it) => it.estimate(),
+            Payload::Done => 0,
+        }
     }
 }
 

@@ -1,15 +1,23 @@
-mod quiche;
 mod stream;
 
 pub(crate) use stream::*;
 
-use crate::backend::quiche::Quiche;
 
-/// A [Backend] implementation.
-///
-/// [Cloudflare/quiche](https://github.com/cloudflare/quiche) is used as an implementation of the QUIC protocol.
-#[cfg(feature = "quiche")]
-pub(crate) type QuicBackend = Quiche;
+use crate::conditional;
+
+conditional! {
+    feature = "quiche",
+
+    mod quiche;
+    use crate::backend::quiche::Quiche;
+
+    /// A [Backend] implementation.
+    ///
+    /// [Cloudflare/quiche](https://github.com/cloudflare/quiche) is used as an implementation of the QUIC protocol.
+    #[cfg(feature = "quiche")]
+    pub(crate) type QuicBackend = Quiche;
+}
+
 
 /// An API for various implementations of the QUIC protocol.
 ///

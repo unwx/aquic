@@ -1,22 +1,42 @@
-/// Conditionally [Send].
-///
-/// Current async runtime environment **requires** [Send] to spawn a future,
-/// therefore [Send] must be present.
-#[cfg(send_rt)]
-pub trait SendIfRt: Send {}
+use crate::conditional;
 
-#[cfg(send_rt)]
-impl<T: Send> SendIfRt for T {}
+conditional! {
+    multithread,
 
-/// Conditionally [Send].
-///
-/// Current async runtime environment **does not require** [Send] to spawn a future,
-/// therefore [Send] can be absent.
-#[cfg(not(send_rt))]
-pub trait SendIfRt {}
+    /// Conditionally [Send].
+    ///
+    /// Current async environment is multithreaded/work-stealing: [Send] is **required**.
+    pub trait SendOnMt: Send {}
 
-#[cfg(not(send_rt))]
-impl<T> SendIfRt for T {}
+    impl<T: Send> SendOnMt for T {}
+
+
+    /// Conditionally [Sync].
+    ///
+    /// Current async environment is multithreaded/work-stealing: [Sync] is **required**.
+    pub trait SyncOnMt: Sync {}
+
+    impl<T: Sync> SyncOnMt for T {}
+}
+
+conditional! {
+    not(multithread),
+
+    /// Conditionally [Send].
+    ///
+    /// Current async environment is single-threaded/thread-per-core: [Send] is **not required**.
+    pub trait SendOnMt {}
+
+    impl<T> SendOnMt for T {}
+
+
+    /// Conditionally [Sync].
+    ///
+    /// Current async environment is single-threaded/thread-per-core: [Sync] is **not required**.
+    pub trait SyncOnMt {}
+
+    impl<T> SyncOnMt for T {}
+}
 
 
 /// Executor that provides an API to spawn async tasks,
@@ -25,7 +45,7 @@ pub(crate) struct Executor {}
 
 impl Executor {
     /// [tokio::spawn].
-    #[cfg(feature = "tokio-rt")]
+    #[cfg(feature = "tokio")]
     pub fn spawn_void<F>(future: F)
     where
         F: Future + Send + 'static,
@@ -35,7 +55,7 @@ impl Executor {
     }
 
     /// [monoio::spawn].
-    #[cfg(feature = "monoio-rt")]
+    #[cfg(feature = "monoio")]
     pub fn spawn_void<F>(future: F)
     where
         F: Future + 'static,

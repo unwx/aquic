@@ -1,8 +1,9 @@
 use crate::backend::StreamResult;
 use crate::backend::{StreamTask, StreamTaskResult};
 use crate::stream::{Priority, StreamId};
+use crate::sync::mpsc;
+use crate::sync::mpsc::unbounded::{UnboundedReceiver, UnboundedSender};
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
 use tracing::debug;
 
 /// Provides [StreamBackend] backend API,
@@ -14,15 +15,15 @@ use tracing::debug;
 /// [StreamBackend]: crate::backend::StreamBackend
 pub(crate) struct InStreamBackend {
     stream_id: StreamId,
-    task_sender: mpsc::UnboundedSender<(StreamId, StreamTask)>,
-    result_receiver: mpsc::UnboundedReceiver<StreamTaskResult>,
+    task_sender: mpsc::unbounded::Sender<(StreamId, StreamTask)>,
+    result_receiver: mpsc::unbounded::Receiver<StreamTaskResult>,
 }
 
 impl InStreamBackend {
     pub fn new(
         stream_id: StreamId,
-        task_sender: mpsc::UnboundedSender<(StreamId, StreamTask)>,
-        result_receiver: mpsc::UnboundedReceiver<StreamTaskResult>,
+        task_sender: mpsc::unbounded::Sender<(StreamId, StreamTask)>,
+        result_receiver: mpsc::unbounded::Receiver<StreamTaskResult>,
     ) -> Self {
         Self {
             stream_id,
@@ -84,15 +85,15 @@ impl InStreamBackend {
 /// [StreamBackend]: crate::backend::StreamBackend
 pub(crate) struct OutStreamBackend {
     stream_id: StreamId,
-    task_sender: mpsc::UnboundedSender<(StreamId, StreamTask)>,
-    result_receiver: mpsc::UnboundedReceiver<StreamTaskResult>,
+    task_sender: mpsc::unbounded::Sender<(StreamId, StreamTask)>,
+    result_receiver: mpsc::unbounded::Receiver<StreamTaskResult>,
 }
 
 impl OutStreamBackend {
     pub fn new(
         stream_id: StreamId,
-        task_sender: mpsc::UnboundedSender<(StreamId, StreamTask)>,
-        result_receiver: mpsc::UnboundedReceiver<StreamTaskResult>,
+        task_sender: mpsc::unbounded::Sender<(StreamId, StreamTask)>,
+        result_receiver: mpsc::unbounded::Receiver<StreamTaskResult>,
     ) -> Self {
         Self {
             stream_id,

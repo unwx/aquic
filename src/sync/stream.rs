@@ -1,32 +1,39 @@
-use crate::Spec;
 use crate::stream::codec::{Decoder, Encoder};
 use crate::stream::{Error, Payload, Priority};
-use crate::sync::oneshot::{SendError, TryRecvError};
-use crate::sync::{oneshot, rendezvous};
+use crate::sync::mpsc::weighted;
+use crate::sync::mpsc::weighted::{WeightedReceiver, WeightedSender};
+use crate::sync::oneshot;
+use crate::sync::oneshot::{OneshotReceiver, OneshotSender, SendError, TryRecvError};
+use crate::sync::stream::cell::PriorityCell;
+use crate::{Estimate, Spec};
+use futures::{FutureExt, select_biased};
 use std::borrow::Cow;
+use std::future::poll_fn;
 use std::io;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::thread::panicking;
-use tokio::select;
-use tokio::sync::watch;
 
-/// Creates the internal synchronization primitives for a single stream direction.
-pub(crate) fn channel<S: Spec>() -> (Sender<S>, Receiver<S>) {
-    let (item_sender, item_receiver) = rendezvous::channel();
+/// Creates a `spsc` channel for a single stream direction communication.
+///
+/// Also see [weighted] for more info about the underlying channel.
+pub(crate) fn channel<S: Spec>(bound: usize) -> (Sender<S>, Receiver<S>) {
+    let (item_sender, item_receiver) = weighted::channel(bound);
     let (error_sender, error_receiver) = oneshot::channel();
-    let (priority_sender, priority_receiver) = watch::channel(None);
+    let priority_cell = PriorityCell::new();
 
     let stream_sender = Sender {
         item_sender,
         error_sender: error_sender.clone(),
         error_receiver: error_receiver.clone(),
-        priority_sender,
+        priority_cell: priority_cell.clone(),
     };
     let stream_receiver = Receiver {
         item_receiver,
         error_sender,
         error_receiver,
-        priority_receiver,
+        priority_cell,
     };
 
     (stream_sender, stream_receiver)
@@ -52,93 +59,38 @@ pub(crate) fn channel<S: Spec>() -> (Sender<S>, Receiver<S>) {
 /// **Note:** It is strongly recommended to close the stream direction manually,
 /// using `finish` or `terminate`.
 pub struct Sender<S: Spec> {
-    /// Channel to send actual data chunks.
-    item_sender: rendezvous::Sender<Payload<S::Item>>,
+    /// Sender to send actual data chunks.
+    item_sender: weighted::Sender<Payload<S::Item>>,
 
-    /// Oneshot channel to broadcast the closure event of this stream direction.
+    /// Sender to broadcast the closure event of this stream direction.
     error_sender: oneshot::Sender<Error<S>>,
 
     /// Receiver to listen for an external closure event (e.g., peer sends [Error::StopSending]).
     error_receiver: oneshot::Receiver<Error<S>>,
 
-    /// Channel to update stream priority dynamically.
-    priority_sender: watch::Sender<Option<Priority>>,
+    /// Cell to update stream priority dynamically.
+    priority_cell: PriorityCell,
 }
 
 //noinspection DuplicatedCode
 impl<S: Spec> Sender<S> {
-    /// Sends a chunk of data.
+    /// Sends a value, equivalent to [Payload::Chunk].
     ///
-    /// To follow the peer's flow control, [`Sender`] uses a rendezvous channel internally.
-    /// This method will wait until the [`Receiver`] receives the data.
-    ///
-    /// # Return Value
-    ///
-    /// - `Ok(())`: The data was sent and [`Receiver`] received it.
-    /// - `Err(Error)`: The stream direction is closed.
-    ///
-    /// # Cancel Safety
-    ///
-    /// As this method uses rendezvous handshake,
-    /// canceling this future breaks the strict rendezvous guarantee,
-    /// but will **not** lose the message.
-    ///
-    /// More details: [`rendezvous::Sender::send()`].
-    ///
-    /// **Note**, still, if you [Sender::terminate] the stream,
-    /// all existing messages will be ignored.
+    /// See [`send_item`](Self::send_item).
     pub async fn send(&mut self, value: S::Item) -> Result<(), Error<S>> {
         self.send_item(Payload::Chunk(value)).await
     }
 
-    /// Sends the final chunk of data,
-    /// and gracefully close the direction with a 'FIN' flag.
+    /// Sends a value with `FIN` flag set, equivalent to [Payload::Last].
     ///
-    /// To follow peer's flow control,
-    /// [`Sender`] uses rendezvous channel inside:
-    /// this method will wait until the [`Receiver`] receive the data.
-    ///
-    /// # Return Value
-    ///
-    /// - `Ok(())`: The data was sent and [`Receiver`] received it.
-    /// - `Err(Error)`: The stream direction is closed.
-    ///
-    /// # Cancel Safety
-    ///
-    /// As this method uses rendezvous handshake,
-    /// canceling this future breaks the strict rendezvous guarantee,
-    /// but will **not** lose the message.
-    ///
-    /// More details: [`rendezvous::Sender::send()`].
-    ///
-    /// **Note**, still, if you [Sender::terminate] the stream,
-    /// all existing messages will be ignored.
+    /// See [`send_item`](Self::send_item).
     pub async fn send_final(mut self, value: S::Item) -> Result<(), Error<S>> {
         self.send_item(Payload::Last(value)).await
     }
 
-    /// Sends the final chunk of data,
-    /// and gracefully close the direction with a 'FIN' flag.
+    /// Sends a `FIN` flag, equivalent to [Payload::Done].
     ///
-    /// To follow peer's flow control,
-    /// [`Sender`] uses rendezvous channel inside:
-    /// this method will wait until the [`Receiver`] receive the signal.
-    ///
-    /// # Return Value
-    ///
-    /// - `Ok(())`: The signal was sent and [`Receiver`] received it.
-    /// - `Err(Error)`: The stream direction is closed.
-    ///
-    /// # Cancel Safety
-    ///
-    /// As this method uses rendezvous handshake,
-    /// canceling this future breaks the strict rendezvous guarantee,
-    /// but will **not** lose the message.
-    ///
-    /// More details: [`rendezvous::Sender::send()`].
-    ///
-    /// **Note**, still, if you [Sender::terminate] the stream,
-    /// all existing messages will be ignored.
+    /// See [`send_item`](Self::send_item).
     pub async fn finish(mut self) -> Result<(), Error<S>> {
         self.send_item(Payload::Done).await
     }
@@ -151,9 +103,18 @@ impl<S: Spec> Sender<S> {
     /// after the channel is closed,
     /// therefore you will receive `Ok(())` on the initial request to close the channel.
     ///
-    /// To follow peer's flow control,
-    /// [`Sender`] uses rendezvous channel inside:
-    /// this method will wait until the [`Receiver`] receive the payload.
+    /// # Bounds
+    /// The underlying channel is bounded, and uses [Estimate] trait for [S::Item]
+    /// to understand how much each value weights in the channel.
+    ///
+    /// For example, with bound of `1024`, you can without blocking:
+    /// - Buffer up to `1024` items with [`estimate`](Estimate) of `1`.
+    /// - Or `infinite` number of items when [`estimate`](Estimate) returns `0` for each of them.
+    /// - Or any other combination of items weight, until their sum exceeds the `bound`.
+    ///  
+    /// **Note**: with bound of `0`, the channel will block
+    /// if there is more than `1` message in the internal queue,
+    /// **unless** its weight is `0`.
     ///
     /// # Return Value
     ///
@@ -162,31 +123,30 @@ impl<S: Spec> Sender<S> {
     ///
     /// # Cancel Safety
     ///
-    /// As this method uses rendezvous handshake,
-    /// canceling this future breaks the strict rendezvous guarantee,
-    /// but will **not** lose the message.
-    ///
-    /// More details: [`rendezvous::Sender::send()`].
-    ///
-    /// **Note**, still, if you [Sender::terminate] the stream,
-    /// all messages will be dropped instantly.
+    /// Not cancel safe: may lead to lost item, or may send an item after cancellation.
     pub async fn send_item(&mut self, item: Payload<S::Item>) -> Result<(), Error<S>> {
         if let Some(e) = self.error() {
             return Err(e);
         }
 
         let fin = item.is_fin();
+        let weight = item.estimate();
 
-        select! {
-            biased;
+        select_biased! {
+            // Cancellation Safety:
+            // - `error_receiver` is cancel_safe.
+            // - `item_sender` is **not** cancel safe, and may lose or send message after cancellation.
+            //
+            // When `item_sender` future is dropped in the result of an error from `error_receiver`,
+            // it should not cause a problem: Receiver will handle this.
 
-            err = self.error_receiver.recv() => {
+            err = self.error_receiver.recv().fuse() => {
                 let err = err.unwrap_or_else(|| Self::fallback_error());
                 Err(self.close(err))
             },
-            result = self.item_sender.send(item) => {
+            result = self.item_sender.send(item, weight).fuse() => {
                 if let Err(_) = result {
-                    let err = Error::HangUp("Sender.error_receiver is unavailable".into());
+                    let err = Error::HangUp("Sender.item_receiver is unavailable".into());
                     return Err(self.close(err));
                 }
 
@@ -239,7 +199,7 @@ impl<S: Spec> Sender<S> {
     pub fn error(&self) -> Option<Error<S>> {
         match self.error_receiver.try_recv() {
             Ok(err) => Some(err),
-            Err(TryRecvError::Disconnected) => Some(Self::fallback_error()),
+            Err(TryRecvError::Closed) => Some(Self::fallback_error()),
             Err(TryRecvError::Empty) => None,
         }
     }
@@ -267,8 +227,7 @@ impl<S: Spec> Sender<S> {
     ///      with other incremental streams of the same urgency.
     ///      Use this for data that can be processed as it arrives (e.g., progressive images, video).
     pub fn set_priority(&self, urgency: u8, incremental: bool) {
-        self.priority_sender
-            .send_replace(Some(Priority::new(urgency, incremental)));
+        self.priority_cell.set(Priority::new(urgency, incremental));
     }
 
 
@@ -279,16 +238,11 @@ impl<S: Spec> Sender<S> {
     ///
     /// If the channel is still open, returns a clone of the provided `error`.  
     fn close(&mut self, error: Error<S>) -> Error<S> {
-        let error = match self.error_sender.send(error.clone()) {
+        match self.error_sender.send(error.clone()) {
             Ok(_) => error,
             Err(SendError::Closed) => Self::fallback_error(),
             Err(SendError::Full) => self.error().expect("bug: there must be an error present"),
-        };
-
-        self.item_sender.close();
-        self.error_sender.close();
-        self.error_receiver.close();
-        error
+        }
     }
 
     fn fallback_error() -> Error<S> {
@@ -330,25 +284,22 @@ impl<S: Spec> Drop for Sender<S> {
 /// **Note:** It is strongly recommended to handle the stream lifecycle gracefully
 /// by consuming the data until a `FIN` is received or by explicitly calling `stop_sending`.
 pub struct Receiver<S: Spec> {
-    /// Channel to receive actual data chunks.
-    item_receiver: rendezvous::Receiver<Payload<S::Item>>,
+    /// Receiver to receive actual data chunks.
+    item_receiver: weighted::Receiver<Payload<S::Item>>,
 
-    /// Oneshot channel to broadcast the closure event of this stream direction.
+    /// Sender to broadcast the closure event of this stream direction.
     error_sender: oneshot::Sender<Error<S>>,
 
     /// Receiver to listen for an external closure event (e.g., peer sends [Error::ResetSending]).
     error_receiver: oneshot::Receiver<Error<S>>,
 
-    /// Receiver to listen for priority updates from the sender.
-    priority_receiver: watch::Receiver<Option<Priority>>,
+    /// Cell to get a dynamic priority from.
+    priority_cell: PriorityCell,
 }
 
 //noinspection DuplicatedCode
 impl<S: Spec> Receiver<S> {
     /// Receives the next chunk of data.
-    ///
-    /// To follow the peer's flow control, [`Receiver`] uses a rendezvous channel internally.
-    /// This method participates in the handshake to notify the sender that the data has been received.
     ///
     /// **Note**: if [`Receiver`] receives error, such as [`Error::ResetSending`],
     /// all the messages will be ignored.
@@ -362,41 +313,50 @@ impl<S: Spec> Receiver<S> {
     ///
     /// # Cancel Safety
     ///
-    /// This method is cancel-safe.
-    ///
-    /// If the future is dropped before completion,
-    /// no data is lost and the rendezvous handshake is not completed for that item.
+    /// Not cancel safe: may lead to lost item.
     pub async fn recv(&mut self) -> Result<Payload<S::Item>, Error<S>> {
-        if let Some(err) = self.error() {
-            return self.next_item_or_error(err).await;
+        enum Event<E, I> {
+            Err(Option<E>),
+            Item(Option<I>),
         }
 
-        select! {
-            biased;
+        let event = {
+            let mut recv_error_fut = pin!(self.error_receiver.recv());
+            let recv_error_fut = poll_fn(|cx| match recv_error_fut.as_mut().poll(cx) {
+                // Ignore `Finish` errors, as it may lead to `item_receiver` future cancellation
+                // and therefore a message loss.
+                //
+                // Handle `Finish` naturally from `item_receiver`.
+                Poll::Ready(Some(Error::Finish)) => Poll::Pending,
+                other => other,
+            });
 
-            err = self.error_receiver.recv() => {
-                let mut err = err.unwrap_or_else(|| Self::fallback_error());
-                err = self.close(err);
-
-                self.next_item_or_error(err).await
+            select_biased! {
+                err = recv_error_fut.fuse() => Event::Err(err),
+                result = self.item_receiver.recv().fuse() => Event::Item(result),
             }
-            result = self.item_receiver.recv() => {
-                match result {
-                    Some(item) => {
-                        if item.is_fin() {
-                            let err = self.close(Error::Finish);
+        };
 
-                            if !matches!(err, Error::Finish) {
-                                return Err(err);
-                            }
+        match event {
+            Event::Err(err) => {
+                let err = err.unwrap_or_else(|| Self::fallback_error());
+                Err(self.close(err))
+            }
+            Event::Item(result) => match result {
+                Some(item) => {
+                    if item.is_fin() {
+                        let err = self.close(Error::Finish);
+
+                        if !matches!(err, Error::Finish) {
+                            return Err(err);
                         }
+                    }
 
-                        Ok(item)
-                    },
-                    None => {
-                        let err = Error::HangUp("Receiver.item_receiver is unavailable".into());
-                        Err(self.close(err))
-                    },
+                    Ok(item)
+                }
+                None => {
+                    let err = Error::HangUp("Receiver.item_receiver is unavailable".into());
+                    Err(self.close(err))
                 }
             },
         }
@@ -443,7 +403,7 @@ impl<S: Spec> Receiver<S> {
     pub fn error(&self) -> Option<Error<S>> {
         match self.error_receiver.try_recv() {
             Ok(err) => Some(err),
-            Err(TryRecvError::Disconnected) => Some(Self::fallback_error()),
+            Err(TryRecvError::Closed) => Some(Self::fallback_error()),
             Err(TryRecvError::Empty) => None,
         }
     }
@@ -461,11 +421,7 @@ impl<S: Spec> Receiver<S> {
     ///
     /// Returns `None` if the priority has not changed since the last call.
     pub(crate) fn priority_once(&mut self) -> Option<Priority> {
-        if !self.priority_receiver.has_changed().unwrap_or(false) {
-            return None;
-        }
-
-        self.priority_receiver.borrow_and_update().as_ref().copied()
+        self.priority_cell.take()
     }
 
 
@@ -476,27 +432,11 @@ impl<S: Spec> Receiver<S> {
     ///
     /// If the channel is still open, returns a clone of the provided `error`.  
     fn close(&mut self, error: Error<S>) -> Error<S> {
-        let error = match self.error_sender.send(error.clone()) {
+        match self.error_sender.send(error.clone()) {
             Ok(_) => error,
             Err(SendError::Closed) => Self::fallback_error(),
             Err(SendError::Full) => self.error().expect("bug: there must be an error present"),
-        };
-
-        self.item_receiver.close();
-        self.error_sender.close();
-        self.error_receiver.close();
-        error
-    }
-
-    async fn next_item_or_error(&mut self, err: Error<S>) -> Result<Payload<S::Item>, Error<S>> {
-        #[allow(clippy::collapsible_if)] // If statement becomes too long.
-        if matches!(err, Error::Finish) {
-            if let Some(item) = self.item_receiver.recv().await {
-                return Ok(item);
-            }
         }
-
-        Err(err)
     }
 
     fn fallback_error() -> Error<S> {
@@ -515,5 +455,95 @@ impl<S: Spec> Drop for Receiver<S> {
         };
 
         self.close(error);
+    }
+}
+
+
+mod cell {
+    use crate::conditional;
+    use crate::stream::Priority;
+
+    conditional! {
+        multithread,
+
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU16;
+        use std::sync::atomic::Ordering::AcqRel;
+        use std::sync::atomic::Ordering::Release;
+
+        const EMPTY: u16 = u16::MAX;
+
+        pub struct PriorityCell {
+            inner: Arc<AtomicU16>,
+        }
+
+        impl PriorityCell {
+            pub fn new() -> Self {
+                Self {
+                    inner: Arc::new(AtomicU16::new(EMPTY))
+                }
+            }
+
+            pub fn set(&self, priority: Priority) {
+                self.inner.store(Self::pack(priority), Release);
+            }
+
+            pub fn take(&self) -> Option<Priority> {
+                Self::unpack(self.inner.swap(EMPTY, AcqRel))
+            }
+
+
+            fn pack(priority: Priority) -> u16 {
+                let incremental = priority.incremental as u8;
+                u16::from_ne_bytes([priority.urgency, incremental])
+            }
+
+            fn unpack(value: u16) -> Option<Priority> {
+                if value == EMPTY {
+                    return None;
+                }
+
+                let [urgency, incremental] = value.to_ne_bytes();
+                Some(Priority {
+                    urgency,
+                    incremental: incremental != 0,
+                })
+            }
+        }
+    }
+
+    conditional! {
+        not(multithread),
+
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        pub struct PriorityCell {
+            inner: Rc<Cell<Option<Priority>>>
+        }
+
+        impl PriorityCell {
+            pub fn new() -> Self {
+                Self {
+                    inner: Rc::new(Cell::new(None))
+                }
+            }
+
+            pub fn set(&self, priority: Priority) {
+                self.inner.replace(Some(priority));
+            }
+
+            pub fn take(&self) -> Option<Priority> {
+                self.inner.take()
+            }
+        }
+    }
+
+    impl Clone for PriorityCell {
+        fn clone(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+            }
+        }
     }
 }

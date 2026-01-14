@@ -1,4 +1,4 @@
-use crate::exec::SendIfRt;
+use crate::exec::SendOnMt;
 use crate::stream::Payload;
 use bytes::{Bytes, BytesMut};
 use std::future::Future;
@@ -35,7 +35,7 @@ pub trait EncoderFactory {
 /// The library is optimized for both blocking and non-blocking implementations.
 pub trait Decoder {
     /// The type of the decoded entity.
-    type Item: SendIfRt + 'static;
+    type Item: SendOnMt + 'static;
 
     /// The type of error in case of decoding failures.
     ///
@@ -74,7 +74,7 @@ pub trait Decoder {
         buffer: BytesMut,
         length: usize,
         finish: bool,
-    ) -> impl Future<Output = Result<(), Self::Error>> + SendIfRt;
+    ) -> impl Future<Output = Result<(), Self::Error>> + SendOnMt;
 
     /// Returns the next decoded item, or `None` if there is no item available.
     ///
@@ -89,7 +89,7 @@ pub trait Decoder {
     /// [`Decoder`] will not be used again after cancellation.
     fn next_item(
         &mut self,
-    ) -> impl Future<Output = Result<Option<Self::Item>, Self::Error>> + SendIfRt;
+    ) -> impl Future<Output = Result<Option<Self::Item>, Self::Error>> + SendOnMt;
 }
 
 /// [`Encoder`] is a stateful object responsible for a single outgoing QUIC stream.
@@ -104,7 +104,7 @@ pub trait Decoder {
 /// The library is optimized for both blocking and non-blocking implementations.
 pub trait Encoder {
     /// The type of the entity to be encoded.
-    type Item: SendIfRt + 'static;
+    type Item: SendOnMt + 'static;
 
     /// The type of error in case of encoding failures.
     ///
@@ -123,7 +123,7 @@ pub trait Encoder {
     fn write(
         &mut self,
         payload: Payload<Self::Item>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + SendIfRt;
+    ) -> impl Future<Output = Result<(), Self::Error>> + SendOnMt;
 
     /// Returns the next chunk of raw bytes to be sent to the peer,
     /// or empty if there is nothing to send.
@@ -135,5 +135,5 @@ pub trait Encoder {
     /// If the future is dropped before completion, the [`Encoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
     /// [`Encoder`] will not be used again after cancellation.
-    fn next_buffer(&mut self) -> impl Future<Output = Result<Bytes, Self::Error>> + SendIfRt;
+    fn next_buffer(&mut self) -> impl Future<Output = Result<Bytes, Self::Error>> + SendOnMt;
 }

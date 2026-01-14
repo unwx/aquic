@@ -4,9 +4,10 @@ use crate::exec::Executor;
 use crate::stream::shared::OutStreamBackend;
 use crate::stream::{Encoder, Error, Payload};
 use crate::sync::oneshot;
+use crate::sync::oneshot::{OneshotReceiver, OneshotSender};
 use crate::sync::stream;
 use bytes::Bytes;
-use tokio::select;
+use futures::{FutureExt, select_biased};
 use tracing::{Instrument, Span, debug};
 
 /// An outgoing direction of QUIC stream,
@@ -74,15 +75,13 @@ impl<S: Spec> Outgoing<S> {
         let cancel_receiver = self.cancel_receiver.clone();
 
         let future = async move {
-            select! {
-                biased;
-
-                e = cancel_receiver.recv() => {
+            select_biased! {
+                e = cancel_receiver.recv().fuse() => {
                     self.close(e.unwrap_or_else(
                         || Error::HangUp("Outgoing.cancel_receiver is unavailable".into())
                     ));
                 }
-                e = self.io_loop() => {
+                e = self.io_loop().fuse() => {
                     self.close(e.map(|_| Error::Finish).unwrap_or_else(|e| e));
                 }
             }
@@ -103,13 +102,11 @@ impl<S: Spec> Outgoing<S> {
         let app_error_receiver = self.item_receiver.error_receiver();
 
         Executor::spawn_void(async move {
-            select! {
-                biased;
-
-                _ = cancel_receiver.recv() => {
+            select_biased! {
+                _ = cancel_receiver.recv().fuse() => {
                     // Do nothing.
                 },
-                app_err = app_error_receiver.recv() => {
+                app_err = app_error_receiver.recv().fuse() => {
                     let app_err = app_err.unwrap_or_else(
                         || Error::HangUp("Outgoing.item_receiver.error_receiver is unavailable".into())
                     );
