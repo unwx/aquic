@@ -123,7 +123,12 @@ impl<S: Spec> Sender<S> {
     ///
     /// # Cancel Safety
     ///
-    /// Not cancel safe: may lead to lost item, or may send an item after cancellation.
+    /// This method is cancel safe.
+    ///
+    /// If `send` is used in `futures::select!` statement and some other branch completes first,
+    /// then it is guaranteed that the message was not sent.
+    ///
+    /// However, in that case, the message is dropped and will be lost.
     pub async fn send_item(&mut self, item: Payload<S::Item>) -> Result<(), Error<S>> {
         if let Some(e) = self.error() {
             return Err(e);
@@ -133,19 +138,16 @@ impl<S: Spec> Sender<S> {
         let weight = item.estimate();
 
         select_biased! {
-            // Cancellation Safety:
+            // Cancel safe:
             // - `error_receiver` is cancel_safe.
-            // - `item_sender` is **not** cancel safe, and may lose or send message after cancellation.
-            //
-            // When `item_sender` future is dropped in the result of an error from `error_receiver`,
-            // it should not cause a problem: Receiver will handle this.
+            // - `item_sender` is cancel_safe.
 
             err = self.error_receiver.recv().fuse() => {
                 let err = err.unwrap_or_else(|| Self::fallback_error());
                 Err(self.close(err))
             },
             result = self.item_sender.send(item, weight).fuse() => {
-                if let Err(_) = result {
+                if result.is_err() {
                     let err = Error::HangUp("Sender.item_receiver is unavailable".into());
                     return Err(self.close(err));
                 }
@@ -313,7 +315,9 @@ impl<S: Spec> Receiver<S> {
     ///
     /// # Cancel Safety
     ///
-    /// Not cancel safe: may lead to lost item.
+    /// This method is cancel safe.
+    /// If `recv` is used in `futures::select!` statement and some other branch completes first,
+    /// it is guaranteed that no messages were received on this channel.
     pub async fn recv(&mut self) -> Result<Payload<S::Item>, Error<S>> {
         enum Event<E, I> {
             Err(Option<E>),
@@ -332,6 +336,10 @@ impl<S: Spec> Receiver<S> {
             });
 
             select_biased! {
+                // Cancel safe:
+                // - `error_receiver` is cancel_safe.
+                // - `item_receiver` is cancel_safe.
+                
                 err = recv_error_fut.fuse() => Event::Err(err),
                 result = self.item_receiver.recv().fuse() => Event::Item(result),
             }

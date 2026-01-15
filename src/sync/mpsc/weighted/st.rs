@@ -43,7 +43,7 @@ impl<T: Unpin + 'static> WeightedSender<T> for Sender<T> {
             let listener = shared.event.listen();
             drop(shared);
 
-            listener.await;
+            listener.await; // Cancel safe: we haven't modified anything yet.
         }
 
         if let Err(_) = self.sender.send((value, weight)) {
@@ -83,6 +83,7 @@ pub(crate) struct Receiver<T> {
 
 impl<T: Unpin + 'static> WeightedReceiver<T> for Receiver<T> {
     async fn recv(&mut self) -> Option<T> {
+        // Cancel safe: mpsc::Receiver::recv() is cancel safe.
         let (value, weight) = self.receiver.recv().await?;
 
         let mut shared = self.shared.borrow_mut();

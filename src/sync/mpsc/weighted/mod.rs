@@ -17,7 +17,12 @@ pub(crate) trait WeightedSender<T: SendOnMt + Unpin + 'static>: Clone {
     ///
     /// # Cancel Safety
     ///
-    /// Not cancel safe: may lead to lost message, or send a message after cancellation.
+    /// This method is cancel safe.
+    ///
+    /// If `send` is used in `futures::select!` statement and some other branch completes first,
+    /// then it is guaranteed that the message was not sent, and channel's state is valid.
+    ///
+    /// However, in that case, the message is dropped and will be lost.
     fn send(
         &self,
         value: T,
@@ -43,7 +48,10 @@ pub(crate) trait WeightedReceiver<T: SendOnMt + Unpin + 'static> {
     ///
     /// # Cancel Safety
     ///
-    /// Not cancel safe: may lead to lost message.
+    /// This method is cancel safe.
+    ///
+    /// If `recv` is used in `futures::select!` statement and some other branch completes first,
+    /// it is guaranteed that no messages were received on this channel, and channel's state is valid.
     fn recv(&mut self) -> impl Future<Output = Option<T>> + SendOnMt;
 
     /// Try to receive an item if it exists, and return:

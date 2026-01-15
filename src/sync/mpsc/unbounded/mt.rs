@@ -36,6 +36,7 @@ pub(crate) struct Receiver<T> {
 
 impl<T: Send + Unpin + 'static> UnboundedReceiver<T> for Receiver<T> {
     async fn recv(&mut self) -> Option<T> {
+        // crossfire.recv() is cancellation safe.
         self.inner.recv().await.ok()
     }
 

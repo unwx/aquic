@@ -15,7 +15,10 @@ pub(crate) trait UnboundedReceiver<T: SendOnMt + Unpin + 'static> {
     ///
     /// # Cancel Safety
     ///
-    /// Not cancel safe: may lose a message.
+    /// This method is cancel safe.
+    /// 
+    /// If `recv` is used in `futures::select!` statement and some other branch completes first,
+    /// it is guaranteed that no messages were received on this channel.
     fn recv(&mut self) -> impl Future<Output = Option<T>> + SendOnMt;
 
     /// Try to receive a message,

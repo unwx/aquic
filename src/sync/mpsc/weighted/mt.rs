@@ -68,7 +68,7 @@ impl<T: Send + Unpin + 'static> WeightedSender<T> for Sender<T> {
                 continue;
             }
 
-            listener.await;
+            listener.await; // Cancel safe: we haven't modified anything yet.
             current = self.shared.occupation.load(Acquire);
         }
 
@@ -110,6 +110,7 @@ pub(crate) struct Receiver<T> {
 
 impl<T: Send + Unpin + 'static> WeightedReceiver<T> for Receiver<T> {
     async fn recv(&mut self) -> Option<T> {
+        // Cancel safe: mpsc::Receiver::recv() is cancel safe.
         let (value, weight) = self.receiver.recv().await?;
 
         let current = {
