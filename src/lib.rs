@@ -4,10 +4,11 @@ use std::hash::Hash;
 
 mod backend;
 mod exec;
+mod net;
 mod stream;
 mod sync;
 
-/// Protocol defined error to be sent inside `STOP_SENDING` or `RESET_STREAM` frames. 
+/// Protocol defined error to be sent inside `STOP_SENDING` or `RESET_STREAM` frames.
 #[rustfmt::skip]
 pub trait Error:
     std::error::Error +
