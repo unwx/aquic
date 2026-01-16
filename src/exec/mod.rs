@@ -1,3 +1,4 @@
+use std::time::{Duration, Instant};
 use crate::conditional;
 
 conditional! {
@@ -39,13 +40,11 @@ conditional! {
 }
 
 
-/// Executor that provides an API to spawn async tasks,
-/// and some utilities to work with them.
-pub(crate) struct Executor {}
+/// Provides an API to work with async runtime.
+pub(crate) struct Runtime {}
 
-impl Executor {
-    /// [tokio::spawn].
-    #[cfg(feature = "tokio")]
+#[cfg(feature = "tokio")]
+impl Runtime {
     pub fn spawn_void<F>(future: F)
     where
         F: Future + Send + 'static,
@@ -53,14 +52,31 @@ impl Executor {
     {
         tokio::spawn(future);
     }
+    
+    pub async fn sleep(duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
 
-    /// [monoio::spawn].
-    #[cfg(feature = "monoio")]
+    pub async fn sleep_until(deadline: Instant) {
+        tokio::time::sleep_until(deadline.into()).await;
+    }
+}
+
+#[cfg(feature = "monoio")]
+impl Runtime {
     pub fn spawn_void<F>(future: F)
     where
         F: Future + 'static,
         F::Output: 'static,
     {
         monoio::spawn(future);
+    }
+
+    pub async fn sleep(duration: Duration) {
+        monoio::time::sleep(duration).await;
+    }
+
+    pub async fn sleep_until(deadline: Instant) {
+        monoio::time::sleep_until(deadline.into()).await;
     }
 }

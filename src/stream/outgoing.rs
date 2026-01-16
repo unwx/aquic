@@ -1,6 +1,6 @@
 use crate::Spec;
 use crate::backend::StreamError;
-use crate::exec::Executor;
+use crate::exec::{Runtime};
 use crate::stream::shared::OutStreamBackend;
 use crate::stream::{Encoder, Error, Payload};
 use crate::sync::oneshot;
@@ -87,7 +87,7 @@ impl<S: Spec> Outgoing<S> {
             }
         };
 
-        Executor::spawn_void(async move {
+        Runtime::spawn_void(async move {
             future.instrument(span).await;
         })
     }
@@ -101,7 +101,7 @@ impl<S: Spec> Outgoing<S> {
         let cancel_receiver = self.cancel_receiver.clone();
         let app_error_receiver = self.item_receiver.error_receiver();
 
-        Executor::spawn_void(async move {
+        Runtime::spawn_void(async move {
             select_biased! {
                 _ = cancel_receiver.recv().fuse() => {
                     // Do nothing.
