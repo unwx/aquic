@@ -1,7 +1,7 @@
 use crate::exec::SendOnMt;
 use std::future::Future;
 use std::io::Result;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs};
 
 /// A unified async interface for sockets.
 pub trait Socket: Sized {
@@ -34,7 +34,10 @@ pub struct Msg {
     pub(crate) buf: Vec<u8>,
 
     /// Never-empty address for sending, and always empty address for receiving (to be filled later).
-    pub(crate) addr: Option<SocketAddr>,
+    pub(crate) from: Option<SocketAddr>,
+
+    /// Never-empty address for sending, and always empty address for receiving (to be filled later).
+    pub(crate) to: Option<SocketAddr>,
 
     /// Number of bytes sent, or received.
     pub(crate) len: usize,
@@ -44,7 +47,8 @@ impl Msg {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             buf: vec![0; capacity],
-            addr: None,
+            from: None,
+            to: None,
             len: 0,
         }
     }
@@ -62,21 +66,38 @@ impl Msg {
         self.buf.as_mut_slice()
     }
 
-    /// Returns the remote socket address.
+    /// Returns the 'from' socket address.
     ///
     /// # Panics
     ///
     /// Panics if the address has not been set (e.g., if the message was
     /// just created but not yet received).
-    pub fn addr(&self) -> SocketAddr {
-        self.addr.expect("socket address is not ready yet")
+    pub fn from(&self) -> SocketAddr {
+        self.from.expect("socket address 'from' is not ready yet")
     }
 
-    /// Sets the remote socket address.
+    /// Sets the 'from' socket address.
     ///
     /// Use this when preparing a message to be sent.
-    pub fn set_addr(&mut self, addr: SocketAddr) {
-        self.addr = Some(addr);
+    pub fn set_from(&mut self, from: SocketAddr) {
+        self.from = Some(from);
+    }
+
+    /// Returns the 'to' socket address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the address has not been set (e.g., if the message was
+    /// just created but not yet received).
+    pub fn to(&self) -> SocketAddr {
+        self.to.expect("socket address 'to' is not ready yet")
+    }
+
+    /// Sets the 'to' socket address.
+    ///
+    /// Use this when preparing a message to be sent.
+    pub fn set_to(&mut self, to: SocketAddr) {
+        self.to = Some(to);
     }
 
     /// Returns the length of the valid payload in the buffer.
@@ -98,7 +119,8 @@ impl Msg {
 
     /// Resets the message state for reuse.
     pub(crate) fn reset(&mut self) {
-        self.addr = None;
+        self.from = None;
+        self.to = None;
         self.len = 0;
     }
 }
