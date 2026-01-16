@@ -19,10 +19,10 @@ pub trait Socket: Sized {
     /// Returns the number of messages successfully flushed to the network.
     fn send(&self, messages: &[Msg]) -> impl Future<Output = Result<usize>> + SendOnMt;
 
-    /// Enable port reuse for this socket.
+    /// Setup socket to ensure it will work correctly on current environment.
     ///
-    /// (`SO_REUSEPORT` on Linux).
-    fn enable_port_reuse(&self) -> Result<()>;
+    /// For example, enable `SO_REUSEPORT` on `monoio` async runtime.
+    fn setup(&self) -> Result<()>;
 }
 
 /// A reusable container for a single UDP packet.
