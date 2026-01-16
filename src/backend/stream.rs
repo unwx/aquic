@@ -1,12 +1,13 @@
 use crate::stream::{Priority, StreamId};
 use bytes::{Bytes, BytesMut};
 use std::borrow::Cow;
+use std::error::Error;
 use std::fmt::{Display, Formatter};
 use tracing::debug;
 
 /// An error during a QUIC stream operation.
 #[derive(Debug, Clone)]
-pub(crate) enum StreamError {
+pub enum StreamError {
     /// The stream direction is already finished.
     Finish,
 
@@ -31,14 +32,14 @@ impl Display for StreamError {
     }
 }
 
-impl std::error::Error for StreamError {}
+impl Error for StreamError {}
 
 /// A QUIC stream operation result.
-pub(crate) type StreamResult<T> = Result<T, StreamError>;
+pub type StreamResult<T> = Result<T, StreamError>;
 
 
 /// A QUIC stream API for various implementations of the QUIC protocol.
-pub(crate) trait StreamBackend {
+pub trait StreamBackend {
     /// Read available stream data into the buffer.
     ///
     /// Returns number of bytes written into the buffer,
