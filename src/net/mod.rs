@@ -1,12 +1,15 @@
 use crate::exec::SendOnMt;
+use bytes::BytesMut;
+use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::io::Result;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
+use std::time::Instant;
 
 /// A unified async interface for sockets.
 pub trait Socket: Sized {
     /// Creates and binds a new socket to the specified address.
-    fn bind<A: ToSocketAddrs>(addr: A) -> impl Future<Output = Result<Self>> + SendOnMt;
+    fn bind(addr: SocketAddr) -> impl Future<Output = Result<Self>> + SendOnMt;
 
     /// Receives a batch of messages.
     ///
@@ -19,108 +22,158 @@ pub trait Socket: Sized {
     /// Returns the number of messages successfully flushed to the network.
     fn send(&self, messages: &[Msg]) -> impl Future<Output = Result<usize>> + SendOnMt;
 
-    /// Setup socket to ensure it will work correctly on current environment.
-    ///
-    /// For example, enable `SO_REUSEPORT` on `monoio` async runtime.
+    /// Setup socket to ensure it will run efficiently on current environment.
     fn setup(&self) -> Result<()>;
+
+    /// Try to enable a specific feature.
+    fn enable(&self, feature: Feature) -> bool;
 }
 
-/// A reusable container for a single UDP packet.
-///
-/// This struct holds the packet buffer, the remote address, and the length
-/// of the valid payload. It is designed to be reused to minimize allocations.
+/// Message to be sent/received.
 pub struct Msg {
-    /// Buffer to send and receive data.
-    pub(crate) buf: Vec<u8>,
+    /// Buffer to sent, or receive data to.
+    pub(crate) buf: BytesMut,
 
-    /// Never-empty address for sending, and always empty address for receiving (to be filled later).
+    /// Source address.
     pub(crate) from: Option<SocketAddr>,
 
-    /// Never-empty address for sending, and always empty address for receiving (to be filled later).
+    /// Destination address.
     pub(crate) to: Option<SocketAddr>,
 
-    /// Number of bytes sent, or received.
-    pub(crate) len: usize,
+    /// Explicit Congestion Notification.
+    pub(crate) ecn: Ecn,
+
+    /// GSO/GRO segment size, if enabled.
+    pub(crate) segment_size: Option<usize>,
+
+    /// (Recv only): accurate packet timestamp.
+    pub(crate) rx_timestamp: Option<Instant>,
+
+    /// (Recv only): marks how many bytes were written.
+    pub(crate) rx_mark: usize,
 }
 
 impl Msg {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            buf: vec![0; capacity],
-            from: None,
-            to: None,
-            len: 0,
-        }
-    }
-
-    /// Returns a slice of the underlying buffer.
-    ///
-    /// Note: This returns the *entire* allocated buffer. Use [`len`](Self::len)
-    /// to determine how much of this buffer contains valid data.
+    /// Returns a reference to the underlying buffer data.
     pub fn buf(&self) -> &[u8] {
-        self.buf.as_slice()
+        self.buf.as_ref()
     }
 
-    /// Returns a mutable slice of the underlying buffer.
+    /// Returns a mutable reference to the underlying buffer data.
     pub fn buf_mut(&mut self) -> &mut [u8] {
-        self.buf.as_mut_slice()
+        self.buf.as_mut()
     }
 
-    /// Returns the 'from' socket address.
+    /// Returns the source address.
     ///
     /// # Panics
     ///
-    /// Panics if the address has not been set (e.g., if the message was
-    /// just created but not yet received).
+    /// Panics if the source address is not set.
     pub fn from(&self) -> SocketAddr {
         self.from.expect("socket address 'from' is not ready yet")
     }
 
-    /// Sets the 'from' socket address.
-    ///
-    /// Use this when preparing a message to be sent.
-    pub fn set_from(&mut self, from: SocketAddr) {
-        self.from = Some(from);
-    }
-
-    /// Returns the 'to' socket address.
+    /// Returns the destination address.
     ///
     /// # Panics
     ///
-    /// Panics if the address has not been set (e.g., if the message was
-    /// just created but not yet received).
+    /// Panics if the destination address is not set.
     pub fn to(&self) -> SocketAddr {
         self.to.expect("socket address 'to' is not ready yet")
     }
 
-    /// Sets the 'to' socket address.
-    ///
-    /// Use this when preparing a message to be sent.
+    /// Returns the Explicit Congestion Notification (ECN) bits.
+    pub fn ecn(&self) -> Ecn {
+        self.ecn
+    }
+
+    /// Returns the GSO/GRO segment size, if enabled.
+    pub fn segment_size(&self) -> Option<usize> {
+        self.segment_size
+    }
+
+    /// Returns the accurate packet timestamp, if available.
+    pub fn rx_timestamp(&self) -> Option<Instant> {
+        self.rx_timestamp
+    }
+
+    /// Returns the number of bytes written to the buffer during receive.
+    pub fn rx_mark(&self) -> usize {
+        self.rx_mark
+    }
+
+    /// Sets the source address.
+    pub fn set_from(&mut self, from: SocketAddr) {
+        self.from = Some(from);
+    }
+
+    /// Sets the destination address.
     pub fn set_to(&mut self, to: SocketAddr) {
         self.to = Some(to);
     }
 
-    /// Returns the length of the valid payload in the buffer.
-    pub fn len(&self) -> usize {
-        self.len
+    /// Sets the Explicit Congestion Notification (ECN) bits.
+    pub fn set_ecn(&mut self, ecn: Ecn) {
+        self.ecn = ecn;
     }
 
-    /// Sets the length of the valid payload.
-    ///
-    /// This is typically updated by the kernel after a receive operation.
-    pub fn set_len(&mut self, len: usize) {
-        self.len = len;
+    /// Sets the GSO/GRO segment size.
+    pub fn set_segment_size(&mut self, segment_size: Option<usize>) {
+        self.segment_size = segment_size;
     }
 
-    /// Resize the internal buffer.
-    pub(crate) fn resize(&mut self, capacity: usize) {
-        self.buf.resize(capacity, 0);
+    /// Sets the accurate packet timestamp.
+    pub fn set_rx_timestamp(&mut self, rx_timestamp: Option<Instant>) {
+        self.rx_timestamp = rx_timestamp;
     }
 
-    /// Resets the message state for reuse.
-    pub(crate) fn reset(&mut self) {
-        self.from = None;
-        self.to = None;
-        self.len = 0;
+    /// Sets the number of bytes written to the buffer.
+    pub fn set_rx_mark(&mut self, rx_mark: usize) {
+        self.rx_mark = rx_mark;
+    }
+}
+
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Feature {
+    /// `SO_REUSEPORT` on Linux.
+    ReusePort,
+
+    /// `UDP_GRO` on Linux.
+    GRO,
+}
+
+
+/// Explicit Congestion Notification.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Ecn {
+    /// Not ECN-Capable Transport (00)
+    NEct = 0b00,
+
+    /// ECN Capable Transport(1) (01).
+    Ect1 = 0b01,
+
+    /// ECN Capable Transport(0) (10),
+    Ect0 = 0b10,
+
+    /// Congestion Experienced (11)
+    Ce = 0b11,
+}
+
+impl Default for Ecn {
+    fn default() -> Self {
+        Self::NEct
+    }
+}
+
+impl Display for Ecn {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ecn::NEct => write!(f, "Not-ECT"),
+            Ecn::Ect1 => write!(f, "ECT(1)"),
+            Ecn::Ect0 => write!(f, "ECT(0)"),
+            Ecn::Ce => write!(f, "CE"),
+        }
     }
 }
