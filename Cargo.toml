@@ -20,10 +20,13 @@ quiche = { version = "0.24", optional = true }
 event-listener = { version = "5.4" } # TODO: make optional in the future, enable it only for Send runtimes.
 crossfire = { version = "2.1", optional = true }
 
+rand = "0.9"
 futures = "0.3"
 tracing = "0.1"
 bytes = "1.11"
 rustc-hash = "2.1"
+aes = "0.8"
+bitvec = "1.0"
 
 
 [build-dependencies]
