@@ -41,9 +41,9 @@ pub(crate) struct Incoming<S: Spec> {
 impl<S: Spec> Incoming<S> {
     pub fn new(
         backend: InStreamBackend,
-        decoder: S::Decoder,
         item_sender: stream::Sender<S>,
     ) -> Self {
+        let decoder = S::new_decoder();
         let (cancel_sender, cancel_receiver) = oneshot::channel();
 
         Self {

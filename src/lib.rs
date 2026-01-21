@@ -1,8 +1,9 @@
-use crate::stream::codec::{Decoder, DecoderFactory, Encoder, EncoderFactory};
+use crate::stream::codec::{Decoder, Encoder};
 use std::fmt::Debug;
 use std::hash::Hash;
 
-mod backend;
+pub mod backend;
+mod conn;
 mod exec;
 mod net;
 mod stream;
@@ -74,7 +75,7 @@ pub trait Estimate {
 }
 
 /// Protocol specification.
-pub trait Spec: Debug + Send + 'static {
+pub trait Spec: Debug + SendOnMt + 'static {
     /// Item to be decoded or encoded.
     type Item: Estimate + SendOnMt + Unpin + 'static;
 
@@ -87,12 +88,6 @@ pub trait Spec: Debug + Send + 'static {
     /// Stream decoder.
     type Decoder: Decoder<Item = Self::Item> + SendOnMt + 'static;
 
-    /// [Self::Encoder] factory.
-    type EncoderFactory: EncoderFactory<Encoder = Self::Encoder>;
-
-    /// [Self::Decoder] factory.
-    type DecoderFactory: DecoderFactory<Decoder = Self::Decoder>;
-
 
     /// Returns protocol error in case of internal error,
     /// and we need to hang up the communication.
@@ -103,6 +98,13 @@ pub trait Spec: Debug + Send + 'static {
 
     /// Converts [Self::Decoder] error into protocol [Self::Error].
     fn on_decoder_error(error: &<Self::Decoder as Decoder>::Error) -> Self::Error;
+
+
+    /// Creates a new [`Encoder`] instance.
+    fn new_encoder() -> Self::Encoder;
+
+    /// Creates a new [`Decoder`] instance.
+    fn new_decoder() -> Self::Decoder;
 }
 
 

@@ -3,24 +3,6 @@ use crate::stream::Payload;
 use bytes::{Bytes, BytesMut};
 use std::future::Future;
 
-/// A factory for creating new instances of [`Decoder`].
-pub trait DecoderFactory {
-    /// The concrete [`Decoder`] implementation created by this factory.
-    type Decoder: Decoder;
-
-    /// Creates a new [`Decoder`] instance.
-    fn new_decoder() -> Self::Decoder;
-}
-
-/// A factory for creating new instances of [`Encoder`].
-pub trait EncoderFactory {
-    /// The concrete [`Encoder`] implementation created by this factory.
-    type Encoder: Encoder;
-
-    /// Creates a new [`Encoder`] instance.
-    fn new_encoder() -> Self::Encoder;
-}
-
 /// A QUIC connection consists of multiple streams where data flows.
 ///
 /// [`Decoder`] is a stateful object responsible for a single incoming QUIC stream.
