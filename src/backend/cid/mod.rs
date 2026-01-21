@@ -31,12 +31,12 @@ impl ConnectionId {
 
     /// Returns connection ID as an immutable slice.
     pub fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
+        self.0.as_slice()
     }
 
     /// Returns connection ID as a mutable slice.
     pub fn as_mut(&mut self) -> &mut [u8] {
-        self.0.as_mut()
+        self.0.as_slice_mut()
     }
 
     /// Returns connection ID length in bytes.
@@ -154,28 +154,26 @@ impl<const SIZE: usize> Bytes<SIZE> {
         array
     }
 
+    pub fn as_slice(&self) -> &[u8] {
+        &self[..self.len]
+    }
+
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        &mut self[..self.len]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     pub fn into_inner(self) -> [u8; SIZE] {
         self.bytes
     }
 }
 
-impl<const SIZE: usize> Deref for Bytes<SIZE> {
-    type Target = [u8; SIZE];
-
-    fn deref(&self) -> &Self::Target {
-        &self.bytes
-    }
-}
-
-impl<const SIZE: usize> DerefMut for Bytes<SIZE> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.bytes
-    }
-}
-
 impl<const SIZE: usize> PartialEq for Bytes<SIZE> {
     fn eq(&self, other: &Self) -> bool {
-        self[..self.len] == other[..other.len]
+        self.as_slice() == other.as_slice()
     }
 }
 
@@ -183,18 +181,18 @@ impl<const SIZE: usize> Eq for Bytes<SIZE> {}
 
 impl<const SIZE: usize> PartialOrd for Bytes<SIZE> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self[..self.len].partial_cmp(&other[..other.len])
+        self.as_slice().partial_cmp(other.as_slice())
     }
 }
 
 impl<const SIZE: usize> Ord for Bytes<SIZE> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self[..self.len].cmp(&other[..other.len])
+        self.as_slice().cmp(other.as_slice())
     }
 }
 
 impl<const SIZE: usize> Hash for Bytes<SIZE> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write(&self[..self.len])
+        state.write(self.as_slice())
     }
 }

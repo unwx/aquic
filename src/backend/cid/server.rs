@@ -172,11 +172,12 @@ impl ConnIdGenerator for ServerConnIdGenerator {
     fn generate_cid(&mut self) -> ConnectionId {
         let mut cid = self.build_cid();
 
+        // (1 for first octet) + (16 for plaintext: server_id + nonce)
         if cid.len() == 17 {
-            let mut block = GenericArray::from_mut_slice(&mut [1..]);
+            let mut block = GenericArray::from_mut_slice(&mut cid.as_slice_mut()[1..]);
             self.cipher.encrypt_block(&mut block);
         } else {
-            encrypt_four_pass(&self.cipher, &mut cid);
+            encrypt_four_pass(&self.cipher, &mut cid.as_slice_mut()[1..]);
         }
 
         ConnectionId(cid)
@@ -215,13 +216,14 @@ impl ConnIdGenerator for ServerConnIdGenerator {
     }
 
     fn decrypt(&self, cid: &mut ConnectionId) -> Result<(), ConnIdError> {
-        let mut cid = &mut cid.0;
+        let mut cid = cid.as_mut();
 
+        // (1 for first octet) + (16 for plaintext: server_id + nonce)
         if cid.len() == 17 {
-            let mut block = GenericArray::from_mut_slice(&mut [1..]);
+            let mut block = GenericArray::from_mut_slice(&mut cid[1..]);
             self.cipher.decrypt_block(&mut block);
         } else {
-            decrypt_four_pass(&self.cipher, &mut cid);
+            decrypt_four_pass(&self.cipher, &mut cid[1..]);
         }
 
         Ok(())
@@ -277,14 +279,18 @@ impl ConnIdGenerator for ServerConnIdGenerator {
 // Also, `bitvec` uses `unsafe` under the hood, so, in theory, this should be replaced in the future,
 // if it is possible to make **readable** (no bit-operations hell) version.
 
-fn encrypt_four_pass(cipher: &Aes128, cid: &mut Bytes<20>) {
-    let cid_len = cid.len as u8;
+fn encrypt_four_pass(cipher: &Aes128, plaintext: &mut [u8]) {
+    if plaintext.is_empty() {
+        return;
+    }
+
+    let cid_len = (plaintext.len() as u8) + 1;
 
     let mut left = Bits::ZERO;
     let mut right = Bits::ZERO;
     let mut temp = Bits::ZERO;
 
-    let plaintext = cid[1..].view_bits_mut::<Msb0>();
+    let plaintext = plaintext.view_bits_mut::<Msb0>();
     let bits = plaintext.len();
     let left_bits = bits / 2;
     let right_bits = bits - left_bits;
@@ -319,9 +325,13 @@ fn encrypt_four_pass(cipher: &Aes128, cid: &mut Bytes<20>) {
     plaintext[left_bits..].copy_from_bitslice(&right[AES_BLOCK_SIZE_BITS - right_bits..]);
 }
 
-fn decrypt_four_pass(cipher: &Aes128, cid: &mut Bytes<20>) {
-    let cid_len = cid.len as u8;
-    let plaintext = cid[1..].view_bits_mut::<Msb0>();
+fn decrypt_four_pass(cipher: &Aes128, plaintext: &mut [u8]) {
+    if plaintext.is_empty() {
+        return;
+    }
+
+    let cid_len = (plaintext.len() as u8) + 1;
+    let plaintext = plaintext.view_bits_mut::<Msb0>();
 
     let bits = plaintext.len();
     let left_bits = bits / 2;
