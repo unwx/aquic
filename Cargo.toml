@@ -6,8 +6,8 @@ edition = "2024"
 
 [features]
 quiche = ["dep:quiche"]
-tokio = ["dep:tokio", "dep:crossfire"]
-monoio = ["dep:monoio"]
+tokio = ["dep:tokio", "dep:crossfire", "dep:sharded-slab"]
+monoio = ["dep:monoio", "dep:slab"]
 default = []
 
 
@@ -16,9 +16,12 @@ tokio = { version = "1.49", features = ["rt", "time"], optional = true }
 monoio = { version = "0.2", optional = true }
 
 quiche = { version = "0.24", optional = true }
+quinn-proto = { version = "0.11", optional = true }
 
 event-listener = { version = "5.4" } # TODO: make optional in the future, enable it only for Send runtimes.
 crossfire = { version = "2.1", optional = true }
+slab = { version = "0.4", optional = true }
+sharded-slab = { version = "0.1", optional = true }
 
 rand = "0.9"
 futures = "0.3"
