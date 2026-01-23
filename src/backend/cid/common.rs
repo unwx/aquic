@@ -1,4 +1,6 @@
-use crate::backend::cid::{Bytes, ConnIdError, ConnIdGenerator, ConnectionId};
+use crate::backend::NoopConnIdMeta;
+use crate::backend::cid::{ConnIdError, ConnIdGenerator, ConnectionId};
+use crate::util::ArrayVec;
 use rand::{RngCore, rng};
 use std::time::Duration;
 
@@ -30,11 +32,11 @@ impl RandConnIdGenerator {
 }
 
 impl ConnIdGenerator for RandConnIdGenerator {
-    type Meta = ();
+    type Meta = NoopConnIdMeta;
 
     fn generate_cid(&mut self) -> ConnectionId {
-        let buf = Bytes::ZERO;
-        rng().fill_bytes(&mut buf.bytes[..self.length]);
+        let mut buf = ArrayVec::zeroed();
+        rng().fill_bytes(&mut buf.as_slice_all_mut()[..self.length]);
 
         ConnectionId(buf)
     }
@@ -56,6 +58,6 @@ impl ConnIdGenerator for RandConnIdGenerator {
     }
 
     fn parse(&self, _cid: &ConnectionId) -> Result<Self::Meta, ConnIdError> {
-        Ok(())
+        Ok(NoopConnIdMeta)
     }
 }

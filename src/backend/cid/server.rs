@@ -1,5 +1,6 @@
-use crate::backend::cid::{Bytes, ConnIdMeta};
+use crate::backend::cid::{ConnIdMeta};
 use crate::backend::cid::{ConnIdError, ConnIdGenerator, ConnectionId, MAX_CID_LEN};
+use crate::util::ArrayVec;
 use aes::Aes128;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
@@ -10,6 +11,7 @@ use bitvec::prelude::BitVec;
 use bitvec::view::BitView;
 use rand::{RngCore, rng};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// AES block size in bytes.
 const AES_BLOCK_SIZE: usize = 16;
@@ -47,9 +49,6 @@ impl ConnIdMeta for ServerConnIdMeta {
 /// In case you want to store advanced routing information like region, zone,
 /// you might want to store it inside `server_id` too.
 pub struct ServerConnIdGenerator {
-    /// 16-byte key shared with the Load Balancer.
-    key: [u8; 16],
-
     /// Your Server ID (Routing Tag).
     server_id: u32,
 
@@ -91,7 +90,7 @@ impl ServerConnIdGenerator {
     /// - and `entropy_bits` is `34`,
     /// - then the resulting `Nonce` would be `50` bits long.
     pub fn new(
-        key: [u8; 16],
+        key: Zeroizing<[u8; 16]>,
         server_id: u32,
         core_id: u16,
         server_id_bits: usize,
@@ -107,7 +106,6 @@ impl ServerConnIdGenerator {
         assert!(entropy_bits >= 32, "entropy_bits must be in range [32..]");
 
         Self {
-            key,
             server_id,
             core_id,
             server_id_bits,
@@ -119,11 +117,11 @@ impl ServerConnIdGenerator {
     }
 
     /// Helper to pack the bits: `[ FirstOctet | ServerID | CoreID | Padding ]`
-    fn build_cid(&self) -> Bytes<MAX_CID_LEN> {
-        let mut buf = Bytes::ZERO;
+    fn build_cid(&self) -> ArrayVec<u8, MAX_CID_LEN> {
+        let mut buf = ArrayVec::zeroed();
         buf[0] = rng().next_u32() as u8;
 
-        let mut plaintext = buf[1..].view_bits_mut::<Msb0>();
+        let mut plaintext = buf.as_slice_all_mut()[1..].view_bits_mut::<Msb0>();
         let mut offset = 0;
 
         plaintext[offset..offset + self.server_id_bits].store_be(self.server_id);

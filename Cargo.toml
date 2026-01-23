@@ -8,6 +8,7 @@ edition = "2024"
 quiche = ["dep:quiche"]
 tokio = ["dep:tokio", "dep:crossfire", "dep:sharded-slab"]
 monoio = ["dep:monoio", "dep:slab"]
+server-util = ["dep:bitvec", "dep:aes", "dep:zeroize"]
 default = []
 
 
@@ -18,18 +19,21 @@ monoio = { version = "0.2", optional = true }
 quiche = { version = "0.24", optional = true }
 quinn-proto = { version = "0.11", optional = true }
 
-event-listener = { version = "5.4" } # TODO: make optional in the future, enable it only for Send runtimes.
-crossfire = { version = "2.1", optional = true }
-slab = { version = "0.4", optional = true }
+event-listener = { version = "5.4" } # TODO(refactor): should be optional, for `Send` runtimes only.
+crossfire = { version = "3.0", optional = true }
 sharded-slab = { version = "0.1", optional = true }
+
+slab = { version = "0.4", optional = true }
+
+bitvec = { version = "1.0", optional = true }
+aes = { version = "0.8", features = ["zeroize"], optional = true }
+zeroize = { version = "1.8", optional = true }
 
 rand = "0.9"
 futures = "0.3"
 tracing = "0.1"
 bytes = "1.11"
 rustc-hash = "2.1"
-aes = "0.8"
-bitvec = "1.0"
 
 
 [build-dependencies]
