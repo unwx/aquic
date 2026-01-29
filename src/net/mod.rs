@@ -1,179 +1,61 @@
 use crate::exec::SendOnMt;
-use bytes::BytesMut;
-use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::io::Result;
 use std::net::SocketAddr;
-use std::time::Instant;
 
-/// A unified async interface for sockets.
+
+mod types;
+pub use types::*;
+
+
+/// A socket to be used for QUIC connections.
+///
+/// In theory application may provide a socket implementation that works not on UDP, but on something else.
+/// Though I believe it may not worth it...
+///
+/// In ideal scenario, QUIC backend and Socket will support GSO/GRO and sendmmsg/recvmmsg combined.
+/// Therefore we might send many different packets for different connections in a single syscall, like:
+/// - 1 GSO packet for CID `A`,
+/// - 3 packets that are not padded to the previous packet GSO size for CID `A`,
+/// - 2 packets for CID `B`.
+///
+/// Ideally, the total payload of these packets should not exceed the socket's buffer.
 pub trait Socket: Sized {
     /// Creates and binds a new socket to the specified address.
+    ///
+    /// Implementation **shoud** attempt to:
+    /// - Reuse port (for example, `SO_REUSEPORT` on Linux) to permits multiple sockets to be bound to an identical socket address.
+    /// - Enable GRO (for example, `UDP_GRO` on Linux) to make the socket receive multiple datagrams worth of data as a single large buffer.
+    /// - Set Don't Fragment (for example, `IP_DONTFRAG` with `IP_PMTUDISC_DO` on Linux) to make socket return an error if packet size exceeds MTU.
     fn bind(addr: SocketAddr) -> impl Future<Output = Result<Self>> + SendOnMt;
 
-    /// Receives a batch of messages.
+    /// Returns an address this socket is bound to.
     ///
-    /// The `messages` slice will be filled with incoming packets.
-    /// Returns the number of messages successfully read.
-    fn recv(&self, messages: &mut [Msg]) -> impl Future<Output = Result<usize>> + SendOnMt;
+    /// **May** be unspecified.
+    fn source_addr(&self) -> SocketAddr;
 
     /// Sends a batch of messages.
     ///
     /// Returns the number of messages successfully flushed to the network.
-    fn send(&self, messages: &[Msg]) -> impl Future<Output = Result<usize>> + SendOnMt;
-
-    /// Setup socket to ensure it will run efficiently on current environment.
-    fn setup(&self) -> Result<()>;
-
-    /// Try to enable a specific feature.
-    fn enable(&self, feature: Feature) -> bool;
-}
-
-/// Message to be sent/received.
-pub struct Msg {
-    /// Buffer to sent, or receive data to.
-    pub(crate) buf: BytesMut,
-
-    /// Source address.
-    pub(crate) from: Option<SocketAddr>,
-
-    /// Destination address.
-    pub(crate) to: Option<SocketAddr>,
-
-    /// Explicit Congestion Notification.
-    pub(crate) ecn: Ecn,
-
-    /// GSO/GRO segment size, if enabled.
-    pub(crate) segment_size: Option<usize>,
-
-    /// (Recv only): accurate packet timestamp.
-    pub(crate) rx_timestamp: Option<Instant>,
-
-    /// (Recv only): marks how many bytes were written.
-    pub(crate) rx_mark: usize,
-}
-
-impl Msg {
-    /// Returns a reference to the underlying buffer data.
-    pub fn buf(&self) -> &[u8] {
-        self.buf.as_ref()
-    }
-
-    /// Returns a mutable reference to the underlying buffer data.
-    pub fn buf_mut(&mut self) -> &mut [u8] {
-        self.buf.as_mut()
-    }
-
-    /// Returns the source address.
     ///
-    /// # Panics
+    /// In case of partial write, the caller should wait until [`ready_to_send`](Socket::ready_to_send) returns.
+    fn send<'a, B: Buf<'a>>(
+        &self,
+        messages: &[SendMsg<B>],
+    ) -> impl Future<Output = Result<usize>> + SendOnMt;
+
+    // Waits until the socket become ready to send packets again.
+    fn ready_to_send(&self) -> impl Future<Output = ()> + SendOnMt;
+
+    /// Receives a batch of messages.
     ///
-    /// Panics if the source address is not set.
-    pub fn from(&self) -> SocketAddr {
-        self.from.expect("socket address 'from' is not ready yet")
-    }
+    /// The `msgs` slice will be filled with incoming packets.
+    /// Returns the number of messages successfully read.
+    fn recv<'a, B: BufMut<'a>>(
+        &self,
+        msgs: &mut [RecvMsg<B>],
+    ) -> impl Future<Output = Result<usize>> + SendOnMt;
 
-    /// Returns the destination address.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the destination address is not set.
-    pub fn to(&self) -> SocketAddr {
-        self.to.expect("socket address 'to' is not ready yet")
-    }
-
-    /// Returns the Explicit Congestion Notification (ECN) bits.
-    pub fn ecn(&self) -> Ecn {
-        self.ecn
-    }
-
-    /// Returns the GSO/GRO segment size, if enabled.
-    pub fn segment_size(&self) -> Option<usize> {
-        self.segment_size
-    }
-
-    /// Returns the accurate packet timestamp, if available.
-    pub fn rx_timestamp(&self) -> Option<Instant> {
-        self.rx_timestamp
-    }
-
-    /// Returns the number of bytes written to the buffer during receive.
-    pub fn rx_mark(&self) -> usize {
-        self.rx_mark
-    }
-
-    /// Sets the source address.
-    pub fn set_from(&mut self, from: SocketAddr) {
-        self.from = Some(from);
-    }
-
-    /// Sets the destination address.
-    pub fn set_to(&mut self, to: SocketAddr) {
-        self.to = Some(to);
-    }
-
-    /// Sets the Explicit Congestion Notification (ECN) bits.
-    pub fn set_ecn(&mut self, ecn: Ecn) {
-        self.ecn = ecn;
-    }
-
-    /// Sets the GSO/GRO segment size.
-    pub fn set_segment_size(&mut self, segment_size: Option<usize>) {
-        self.segment_size = segment_size;
-    }
-
-    /// Sets the accurate packet timestamp.
-    pub fn set_rx_timestamp(&mut self, rx_timestamp: Option<Instant>) {
-        self.rx_timestamp = rx_timestamp;
-    }
-
-    /// Sets the number of bytes written to the buffer.
-    pub fn set_rx_mark(&mut self, rx_mark: usize) {
-        self.rx_mark = rx_mark;
-    }
-}
-
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Feature {
-    /// `SO_REUSEPORT` on Linux.
-    ReusePort,
-
-    /// `UDP_GRO` on Linux.
-    GRO,
-}
-
-
-/// Explicit Congestion Notification.
-#[repr(u8)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Ecn {
-    /// Not ECN-Capable Transport (00)
-    NEct = 0b00,
-
-    /// ECN Capable Transport(1) (01).
-    Ect1 = 0b01,
-
-    /// ECN Capable Transport(0) (10),
-    Ect0 = 0b10,
-
-    /// Congestion Experienced (11)
-    Ce = 0b11,
-}
-
-impl Default for Ecn {
-    fn default() -> Self {
-        Self::NEct
-    }
-}
-
-impl Display for Ecn {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Ecn::NEct => write!(f, "Not-ECT"),
-            Ecn::Ect1 => write!(f, "ECT(1)"),
-            Ecn::Ect0 => write!(f, "ECT(0)"),
-            Ecn::Ce => write!(f, "CE"),
-        }
-    }
+    /// Returns features that socket has enabled (on `bind`) and supports (per message).
+    fn features(&self) -> impl Iterator<Item = SoFeat> + '_;
 }
