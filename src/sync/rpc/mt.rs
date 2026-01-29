@@ -1,6 +1,7 @@
 use crate::sync::mpsc;
 use crate::sync::mpsc::unbounded::UnboundedSender;
 use crate::sync::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
+use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -24,7 +25,11 @@ enum State<R> {
 }
 
 
-pub(crate) struct Remote<T, R> {
+pub(crate) struct Remote<T, R>
+where
+    T: Send + Unpin + 'static,
+    R: Send + Unpin + 'static,
+{
     sender: mpsc::unbounded::Sender<Call<T, R>>,
 
     // According to `shared_slab` doc, each returned key on `insert` has a generation included,
@@ -79,7 +84,21 @@ where
     }
 }
 
-impl<T, R> Clone for Remote<T, R> {
+impl<T, R> Debug for Remote<T, R>
+where
+    T: Send + Unpin + 'static,
+    R: Send + Unpin + 'static,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("mt::Remote").finish()
+    }
+}
+
+impl<T, R> Clone for Remote<T, R>
+where
+    T: Send + Unpin + 'static,
+    R: Send + Unpin + 'static,
+{
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
@@ -100,7 +119,9 @@ impl<R> RemoteCallback<R> for Callback<R> {
         let Some(entry) = self.storage.get(self.key) else {
             return;
         };
-        let Some(state) = entry.lock().unwrap().as_mut() else {
+
+        let mut guard = entry.lock().unwrap();
+        let Some(state) = guard.as_mut() else {
             return;
         };
 
@@ -132,7 +153,11 @@ impl<R> Drop for Callback<R> {
         let Some(entry) = self.storage.get(self.key) else {
             return;
         };
-        let Some(state) = entry.lock().unwrap().as_mut() else {
+
+        let Ok(mut guard) = entry.lock() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
             return;
         };
 

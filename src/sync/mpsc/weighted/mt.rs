@@ -23,7 +23,7 @@ pub(crate) fn channel<T: Send + Unpin + 'static>(bound: usize) -> (Sender<T>, Re
 }
 
 
-pub(crate) struct Sender<T> {
+pub(crate) struct Sender<T: Send + Unpin + 'static> {
     sender: mt::Sender<(T, usize)>,
     shared: Arc<Shared>,
 }
@@ -93,7 +93,7 @@ impl<T: Send + Unpin + 'static> WeightedSender<T> for Sender<T> {
     }
 }
 
-impl<T: Send> Clone for Sender<T> {
+impl<T: Send + Unpin + 'static> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
@@ -103,7 +103,7 @@ impl<T: Send> Clone for Sender<T> {
 }
 
 
-pub(crate) struct Receiver<T> {
+pub(crate) struct Receiver<T: Send + Unpin + 'static> {
     receiver: mt::Receiver<(T, usize)>,
     shared: Arc<Shared>,
 }
@@ -145,7 +145,7 @@ impl<T: Send + Unpin + 'static> WeightedReceiver<T> for Receiver<T> {
     }
 }
 
-impl<T> Drop for Receiver<T> {
+impl<T: Send + Unpin + 'static> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.shared.open.store(false, Release);
         self.shared.occupation.store(0, Release);

@@ -3,6 +3,7 @@ use crate::sync::mpsc::unbounded::UnboundedSender;
 use crate::sync::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
 use slab::Slab;
 use std::cell::RefCell;
+use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -98,6 +99,12 @@ where
                 callback: None,
             })
             .map_err(|_| SendError::Closed)
+    }
+}
+
+impl<T, R> Debug for crate::sync::rpc::mt::Remote<T, R> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("st::Remote").finish()
     }
 }
 

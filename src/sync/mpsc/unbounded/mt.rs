@@ -1,3 +1,5 @@
+use crossfire::mpsc::List;
+
 use crate::sync::mpsc::unbounded::{UnboundedReceiver, UnboundedSender};
 use crate::sync::mpsc::{SendError, TryRecvError};
 
@@ -7,11 +9,11 @@ pub(crate) fn channel<T: Send + Unpin + 'static>() -> (Sender<T>, Receiver<T>) {
 }
 
 
-pub(crate) struct Sender<T> {
-    inner: crossfire::MTx<T>,
+pub(crate) struct Sender<T: Send + Unpin + 'static> {
+    inner: crossfire::MTx<List<T>>,
 }
 
-impl<T: Send> Clone for Sender<T> {
+impl<T: Send + Unpin + 'static> Clone for Sender<T> {
     fn clone(&self) -> Self {
         Sender {
             inner: self.inner.clone(),
@@ -30,8 +32,8 @@ impl<T: Send + Unpin + 'static> UnboundedSender<T> for Sender<T> {
 }
 
 
-pub(crate) struct Receiver<T> {
-    inner: crossfire::AsyncRx<T>,
+pub(crate) struct Receiver<T: Send + Unpin + 'static> {
+    inner: crossfire::AsyncRx<List<T>>,
 }
 
 impl<T: Send + Unpin + 'static> UnboundedReceiver<T> for Receiver<T> {

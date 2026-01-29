@@ -1,7 +1,7 @@
 use crate::conditional;
 use crate::exec::SendOnMt;
 use crate::sync::mpsc;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 /// Failure on RPC call.
 #[derive(Debug, Copy, Clone)]
@@ -28,18 +28,19 @@ impl std::error::Error for SendError {}
 
 
 /// A client to make sync and async calls.
-pub(crate) trait RemoteClient<T, R, C: RemoteCallback<R>>: Clone
+pub(crate) trait RemoteClient<T, R, C: RemoteCallback<R>>: Debug + Clone
 where
     T: SendOnMt + Unpin + 'static,
     R: SendOnMt + Unpin + 'static,
+    C: SendOnMt + Unpin + 'static,
 {
     /// Create a new client with a specified `sender`.
     fn new(sender: mpsc::unbounded::Sender<RemoteCall<T, C>>) -> Self;
 
     /// Make a call with provided `args` and wait for the result.
-    /// 
+    ///
     /// # Cancel safety.
-    /// 
+    ///
     /// This method is cancel safe, but, obviously, the result is going to be lost.
     fn send(&self, args: T) -> impl Future<Output = Result<R, SendError>> + SendOnMt;
 
