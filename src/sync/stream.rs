@@ -14,11 +14,15 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
 use std::thread::panicking;
+use std::time::Instant;
 
 /// Creates a `spsc` channel for a single stream direction communication.
 ///
-/// Also see [weighted] for more info about the underlying channel.
-pub(crate) fn channel<S: Spec>(bound: usize) -> (Sender<S>, Receiver<S>) {
+/// Also see [Estimate][`crate::Estimate`] for more info about the underlying channel and the meaning of the `bound` parameter.
+pub fn channel<S: Spec>(
+    bound: usize,
+    shutdown_warn_receiver: oneshot::Receiver<Instant>,
+) -> (Sender<S>, Receiver<S>) {
     let (item_sender, item_receiver) = weighted::channel(bound);
     let (error_sender, error_receiver) = oneshot::channel();
     let priority_cell = PriorityCell::new();
@@ -27,12 +31,14 @@ pub(crate) fn channel<S: Spec>(bound: usize) -> (Sender<S>, Receiver<S>) {
         item_sender,
         error_sender: error_sender.clone(),
         error_receiver: error_receiver.clone(),
+        shutdown_warn_receiver: shutdown_warn_receiver.clone(),
         priority_cell: priority_cell.clone(),
     };
     let stream_receiver = Receiver {
         item_receiver,
         error_sender,
         error_receiver,
+        shutdown_warn_receiver,
         priority_cell,
     };
 
@@ -49,6 +55,9 @@ pub(crate) fn channel<S: Spec>(bound: usize) -> (Sender<S>, Receiver<S>) {
 ///    or [`send_final()`](Sender::send_final), which sends a `FIN` bit to the peer.
 /// 3. **Aborting**: The stream direction can be abruptly terminated using [`reset()`](Sender::reset),
 ///    sending a `RESET_STREAM` frame.
+///
+/// **Note**: by "sending" it's implied "scheduled to be sent by QUIC implementation and network I/O loop":
+/// when you send `FIN` or `RESET_STREAM`, it is not guaranteed that stream is going to be finished with the specified state.
 ///
 /// # Drop Behavior
 ///
@@ -68,17 +77,20 @@ pub struct Sender<S: Spec> {
     /// Receiver to listen for an external closure event (e.g., peer sends [Error::StopSending]).
     error_receiver: oneshot::Receiver<Error<S>>,
 
+    /// Receiver to listen for a warning, that connection is going to be closed at informed point of time.
+    shutdown_warn_receiver: oneshot::Receiver<Instant>,
+
     /// Cell to update stream priority dynamically.
     priority_cell: PriorityCell,
 }
 
 //noinspection DuplicatedCode
 impl<S: Spec> Sender<S> {
-    /// Sends a value, equivalent to [Payload::Chunk].
+    /// Sends a value, equivalent to [Payload::Item].
     ///
     /// See [`send_item`](Self::send_item).
     pub async fn send(&mut self, value: S::Item) -> Result<(), Error<S>> {
-        self.send_item(Payload::Chunk(value)).await
+        self.send_item(Payload::Item(value)).await
     }
 
     /// Sends a value with `FIN` flag set, equivalent to [Payload::Last].
@@ -111,7 +123,7 @@ impl<S: Spec> Sender<S> {
     /// - Buffer up to `1024` items with [`estimate`](Estimate) of `1`.
     /// - Or `infinite` number of items when [`estimate`](Estimate) returns `0` for each of them.
     /// - Or any other combination of items weight, until their sum exceeds the `bound`.
-    ///  
+    ///
     /// **Note**: with bound of `0`, the channel will block
     /// if there is more than `1` message in the internal queue,
     /// **unless** its weight is `0`.
@@ -183,8 +195,8 @@ impl<S: Spec> Sender<S> {
     /// Abruptly terminates the stream direction with [Error::Connection].
     ///
     /// If the direction is already closed, this operation is a no-op.
-    pub(crate) fn terminate_due_connection(&mut self, error: Arc<io::Error>) {
-        self.close(Error::Connection(error));
+    pub(crate) fn terminate_due_connection(&mut self) {
+        self.close(Error::Connection);
     }
 
     /// Abruptly terminates the stream direction with [Error::HangUp].
@@ -206,7 +218,7 @@ impl<S: Spec> Sender<S> {
         }
     }
 
-    /// Returns a handle to the error receiver.
+    /// Returns an error receiver.
     ///
     /// This allows external observers (like background tasks) to wait for the
     /// stream direction to complete or fail without holding a mutable reference to the sender.
@@ -214,22 +226,21 @@ impl<S: Spec> Sender<S> {
         self.error_receiver.clone()
     }
 
+    /// Returns a shutdown warning receiver.
+    ///
+    /// It's a receiver, used to listen for a warning,
+    /// that connection is going to be closed at informed point of time.
+    ///
+    /// This allows external observers (like background tasks) to wait for
+    /// this signal and act accordingly to gracefully shutdown the stream, if possible.
+    pub fn shutdown_warn_receiver(&self) -> oneshot::Receiver<Instant> {
+        self.shutdown_warn_receiver.clone()
+    }
+
 
     /// Updates the priority of the stream direction.
-    ///
-    /// - `urgency`: Lower values indicate higher priority (0 is highest).
-    /// - `incremental`:
-    ///   Controls how bandwidth is shared among streams with the same urgency.
-    ///
-    ///    - `false`: **Sequential**. The scheduler attempts to send this stream's data
-    ///      back-to-back until completion before moving to the next stream.
-    ///      Use this for data that requires the whole payload to be useful (e.g., scripts, CSS).
-    ///
-    ///    - `true`: **Incremental**. The scheduler interleaves data from this stream
-    ///      with other incremental streams of the same urgency.
-    ///      Use this for data that can be processed as it arrives (e.g., progressive images, video).
-    pub fn set_priority(&self, urgency: u8, incremental: bool) {
-        self.priority_cell.set(Priority::new(urgency, incremental));
+    pub fn set_priority(&self, priority: Priority) {
+        self.priority_cell.set(priority);
     }
 
 
@@ -238,7 +249,7 @@ impl<S: Spec> Sender<S> {
     ///
     /// If the channel is closed, returns [Error] it was closed with.
     ///
-    /// If the channel is still open, returns a clone of the provided `error`.  
+    /// If the channel is still open, returns a clone of the provided `error`.
     fn close(&mut self, error: Error<S>) -> Error<S> {
         match self.error_sender.send(error.clone()) {
             Ok(_) => error,
@@ -295,6 +306,9 @@ pub struct Receiver<S: Spec> {
     /// Receiver to listen for an external closure event (e.g., peer sends [Error::ResetSending]).
     error_receiver: oneshot::Receiver<Error<S>>,
 
+    /// Receiver to listen for a warning, that connection is going to be closed at informed point of time.
+    shutdown_warn_receiver: oneshot::Receiver<Instant>,
+
     /// Cell to get a dynamic priority from.
     priority_cell: PriorityCell,
 }
@@ -339,7 +353,7 @@ impl<S: Spec> Receiver<S> {
                 // Cancel safe:
                 // - `error_receiver` is cancel_safe.
                 // - `item_receiver` is cancel_safe.
-                
+
                 err = recv_error_fut.fuse() => Event::Err(err),
                 result = self.item_receiver.recv().fuse() => Event::Item(result),
             }
@@ -387,8 +401,8 @@ impl<S: Spec> Receiver<S> {
     /// Abruptly terminates the stream direction with [Error::Connection].
     ///
     /// If the direction is already closed, this operation is a no-op.
-    pub(crate) fn terminate_due_connection(&mut self, error: Arc<io::Error>) {
-        self.close(Error::Connection(error));
+    pub(crate) fn terminate_due_connection(&mut self) {
+        self.close(Error::Connection);
     }
 
 
@@ -424,6 +438,17 @@ impl<S: Spec> Receiver<S> {
         self.error_receiver.clone()
     }
 
+    /// Returns a shutdown warning receiver.
+    ///
+    /// It's a receiver, used to listen for a warning,
+    /// that connection is going to be closed at informed point of time.
+    ///
+    /// This allows external observers (like background tasks) to wait for
+    /// this signal and act accordingly to gracefully shutdown the stream, if possible.
+    pub fn shutdown_warn_receiver(&self) -> oneshot::Receiver<Instant> {
+        self.shutdown_warn_receiver.clone()
+    }
+
 
     /// Checks if the stream priority has changed and returns the new value if so.
     ///
@@ -438,7 +463,7 @@ impl<S: Spec> Receiver<S> {
     ///
     /// If the channel is closed, returns [Error] it was closed with.
     ///
-    /// If the channel is still open, returns a clone of the provided `error`.  
+    /// If the channel is still open, returns a clone of the provided `error`.
     fn close(&mut self, error: Error<S>) -> Error<S> {
         match self.error_sender.send(error.clone()) {
             Ok(_) => error,

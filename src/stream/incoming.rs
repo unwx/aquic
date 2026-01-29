@@ -1,13 +1,11 @@
 use crate::Spec;
-use crate::backend::StreamError;
-use crate::exec::{Runtime};
-use crate::stream::shared::InStreamBackend;
+use crate::backend::stream::{InStreamBackend, StreamError};
+use crate::exec::{Runtime, SendOnMt};
 use crate::stream::{Decoder, Error, Payload};
-use crate::sync::oneshot;
 use crate::sync::oneshot::{OneshotReceiver, OneshotSender};
 use crate::sync::stream;
+use crate::sync::{SmartRc, oneshot};
 use futures::{FutureExt, select_biased};
-use std::any::type_name;
 use tracing::{Instrument, Span, debug};
 
 /// An incoming direction of QUIC stream,
@@ -18,9 +16,13 @@ use tracing::{Instrument, Span, debug};
 ///
 /// The entire flow is sequential: implementation won't read from the stream,
 /// unless the listener is ready to receive the data.
-pub(crate) struct Incoming<S: Spec> {
+pub(crate) struct Incoming<S, CId>
+where
+    S: Spec,
+    CId: SendOnMt + Unpin + 'static,
+{
     /// An API to communicate with QUIC implementation.
-    backend: InStreamBackend,
+    backend: InStreamBackend<CId>,
 
     /// Decoder for decoding raw bytes stream.
     decoder: S::Decoder,
@@ -38,12 +40,17 @@ pub(crate) struct Incoming<S: Spec> {
     draining: bool,
 }
 
-impl<S: Spec> Incoming<S> {
+impl<S, CId> Incoming<S, CId>
+where
+    S: Spec,
+    CId: Clone + SendOnMt + Unpin + 'static,
+{
     pub fn new(
-        backend: InStreamBackend,
+        spec: SmartRc<S>,
+        backend: InStreamBackend<CId>,
         item_sender: stream::Sender<S>,
     ) -> Self {
-        let decoder = S::new_decoder();
+        let decoder = spec.new_decoder();
         let (cancel_sender, cancel_receiver) = oneshot::channel();
 
         Self {
@@ -59,7 +66,11 @@ impl<S: Spec> Incoming<S> {
     /// Starts the I/O loop in a separate task: reads data from the stream
     /// until 'FIN' or error is received.
     ///
-    /// Returns cancellation sender.
+    /// Returns a cancellation sender.
+    ///
+    /// **Note**: only few variants of [Error] are allowed to be sent via this sender:
+    /// - [Error::ResetSending],
+    /// - [Error::Connection].
     pub fn read(self, span: Span) -> oneshot::Sender<Error<S>> {
         let cancel_sender = self.cancel_sender.clone();
 
@@ -121,7 +132,7 @@ impl<S: Spec> Incoming<S> {
                         Error::ResetSending(_) |
                         Error::Decoder(_) |
                         Error::Encoder(_) |
-                        Error::Connection(_) => {
+                        Error::Connection => {
                             // Do nothing.
                         }
                     }
@@ -144,9 +155,9 @@ impl<S: Spec> Incoming<S> {
                 }
 
                 while let Some(item) = current {
-                    let next = self.decode_next().await?;
-                    self.send(Some(item), next.is_none()).await?;
-                    current = next;
+                    let fin = self.decoder.is_fin();
+                    self.send(Some(item), fin).await?;
+                    current = if fin { None } else { self.decode_next().await? };
                 }
 
                 return Ok(());
@@ -166,22 +177,11 @@ impl<S: Spec> Incoming<S> {
             return Ok(());
         }
 
-        let buffer = self.decoder.buffer();
-
-        // Empty buffer will lead to an infinite loop,
-        // until non-empty buffer is returned.
-        // This should not be tolerated.
-        assert!(
-            buffer.len() > 0,
-            "decoder must not provide empty buffers: {}",
-            type_name::<S::Decoder>()
-        );
-
-        let (buffer, length, fin) = match self
+        let (chunks, fin) = match self
             .backend
-            .recv(buffer)
+            .recv(self.decoder.max_batch_size())
             .await
-            .ok_or_else(|| Error::HangUp("Incoming.backend is unavailable".into()))?
+            .map_err(|e| Error::HangUp(format!("Incoming.backend is unavailable: {e}").into()))?
         {
             Ok(it) => it,
             Err(e) => {
@@ -202,7 +202,7 @@ impl<S: Spec> Incoming<S> {
             }
         };
 
-        if length == 0 && !fin {
+        if chunks.is_empty() && !fin {
             return Ok(());
         }
 
@@ -210,10 +210,7 @@ impl<S: Spec> Incoming<S> {
             self.draining = true;
         }
 
-        self.decoder
-            .notify_read(buffer, length, fin)
-            .await
-            .map_err(Error::Decoder)
+        self.decoder.read(chunks, fin).await.map_err(Error::Decoder)
     }
 
     /// Tries to decode next item.
@@ -226,7 +223,7 @@ impl<S: Spec> Incoming<S> {
         let empty = item.is_none();
         let payload = match (item, fin) {
             (Some(item), true) => Payload::Last(item),
-            (Some(item), false) => Payload::Chunk(item),
+            (Some(item), false) => Payload::Item(item),
             (None, true) => Payload::Done,
             (None, false) => {
                 return Ok(());
@@ -250,7 +247,7 @@ impl<S: Spec> Incoming<S> {
                 Error::ResetSending(_)
                 | Error::Decoder(_)
                 | Error::Encoder(_)
-                | Error::Connection(_) => {
+                | Error::Connection => {
                     panic!("bug: received unexpected error from stream::Sender: {e}");
                 }
             },
@@ -290,8 +287,8 @@ impl<S: Spec> Incoming<S> {
             }
 
             // Occurred connection error, notify the app.
-            Error::Connection(e) => {
-                self.item_sender.terminate_due_connection(e);
+            Error::Connection => {
+                self.item_sender.terminate_due_connection();
             }
 
             // Internal error, notify both sides.

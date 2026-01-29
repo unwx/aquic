@@ -1,14 +1,49 @@
 use crate::stream::codec::{Decoder, Encoder};
+use crate::sync::stream;
 use crate::{Estimate, Spec};
+use aquic_macros::supports;
+use bytes::Bytes;
 use std::borrow::Cow;
 use std::fmt::{Debug, Display, Formatter};
-use std::io;
-use std::sync::Arc;
+
 
 pub mod codec;
 mod incoming;
 mod outgoing;
-mod shared;
+
+pub(crate) use incoming::*;
+pub(crate) use outgoing::*;
+
+
+/// A stream ID.
+pub type StreamId = u64;
+
+/// A new initiated stream.
+pub enum Stream<S: Spec> {
+    /// Client unidirectional stream.
+    ClientUni(stream::Sender<S>),
+
+    /// Client bidirectional stream
+    ClientBidi(stream::Sender<S>, stream::Receiver<S>),
+
+    /// Server unidirectional stream.
+    ServerUni(stream::Receiver<S>),
+
+    /// Server bidirectional stream.
+    ServerBidi(stream::Sender<S>, stream::Receiver<S>),
+}
+
+impl<S: Spec> Debug for Stream<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientUni(_) => f.debug_tuple("ClientUni").finish(),
+            Self::ClientBidi(_, _) => f.debug_tuple("ClientBidi").finish(),
+            Self::ServerUni(_) => f.debug_tuple("ServerUni").finish(),
+            Self::ServerBidi(_, _) => f.debug_tuple("ServerBidi").finish(),
+        }
+    }
+}
+
 
 /// Represents the terminal, final state of a stream **direction**.
 pub enum Error<S: Spec> {
@@ -29,11 +64,8 @@ pub enum Error<S: Spec> {
     /// Serialization of the outgoing message failed.
     Encoder(<S::Encoder as Encoder>::Error),
 
-    /// The underlying connection was severed unexpectedly.
-    ///
-    /// This represents an unrecoverable transport failure,
-    /// such as a network timeout, connection loss.
-    Connection(Arc<io::Error>),
+    /// A QUIC connection, this stream belongs to, is closed.
+    Connection,
 
     /// The sending/receiving side unexpectedly disappeared.
     HangUp(Cow<'static, str>),
@@ -47,7 +79,7 @@ impl<S: Spec> Clone for Error<S> {
             Self::ResetSending(e) => Self::ResetSending(*e),
             Self::Decoder(e) => Self::Decoder(e.clone()),
             Self::Encoder(e) => Self::Encoder(e.clone()),
-            Self::Connection(e) => Self::Connection(e.clone()),
+            Self::Connection => Self::Connection,
             Self::HangUp(e) => Self::HangUp(e.clone()),
         }
     }
@@ -55,7 +87,15 @@ impl<S: Spec> Clone for Error<S> {
 
 impl<S: Spec> Debug for Error<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self, f)
+        match self {
+            Self::Finish => write!(f, "Finish"),
+            Self::StopSending(e) => f.debug_tuple("StopSending").field(e).finish(),
+            Self::ResetSending(e) => f.debug_tuple("ResetSending").field(e).finish(),
+            Self::Decoder(e) => f.debug_tuple("Decoder").field(e).finish(),
+            Self::Encoder(e) => f.debug_tuple("Encoder").field(e).finish(),
+            Self::Connection => f.debug_tuple("Connection").finish(),
+            Self::HangUp(e) => f.debug_tuple("HangUp").field(e).finish(),
+        }
     }
 }
 
@@ -67,7 +107,7 @@ impl<S: Spec> Display for Error<S> {
             Self::ResetSending(e) => write!(f, "reset sending ({e})"),
             Self::Decoder(e) => write!(f, "decoder error ({e})"),
             Self::Encoder(e) => write!(f, "encoder error ({e})"),
-            Self::Connection(e) => write!(f, "connection error ({e})"),
+            Self::Connection => write!(f, "connection is closed"),
             Self::HangUp(e) => write!(f, "hang up ({e})"),
         }
     }
@@ -76,6 +116,23 @@ impl<S: Spec> Display for Error<S> {
 impl<S: Spec> std::error::Error for Error<S> {}
 
 
+/// A chunk of data from a QUIC stream.
+///
+/// If `fin` is true, then no more chunks are going to arrive.
+///
+/// In unordered streams, `fin` flag may be set on intermediate chunk (chunk of bytes that was lost previously due to network conditions, etc).
+/// But it would mean that all chunks were successfully received.
+#[supports]
+#[derive(Debug, Clone)]
+pub enum Chunk {
+    /// Chunk of data from an ordered QUIC stream.
+    Ordered { bytes: Bytes },
+
+    /// Chunk of data and a stream offset.
+    #[supports(quinn)]
+    Unordered { bytes: Bytes, offset: u64 },
+}
+
 /// Represents a piece of data received from a stream.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Payload<T> {
@@ -83,7 +140,7 @@ pub enum Payload<T> {
     ///
     /// The stream direction remains open and more data is expected to follow.
     /// This corresponds to a frame with the `FIN` bit set to **0**.
-    Chunk(T),
+    Item(T),
 
     /// The final chunk of data.
     ///
@@ -108,7 +165,7 @@ impl<T> Payload<T> {
     /// Returns the inner data if present, discarding the `FIN` state.
     pub fn into_inner(self) -> Option<T> {
         match self {
-            Self::Chunk(val) | Self::Last(val) => Some(val),
+            Self::Item(val) | Self::Last(val) => Some(val),
             Self::Done => None,
         }
     }
@@ -119,7 +176,7 @@ impl<T> Payload<T> {
         F: FnOnce(T) -> U,
     {
         match self {
-            Self::Chunk(t) => Payload::Chunk(f(t)),
+            Self::Item(t) => Payload::Item(f(t)),
             Self::Last(t) => Payload::Last(f(t)),
             Self::Done => Payload::Done,
         }
@@ -131,7 +188,7 @@ impl<T> Payload<T> {
         F: FnOnce(T) -> Result<U, E>,
     {
         Ok(match self {
-            Self::Chunk(t) => Payload::Chunk(f(t)?),
+            Self::Item(t) => Payload::Item(f(t)?),
             Self::Last(t) => Payload::Last(f(t)?),
             Self::Done => Payload::Done,
         })
@@ -141,7 +198,7 @@ impl<T> Payload<T> {
 impl<T: Estimate> Estimate for Payload<T> {
     fn estimate(&self) -> usize {
         match self {
-            Payload::Chunk(it) => it.estimate(),
+            Payload::Item(it) => it.estimate(),
             Payload::Last(it) => it.estimate(),
             Payload::Done => 0,
         }
@@ -150,9 +207,14 @@ impl<T: Estimate> Estimate for Payload<T> {
 
 
 /// A stream's priority that determines the order in which stream data is sent on the wire.
+///
+/// **Note** different [`QuicBackend`][crate::backend::QuicBackend] implement prioritization differently,
+/// or don't implement at all.
+#[supports]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct Priority {
-    /// Lower values indicate higher priority (0 is highest).
+pub struct Priority {
+    /// Higher values indicate higher priority.
+    #[supports(quiche, quinn)]
     pub urgency: u8,
 
     /// Controls how bandwidth is shared among streams with the same urgency.
@@ -164,17 +226,7 @@ pub(crate) struct Priority {
     /// - `true`: **Incremental**. The scheduler interleaves data from this stream
     ///   with other incremental streams of the same urgency.
     ///   Use this for data that can be processed as it arrives (e.g., progressive images, video).
+    ///
+    #[supports(quiche)]
     pub incremental: bool,
 }
-
-impl Priority {
-    pub fn new(urgency: u8, incremental: bool) -> Self {
-        Self {
-            urgency,
-            incremental,
-        }
-    }
-}
-
-/// A stream ID.
-pub(crate) type StreamId = u64;

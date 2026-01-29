@@ -1,6 +1,8 @@
 use crate::exec::SendOnMt;
-use crate::stream::Payload;
-use bytes::{Bytes, BytesMut};
+use crate::stream::{Chunk, Payload};
+use aquic_macros::supports;
+use bytes::Bytes;
+use smallvec::SmallVec;
 use std::future::Future;
 
 /// A QUIC connection consists of multiple streams where data flows.
@@ -15,6 +17,7 @@ use std::future::Future;
 /// expensive I/O operations).
 ///
 /// The library is optimized for both blocking and non-blocking implementations.
+#[supports]
 pub trait Decoder {
     /// The type of the decoded entity.
     type Item: SendOnMt + 'static;
@@ -24,25 +27,29 @@ pub trait Decoder {
     /// Clones should be cheap.
     type Error: std::error::Error + Clone + Send + Sync + 'static;
 
-    /// Returns a mutable buffer to store incoming raw data.
+    /// Returns `true` if the decoder supports an unordered stream.
     ///
-    /// It is guaranteed to not store more than [BytesMut::len] bytes.
+    /// If a current [`QUIC Backend`][crate::backend::QuicBackend] supports unordered streams too,
+    /// then [`read()`][Decoder::read] will be populated with [`Chunk::Unordered`].
     ///
-    /// Must be not empty.
-    fn buffer(&mut self) -> BytesMut;
+    /// **Note**: for most cases an application wants an ordered stream,
+    /// which will be decoded into ordered sequence of messages.
+    ///
+    /// Unordered stream is a feature when an application receives all stream frames immediately,
+    /// even if there are previous frames that are missing due to packet loss.
+    ///
+    /// Application may use unordered streams if there is no reason to preserve the order,
+    /// for example when writing to file ([`Chunk::Unordered`] contains offset too).
+    #[supports(quinn)]
+    fn supports_unordered() -> bool;
 
-    /// Notifies the decoder that data was written into the buffer returned by [`Decoder::buffer()`].
+    /// Returns a maximum size for a **sum** of bytes
+    /// that decoder wants to receive in a single [`read()`][Decoder::read] call.
+    fn max_batch_size(&self) -> usize;
+
+    /// Notifies about new available data for decoding.
     ///
-    /// # Arguments
-    ///
-    /// - `buffer` The buffer that was previously returned by [`Decoder::buffer`].
-    /// - `length`: The number of bytes actually written to the buffer.
-    /// - `finish`: If `true`, indicates the successful end of the stream; no further data will arrive.
-    ///
-    /// # Panics
-    ///
-    /// Implementations may panic if
-    /// `length` exceeds the size of the slice previously returned by [`buffer()`](Self::buffer).
+    /// If `fin` is `true`, this indicates the successful end of the stream; no further data will arrive.
     ///
     /// # Cancel Safety
     ///
@@ -51,11 +58,10 @@ pub trait Decoder {
     /// If the future is dropped before completion, the [`Decoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
     /// [`Decoder`] will not be used again after cancellation.
-    fn notify_read(
+    fn read(
         &mut self,
-        buffer: BytesMut,
-        length: usize,
-        finish: bool,
+        chunks: SmallVec<[Chunk; 32]>,
+        fin: bool,
     ) -> impl Future<Output = Result<(), Self::Error>> + SendOnMt;
 
     /// Returns the next decoded item, or `None` if there is no item available.
@@ -72,6 +78,10 @@ pub trait Decoder {
     fn next_item(
         &mut self,
     ) -> impl Future<Output = Result<Option<Self::Item>, Self::Error>> + SendOnMt;
+
+    /// Returns `true` if decoder received `fin` previously in [`read()`][Decoder::read],
+    /// and has no more data in [`next_item()`][Decoder::next_item].
+    fn is_fin(&self) -> bool;
 }
 
 /// [`Encoder`] is a stateful object responsible for a single outgoing QUIC stream.
@@ -117,5 +127,11 @@ pub trait Encoder {
     /// If the future is dropped before completion, the [`Encoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
     /// [`Encoder`] will not be used again after cancellation.
-    fn next_buffer(&mut self) -> impl Future<Output = Result<Bytes, Self::Error>> + SendOnMt;
+    fn next_buffer(
+        &mut self,
+    ) -> impl Future<Output = Result<SmallVec<[Bytes; 32]>, Self::Error>> + SendOnMt;
+
+    /// Returns `true` if encoder received `fin` previously in [`write()`][Encoder::write],
+    /// and has no more data in [`next_buffer()`][Encoder::next_buffer].
+    fn is_fin(&self) -> bool;
 }

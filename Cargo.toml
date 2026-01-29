@@ -6,34 +6,47 @@ edition = "2024"
 
 [features]
 quiche = ["dep:quiche"]
+quinn = ["dep:quinn-proto", "dep:rustls"]
 tokio = ["dep:tokio", "dep:crossfire", "dep:sharded-slab"]
-monoio = ["dep:monoio", "dep:slab"]
+monoio = ["dep:monoio"]
 server-util = ["dep:bitvec", "dep:aes", "dep:zeroize"]
 default = []
 
 
 [dependencies]
+# internals
+aquic-macros = { path = "aquic-macros" }
+
+# async runtimes
 tokio = { version = "1.49", features = ["rt", "time"], optional = true }
 monoio = { version = "0.2", optional = true }
 
+# QUIC providers
 quiche = { version = "0.24", optional = true }
 quinn-proto = { version = "0.11", optional = true }
 
+# for `Send` async runtimes
 event-listener = { version = "5.4" } # TODO(refactor): should be optional, for `Send` runtimes only.
 crossfire = { version = "3.0", optional = true }
 sharded-slab = { version = "0.1", optional = true }
 
-slab = { version = "0.4", optional = true }
+# for `quinn` feature
+rustls = { version = "0.23", optional = true }
 
+# `server-util` feature
 bitvec = { version = "1.0", optional = true }
 aes = { version = "0.8", features = ["zeroize"], optional = true }
 zeroize = { version = "1.8", optional = true }
 
 rand = "0.9"
-futures = "0.3"
 tracing = "0.1"
+futures = "0.3"
 bytes = "1.11"
+slab = "0.4"
+smallvec = "1.15"
 rustc-hash = "2.1"
+indexmap = "2.13"
+domain = "0.11"
 
 
 [build-dependencies]
