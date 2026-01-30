@@ -1,12 +1,14 @@
 use crate::Spec;
 use crate::backend::stream::{InStreamBackend, StreamError};
 use crate::exec::{Runtime, SendOnMt};
+use crate::log;
 use crate::stream::{Decoder, Error, Payload};
 use crate::sync::oneshot::{OneshotReceiver, OneshotSender};
 use crate::sync::stream;
 use crate::sync::{SmartRc, oneshot};
+use crate::tracing::StreamSpan;
 use futures::{FutureExt, select_biased};
-use tracing::{Instrument, Span, debug};
+use tracing::{Instrument, Level, Span};
 
 /// An incoming direction of QUIC stream,
 /// acts like a bridge between protocol backend and application listener.
@@ -71,7 +73,7 @@ where
     /// **Note**: only few variants of [Error] are allowed to be sent via this sender:
     /// - [Error::ResetSending],
     /// - [Error::Connection].
-    pub fn read(self, span: Span) -> oneshot::Sender<Error<S>> {
+    pub fn read(self, span: StreamSpan) -> oneshot::Sender<Error<S>> {
         let cancel_sender = self.cancel_sender.clone();
 
         self.spawn_listen_for_app_error();
@@ -82,7 +84,7 @@ where
 
 
     /// Spawn a [Self::io_loop] with an additional listener for cancel signals.
-    fn spawn_io_loop(mut self, span: Span) {
+    fn spawn_io_loop(mut self, span: StreamSpan) {
         let cancel_receiver = self.cancel_receiver.clone();
 
         let future = async move {
@@ -99,7 +101,7 @@ where
         };
 
         Runtime::spawn_void(async move {
-            future.instrument(span).await;
+            future.instrument(span.into()).await;
         })
     }
 
@@ -259,24 +261,39 @@ where
     ///
     /// Notify the application and network peer when necessary.
     fn close(mut self, error: Error<S>) {
-        debug!("closing in(read) stream, reason: {}", &error);
-        let _ = self.cancel_sender.send(Error::HangUp("".into()));
+        if self.cancel_sender.send(Error::HangUp("".into())).is_err() {
+            return;
+        };
 
-        match error {
+        let log_level = match &error {
+            Error::Finish => Level::DEBUG,
+            Error::StopSending(_) => Level::DEBUG,
+            Error::ResetSending(_) => Level::DEBUG,
+            Error::Decoder(_) => Level::WARN,
+            Error::Encoder(_) => Level::ERROR,
+            Error::Connection => Level::DEBUG,
+            Error::HangUp(_) => Level::WARN,
+        };
+
+        log!(log_level, "closing in(read) stream, reason: {}", &error);
+        let span = StreamSpan::from(Span::current());
+
+        match error.clone() {
             Error::Finish => {
-                // We should have sent 'FIN' to app by now.
-                // Nothing to do.
+                span.on_fin();
             }
 
             // We are no more interested in the peer's data,
             // and send 'STOP_SENDING' to him.
             Error::StopSending(e) => {
                 self.backend.stop_sending(e.into());
+                span.on_stop_sending(e.into());
             }
 
             // Peer sent 'RESET_STREAM' to us, notify the app.
             Error::ResetSending(e) => {
                 self.item_sender.terminate(e);
+                span.on_reset_stream(e.into());
             }
 
             // Occurred Decoder::Error, notify both sides.
@@ -284,25 +301,29 @@ where
                 let proto_err = S::on_decoder_error(&codec_err);
                 self.item_sender.terminate_due_decoder(codec_err);
                 self.backend.stop_sending(proto_err.into());
+                span.on_internal();
             }
 
             // Occurred connection error, notify the app.
             Error::Connection => {
                 self.item_sender.terminate_due_connection();
+                span.on_connection_close();
             }
 
             // Internal error, notify both sides.
             Error::HangUp(e) => {
                 self.item_sender.hangup(e);
                 self.backend.stop_sending(S::on_hangup().into());
+                span.on_internal();
             }
 
             Error::Encoder(codec_err) => {
+                span.on_internal();
                 panic!(
                     "bug: received unexpected encoder error in incoming stream: {}",
                     &codec_err
                 );
             }
-        }
+        };
     }
 }
