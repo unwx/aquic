@@ -1,6 +1,6 @@
-use crate::backend::cid::{ConnIdMeta};
-use crate::backend::cid::{ConnIdError, ConnIdGenerator, ConnectionId, MAX_CID_LEN};
-use crate::util::ArrayVec;
+use crate::backend::cid::{
+    ConnectionId, ConnectionIdGenerator, ConnectionIdMeta, IdError, MAX_CID_LEN,
+};
 use aes::Aes128;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
@@ -10,8 +10,8 @@ use bitvec::order::Msb0;
 use bitvec::prelude::BitVec;
 use bitvec::view::BitView;
 use rand::{RngCore, rng};
+use smallvec::SmallVec;
 use std::time::Duration;
-use zeroize::Zeroizing;
 
 /// AES block size in bytes.
 const AES_BLOCK_SIZE: usize = 16;
@@ -25,7 +25,7 @@ type Bits = BitArray<[u8; AES_BLOCK_SIZE], Msb0>;
 
 /// [ConnIdMeta] for a server Connection ID.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct ServerConnIdMeta {
+pub struct ServerIdMeta {
     /// Server ID (may optionally include other data, as region).
     pub server_id: u32,
 
@@ -36,19 +36,19 @@ pub struct ServerConnIdMeta {
     pub core_id: Option<u16>,
 }
 
-impl ConnIdMeta for ServerConnIdMeta {
+impl ConnectionIdMeta for ServerIdMeta {
     fn core_id(&self) -> Option<u16> {
         self.core_id
     }
 }
 
 
-/// Load-balancer compatible implementation of the [ConnIdGenerator]
+/// Load-balancer compatible implementation of the [ConnectionIdGenerator]
 /// that should be sufficient for most cases: can store `server_id` and `core_id`.
 ///
 /// In case you want to store advanced routing information like region, zone,
 /// you might want to store it inside `server_id` too.
-pub struct ServerConnIdGenerator {
+pub struct ServerConnectionIdGenerator {
     /// Your Server ID (Routing Tag).
     server_id: u32,
 
@@ -73,7 +73,7 @@ pub struct ServerConnIdGenerator {
     cipher: Aes128,
 }
 
-impl ServerConnIdGenerator {
+impl ServerConnectionIdGenerator {
     /// Creates new generator with a specified encryption key.
     ///
     /// * `server_id_len` The length of `server_id` in bits (8-32).
@@ -90,7 +90,7 @@ impl ServerConnIdGenerator {
     /// - and `entropy_bits` is `34`,
     /// - then the resulting `Nonce` would be `50` bits long.
     pub fn new(
-        key: Zeroizing<[u8; 16]>,
+        key: [u8; 16],
         server_id: u32,
         core_id: u16,
         server_id_bits: usize,
@@ -117,11 +117,11 @@ impl ServerConnIdGenerator {
     }
 
     /// Helper to pack the bits: `[ FirstOctet | ServerID | CoreID | Padding ]`
-    fn build_cid(&self) -> ArrayVec<u8, MAX_CID_LEN> {
-        let mut buf = ArrayVec::zeroed();
-        buf[0] = rng().next_u32() as u8;
+    fn build_cid(&self) -> SmallVec<[u8; MAX_CID_LEN]> {
+        let mut buffer = SmallVec::from_elem(0, self.cid_len());
+        buffer[0] = rng().next_u32() as u8;
 
-        let mut plaintext = buf.as_slice_all_mut()[1..].view_bits_mut::<Msb0>();
+        let plaintext = buffer.as_mut_slice()[1..].view_bits_mut::<Msb0>();
         let mut offset = 0;
 
         plaintext[offset..offset + self.server_id_bits].store_be(self.server_id);
@@ -148,14 +148,14 @@ impl ServerConnIdGenerator {
             plaintext[offset..(offset + entropy_bits)].copy_from_bitslice(&entropy);
         }
 
-        buf
+        buffer
     }
 
     fn random_bits(bits_len: usize) -> BitVec<u8, Msb0> {
         let bytes_len = bits_len.div_ceil(8);
 
         let mut bytes = vec![0u8; bytes_len];
-        rng.fill_bytes(&mut bytes);
+        rng().fill_bytes(&mut bytes);
 
         let mut bits = BitVec::<u8, Msb0>::from_vec(bytes);
         bits.truncate(bits_len);
@@ -164,18 +164,18 @@ impl ServerConnIdGenerator {
     }
 }
 
-impl ConnIdGenerator for ServerConnIdGenerator {
-    type Meta = ServerConnIdMeta;
+impl ConnectionIdGenerator for ServerConnectionIdGenerator {
+    type Meta = ServerIdMeta;
 
-    fn generate_cid(&mut self) -> ConnectionId {
+    fn generate(&mut self) -> ConnectionId {
         let mut cid = self.build_cid();
 
         // (1 for first octet) + (16 for plaintext: server_id + nonce)
         if cid.len() == 17 {
-            let mut block = GenericArray::from_mut_slice(&mut cid.as_slice_mut()[1..]);
-            self.cipher.encrypt_block(&mut block);
+            let block = GenericArray::from_mut_slice(&mut cid.as_mut_slice()[1..]);
+            self.cipher.encrypt_block(block);
         } else {
-            encrypt_four_pass(&self.cipher, &mut cid.as_slice_mut()[1..]);
+            encrypt_four_pass(&self.cipher, &mut cid.as_mut_slice()[1..]);
         }
 
         ConnectionId(cid)
@@ -213,13 +213,13 @@ impl ConnIdGenerator for ServerConnIdGenerator {
         }
     }
 
-    fn decrypt(&self, cid: &mut ConnectionId) -> Result<(), ConnIdError> {
-        let mut cid = cid.as_mut();
+    fn decrypt(&self, cid: &mut ConnectionId) -> Result<(), IdError> {
+        let cid = cid.as_mut_slice();
 
         // (1 for first octet) + (16 for plaintext: server_id + nonce)
         if cid.len() == 17 {
-            let mut block = GenericArray::from_mut_slice(&mut cid[1..]);
-            self.cipher.decrypt_block(&mut block);
+            let block = GenericArray::from_mut_slice(&mut cid[1..]);
+            self.cipher.decrypt_block(block);
         } else {
             decrypt_four_pass(&self.cipher, &mut cid[1..]);
         }
@@ -227,9 +227,9 @@ impl ConnIdGenerator for ServerConnIdGenerator {
         Ok(())
     }
 
-    fn parse(&self, cid: &ConnectionId) -> Result<ServerConnIdMeta, ConnIdError> {
-        if cid.len() == 0 {
-            return Err(ConnIdError {
+    fn parse(&self, cid: &ConnectionId) -> Result<ServerIdMeta, IdError> {
+        if cid.is_empty() {
+            return Err(IdError {
                 original: cid.clone(),
                 detail: "CID is empty".into(),
             });
@@ -239,7 +239,7 @@ impl ConnIdGenerator for ServerConnIdGenerator {
         let required_bits = self.server_id_bits + self.core_id_bits;
 
         if plaintext.len() < required_bits {
-            return Err(ConnIdError {
+            return Err(IdError {
                 original: cid.clone(),
                 detail: format!(
                     "Expected CID to have '{}' bits for server_id,\
@@ -263,7 +263,7 @@ impl ConnIdGenerator for ServerConnIdGenerator {
             None
         };
 
-        Ok(ServerConnIdMeta { server_id, core_id })
+        Ok(ServerIdMeta { server_id, core_id })
     }
 }
 
@@ -286,7 +286,7 @@ fn encrypt_four_pass(cipher: &Aes128, plaintext: &mut [u8]) {
 
     let mut left = Bits::ZERO;
     let mut right = Bits::ZERO;
-    let mut temp = Bits::ZERO;
+    let mut temp;
 
     let plaintext = plaintext.view_bits_mut::<Msb0>();
     let bits = plaintext.len();
@@ -371,8 +371,8 @@ fn decrypt_four_pass(cipher: &Aes128, plaintext: &mut [u8]) {
 fn aes_ecb(val: &mut Bits, cipher: &Aes128) {
     debug_assert_eq!(val.len(), AES_BLOCK_SIZE_BITS);
 
-    let mut block = GenericArray::from_mut_slice(val.as_raw_mut_slice());
-    cipher.encrypt_block(&mut block);
+    let block = GenericArray::from_mut_slice(val.as_raw_mut_slice());
+    cipher.encrypt_block(block);
 }
 
 /// `truncate_left(0x2094842ca49256198c2deaa0ba53caa0, 28) = 0x20948420000000000000000000000000`.
@@ -391,7 +391,7 @@ fn truncate_right(val: &mut Bits, bits: usize) {
 /// * `lsb_byte`: The byte to place in the lowest position.
 /// * `second_lsb_byte`: The byte to place in the second-lowest position.
 fn expand_left(msb_val: &mut Bits, lsb_byte: u8, second_lsb_byte: u8) {
-    let mut slice = msb_val.as_raw_mut_slice();
+    let slice = msb_val.as_raw_mut_slice();
     slice[AES_BLOCK_SIZE - 1] |= lsb_byte;
     slice[AES_BLOCK_SIZE - 2] |= second_lsb_byte;
 }
@@ -401,7 +401,7 @@ fn expand_left(msb_val: &mut Bits, lsb_byte: u8, second_lsb_byte: u8) {
 /// * `msb_byte`: The byte to place in the highest position.
 /// * `second_msb_byte`: The byte to place in the second-highest position.
 fn expand_right(lsb_val: &mut Bits, msb_byte: u8, second_msb_byte: u8) {
-    let mut slice = lsb_val.as_raw_mut_slice();
+    let slice = lsb_val.as_raw_mut_slice();
     slice[0] = msb_byte;
     slice[1] = second_msb_byte;
 }

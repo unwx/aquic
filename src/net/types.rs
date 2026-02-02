@@ -21,6 +21,8 @@ pub enum SoFeat {
     DontFragment,
 
     /// This socket supports `sendmmsg/recvmmsg` syscalls (or their alternative).
+    ///
+    /// Or the socket will simply benefit receiving messages in batches.
     Mmsg,
 
     /// Generic Receive Offload.
@@ -56,7 +58,7 @@ pub struct RecvMsg<B> {
     timestamp: Option<Instant>,
 }
 
-impl<'a, B: BufMut<'a>> RecvMsg<B> {
+impl<B: BufMut> RecvMsg<B> {
     /// Create a new blank message.
     ///
     /// # Panics
@@ -64,7 +66,7 @@ impl<'a, B: BufMut<'a>> RecvMsg<B> {
     /// If provided buffer is empty.
     #[inline]
     pub fn new(buf: B) -> Self {
-        assert!(!buf.is_empty(), "provided slice must not be empty");
+        assert!(buf.capacity() > 0, "provided slice capacity must be > 0");
 
         Self {
             buf,
@@ -148,16 +150,16 @@ impl<'a, B: BufMut<'a>> RecvMsg<B> {
 
     /// Returns a slice that is intended for writing a data received from peer.
     #[inline]
-    pub(crate) fn slice_write(&'a mut self) -> IoSliceMut<'a> {
+    pub(crate) fn slice_write(&mut self) -> IoSliceMut<'_> {
         debug_assert!(!self.has_data());
-        self.buf.as_mut_io_slice()
+        self.buf.as_mut_write_io_slice()
     }
 
     /// Returns a slice that is intended for reading the received data.
     #[inline]
-    pub fn slice_read(&'a mut self) -> &mut [u8] {
+    pub fn slice_read(&mut self) -> &mut [u8] {
         debug_assert!(self.has_data());
-        self.buf.as_mut_slice()
+        self.buf.as_mut_read_slice()
     }
 
     /// Returns `source` address.
@@ -220,7 +222,7 @@ pub struct SendMsg<B> {
     segment_size: usize,
 }
 
-impl<'a, B: Buf<'a>> SendMsg<B> {
+impl<B: Buf> SendMsg<B> {
     /// Creates a new message.
     ///
     /// * `buf`: buffer with the data to be sent.
@@ -235,7 +237,7 @@ impl<'a, B: Buf<'a>> SendMsg<B> {
     /// - If `to` address is unspecified.
     #[inline]
     pub fn new(buf: B, from: IpAddr, to: SocketAddr, ecn: Ecn, segment_size: usize) -> Self {
-        assert!(!buf.is_empty(), "provided buf must not be empty");
+        assert!(buf.len() != 0, "provided buf must not be empty");
 
         {
             let unspecified = match to {
@@ -274,8 +276,8 @@ impl<'a, B: Buf<'a>> SendMsg<B> {
 
     /// Slice that contains data to be sent.
     #[inline]
-    pub fn io_slice(&'a self) -> IoSlice<'a> {
-        self.buf.as_io_slice()
+    pub fn io_slice(&self) -> IoSlice<'_> {
+        self.buf.as_read_io_slice()
     }
 
     /// Source address.
@@ -312,9 +314,10 @@ impl<'a, B: Buf<'a>> SendMsg<B> {
 
 /// Explicit Congestion Notification.
 #[repr(u8)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Ecn {
     /// Not ECN-Capable Transport (00)
+    #[default]
     NEct = 0b00,
 
     /// ECN Capable Transport(1) (01).
@@ -325,12 +328,6 @@ pub enum Ecn {
 
     /// Congestion Experienced (11)
     Ce = 0b11,
-}
-
-impl Default for Ecn {
-    fn default() -> Self {
-        Self::NEct
-    }
 }
 
 impl Display for Ecn {
@@ -395,27 +392,35 @@ impl TryFrom<&str> for ServerName {
 impl Display for ServerName {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Domain(it) => write!(f, "{}", it.to_string()),
-            Self::Ip(it) => write!(f, "{}", it.to_string()),
+            Self::Domain(it) => write!(f, "{}", it),
+            Self::Ip(it) => write!(f, "{}", it),
         }
     }
 }
 
 
-/// A `u8` slice.
-pub trait Buf<'a> {
-    fn is_empty(&self) -> bool;
-
+/// A read-only buffer.
+pub trait Buf {
     fn len(&self) -> usize;
 
-    fn as_slice(&'a self) -> &'a [u8];
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
-    fn as_io_slice(&'a self) -> IoSlice<'a>;
+    fn capacity(&self) -> usize;
+
+    /// Returns `[..len()]` slice for reading.
+    fn as_read_slice(&self) -> &[u8];
+
+    /// Returns `[..len()]` I/O slice for reading.
+    fn as_read_io_slice(&self) -> IoSlice<'_>;
 }
 
-/// A `u8` mutable slice.
-pub trait BufMut<'a>: Buf<'a> {
-    fn as_mut_slice(&'a mut self) -> &'a mut [u8];
+/// A mutable buffer.
+pub trait BufMut: Buf {
+    /// Returns `[..len()]` slice for reading (and mutating).
+    fn as_mut_read_slice(&mut self) -> &mut [u8];
 
-    fn as_mut_io_slice(&'a mut self) -> IoSliceMut<'a>;
+    /// Returns `[..capacity()]` slice for writing.
+    fn as_mut_write_io_slice(&mut self) -> IoSliceMut<'_>;
 }

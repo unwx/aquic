@@ -9,9 +9,7 @@ use crate::{Estimate, Spec};
 use futures::{FutureExt, select_biased};
 use std::borrow::Cow;
 use std::future::poll_fn;
-use std::io;
 use std::pin::pin;
-use std::sync::Arc;
 use std::task::Poll;
 use std::thread::panicking;
 use std::time::Instant;
@@ -341,8 +339,7 @@ impl<S: Spec> Receiver<S> {
         let event = {
             let mut recv_error_fut = pin!(self.error_receiver.recv());
             let recv_error_fut = poll_fn(|cx| match recv_error_fut.as_mut().poll(cx) {
-                // Ignore `Finish` errors, as it may lead to `item_receiver` future cancellation
-                // and therefore a message loss.
+                // Ignore `Finish` errors.
                 //
                 // Handle `Finish` naturally from `item_receiver`.
                 Poll::Ready(Some(Error::Finish)) => Poll::Pending,

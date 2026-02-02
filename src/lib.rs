@@ -13,10 +13,12 @@ pub mod backend;
 pub mod net;
 pub mod stream;
 pub mod sync;
+pub mod util;
 
 
 mod core;
 mod exec;
+mod tracing;
 
 /// Custom application error.
 ///
@@ -24,6 +26,9 @@ mod exec;
 /// the `RESET_STREAM` frame,
 /// the `STOP_SENDING` frame, and
 /// the `CONNECTION_CLOSE` frame.
+///
+/// Make sure its `u64` representation is in range of `[0..2^62]`,
+/// as higher values might lead to panics ([quinn_proto::VarInt::MAX]).
 ///
 /// More: [20.2. Application Protocol Error Codes](https://datatracker.ietf.org/doc/html/rfc9000#name-application-protocol-error-)
 #[rustfmt::skip]
@@ -152,12 +157,12 @@ pub trait Spec: SendOnMt + SyncOnMt + 'static {
 
 
 /// Everything that [`protocol`](Spec) needs to work on the network level.
-pub trait Engine<S: Spec>: SendOnMt + SyncOnMt + 'static {
+pub trait Engine: SendOnMt + SyncOnMt + 'static {
     /// Socket to use for network I/O.
     type Socket: Socket;
 
     /// QUIC protocol implementation provider.
-    type QuicBackend<'io>: QuicBackend<'io, S>;
+    type QuicBackend: QuicBackend;
 
     /// Creates a new socket and binds it to the specified address.
     ///
@@ -165,11 +170,11 @@ pub trait Engine<S: Spec>: SendOnMt + SyncOnMt + 'static {
     fn bind_socket(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Socket>>;
 
     /// Creates a new [`QuicBackend`] instance.
-    fn new_quic_backend<'io>(
+    fn new_quic_backend(
         &self,
-        so_addr: SocketAddr,
-        so_features: &HashSet<SoFeat>,
-    ) -> Self::QuicBackend<'io>;
+        socket_addr: SocketAddr,
+        socket_features: &HashSet<SoFeat>,
+    ) -> Self::QuicBackend;
 }
 
 
@@ -193,4 +198,18 @@ macro_rules! conditional {
     };
 }
 
+/// Write a log with a dynamic log level.
+macro_rules! log {
+    ($lvl:expr, $($arg:tt)+) => {
+        match $lvl {
+            tracing::Level::ERROR => tracing::error!($($arg)+),
+            tracing::Level::WARN  => tracing::warn!($($arg)+),
+            tracing::Level::INFO  => tracing::info!($($arg)+),
+            tracing::Level::DEBUG => tracing::debug!($($arg)+),
+            tracing::Level::TRACE => tracing::trace!($($arg)+),
+        }
+    }
+}
+
 use conditional;
+use log;

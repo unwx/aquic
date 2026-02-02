@@ -8,31 +8,31 @@ pub struct ConstBuf<const SIZE: usize> {
     len: usize,
 }
 
-impl<'a, const SIZE: usize> Buf<'a> for ConstBuf<SIZE> {
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
+impl<const SIZE: usize> Buf for ConstBuf<SIZE> {
     fn len(&self) -> usize {
         self.len
     }
 
-    fn as_slice(&'a self) -> &'a [u8] {
+    fn capacity(&self) -> usize {
+        SIZE
+    }
+
+    fn as_read_slice(&self) -> &[u8] {
         &self.array[..self.len]
     }
 
-    fn as_io_slice(&'a self) -> IoSlice<'a> {
-        IoSlice::new(self.as_slice())
+    fn as_read_io_slice(&self) -> IoSlice<'_> {
+        IoSlice::new(self.as_read_slice())
     }
 }
 
-impl<'a, const SIZE: usize> BufMut<'a> for ConstBuf<SIZE> {
-    fn as_mut_slice(&'a mut self) -> &'a mut [u8] {
+impl<const SIZE: usize> BufMut for ConstBuf<SIZE> {
+    fn as_mut_read_slice(&mut self) -> &mut [u8] {
         &mut self.array[..self.len]
     }
 
-    fn as_mut_io_slice(&'a mut self) -> IoSliceMut<'a> {
-        IoSliceMut::new(self.as_mut_slice())
+    fn as_mut_write_io_slice(&mut self) -> IoSliceMut<'_> {
+        IoSliceMut::new(&mut self.array[..])
     }
 }
 
@@ -41,6 +41,6 @@ pub(crate) enum QuicCommand<CId> {
     _Private(CId), // TODO(feat): different commands should be here.
 }
 
-pub(crate) enum QuicResponse<CId> {
-    _Private(CId), // TODO(feat): different responses should be here.
+pub(crate) enum QuicResponse {
+    // TODO(feat): different responses should be here.
 }

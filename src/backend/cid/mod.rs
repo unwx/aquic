@@ -1,20 +1,21 @@
 mod common;
 
 pub use common::*;
+use smallvec::SmallVec;
 
 conditional! {
     feature = "server-util",
 
     mod server;
+    pub use server::*;
 }
 
 
 use crate::conditional;
-use crate::util::ArrayVec;
 use std::borrow::Cow;
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::time::Duration;
 
 /// Max allowed connection ID length (RFC 9000).
@@ -24,31 +25,33 @@ pub const MAX_CID_LEN: usize = 20;
 /// A Connection ID.
 ///
 /// This struct holds the raw bytes of a connection ID.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ConnectionId(ArrayVec<u8, MAX_CID_LEN>);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnectionId(SmallVec<[u8; MAX_CID_LEN]>);
 
 impl ConnectionId {
-    /// Empty Connection ID.
-    pub const EMPTY: Self = ConnectionId(ArrayVec::zeroed());
-
     /// Create a clone of Connection ID from slice.
     pub fn from_slice(slice: &[u8]) -> Self {
-        Self(ArrayVec::from_slice(slice))
+        Self(SmallVec::from_slice(slice))
     }
 
     /// Returns connection ID as an immutable slice.
-    pub fn as_ref(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         self.0.as_slice()
     }
 
     /// Returns connection ID as a mutable slice.
-    pub fn as_mut(&mut self) -> &mut [u8] {
-        self.0.as_slice_mut()
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.0.as_mut_slice()
     }
 
     /// Returns connection ID length in bytes.
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Returns `true` if connection ID is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -65,12 +68,12 @@ impl Display for ConnectionId {
 
 /// The specified Connection ID is invalid.
 #[derive(Debug, Clone)]
-pub struct ConnIdError {
+pub struct IdError {
     pub original: ConnectionId,
     pub detail: Cow<'static, str>,
 }
 
-impl Display for ConnIdError {
+impl Display for IdError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -80,11 +83,11 @@ impl Display for ConnIdError {
     }
 }
 
-impl std::error::Error for ConnIdError {}
+impl std::error::Error for IdError {}
 
 
 /// Metadata, that a specific Connection ID holds.
-pub trait ConnIdMeta {
+pub trait ConnectionIdMeta {
     /// Returns a CPU Core ID if this Connection ID is a Server ID, and it contains it.
     ///
     /// Core ID is **required** for server-side routing in thread-per-core async runtimes like monoio,
@@ -98,9 +101,9 @@ pub trait ConnIdMeta {
 
 /// Noop implementation of [ConnIdMeta].
 #[derive(Debug, Copy, Clone)]
-pub struct NoopConnIdMeta;
+pub struct NoopIdMeta;
 
-impl ConnIdMeta for NoopConnIdMeta {
+impl ConnectionIdMeta for NoopIdMeta {
     fn core_id(&self) -> Option<u16> {
         None
     }
@@ -108,18 +111,18 @@ impl ConnIdMeta for NoopConnIdMeta {
 
 
 /// A [ConnectionId] generator.
-pub trait ConnIdGenerator: Send {
+pub trait ConnectionIdGenerator: Send {
     // Some QUIC implementations (like quinn-proto) require ConnIdGenerators to be Send + Sync.
     // Therefore, `Send` requirement is mandatory...
 
-    type Meta: ConnIdMeta;
+    type Meta: ConnectionIdMeta;
 
     /// Generates a new CID.
     ///
     /// Connection IDs **must not** contain any information that can be used by
     /// an external observer to correlate them with other connection IDs for the same
     /// connection. They **must** have high entropy.
-    fn generate_cid(&mut self) -> ConnectionId;
+    fn generate(&mut self) -> ConnectionId;
 
     /// Returns the length of a CID for connections created by this generator.
     ///
@@ -141,8 +144,8 @@ pub trait ConnIdGenerator: Send {
     /// Decrypts a connection ID.
     ///
     /// Noop if it's not encrypted.
-    fn decrypt(&self, cid: &mut ConnectionId) -> Result<(), ConnIdError>;
+    fn decrypt(&self, cid: &mut ConnectionId) -> Result<(), IdError>;
 
     /// Get metadata from a connection ID.
-    fn parse(&self, cid: &ConnectionId) -> Result<Self::Meta, ConnIdError>;
+    fn parse(&self, cid: &ConnectionId) -> Result<Self::Meta, IdError>;
 }

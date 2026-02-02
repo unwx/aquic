@@ -1,27 +1,24 @@
 use slab::Slab;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::exec::Runtime;
 
 /// A timer queue which allows events
 /// to be scheduled for execution at some later point.
-struct TimerWheel<T> {
+pub struct TimerWheel<T> {
     slots: Vec<Vec<(T, TimerKey)>>,
     entries: Slab<TimerEntry>,
 
+    tick_duration: Duration,
     current_tick: u64,
     mask: usize,
 }
 
 impl<T> TimerWheel<T> {
-    const DEFAULT_BUCKET_SIZE: usize = 4;
-
     /// Create a new instance of `TimerWheel`.
     ///
-    /// Parameters:
-    /// Note, they required only to calculate a number of buckets,
-    /// `TimerWheel` does not have a sense of time and doesn't adjust according to current time.
-    ///
     /// * `tick_duration`: what real duration does a single tick represent.
-    /// * `max_schedule`: in real time, what is the maximum for
+    /// * `max_schedule`: what is the maximum time event can be scheduled for.
     pub fn new(tick_duration: Duration, max_schedule: Duration) -> Self {
         assert!(tick_duration.as_millis() > 0, "tick_duration must be > 0");
         assert!(max_schedule.as_millis() > 0, "max_schedule must be > 0");
@@ -30,19 +27,18 @@ impl<T> TimerWheel<T> {
         let size = (total_ticks as u64 + 1).next_power_of_two() as usize;
 
         Self {
-            slots: (0..size)
-                .map(|_| Vec::with_capacity(Self::DEFAULT_BUCKET_CAPACITY))
-                .collect(),
+            slots: (0..size).map(|_| Vec::with_capacity(4)).collect(),
             entries: Slab::with_capacity(64),
+            tick_duration,
             current_tick: 0,
             mask: size - 1,
         }
     }
 
-    /// Schedule next value.
+    /// Schedule next event.
     ///
-    /// * `value`: value to schedule.
-    /// * `previous_val_key`: a previous key of the related value, that needs to be invalidated.
+    /// * `event`: event to schedule.
+    /// * `previous_val_key`: a previous key of the related event, that needs to be invalidated.
     /// * `duration_ticks` duration in ticks.
     ///
     /// # Panics
@@ -50,7 +46,7 @@ impl<T> TimerWheel<T> {
     /// If `duration_ticks` exceeds `max_schedule` value that was set at [`new`](TimerWheel::new) method.
     pub fn schedule(
         &mut self,
-        value: T,
+        event: T,
         duration_ticks: u64,
         previous_val_key: Option<TimerKey>,
     ) -> TimerKey {
@@ -78,18 +74,41 @@ impl<T> TimerWheel<T> {
         });
         let timer_key = TimerKey(entry_index);
 
-        bucket.push((value, timer_key));
+        bucket.push((event, timer_key));
         timer_key
     }
 
-    /// Cancel a scheduled value with the specified key.
+    /// Schedule next event, with `Instant` as a parameter instead of ticks.
+    ///
+    /// If it is impossible to precisely convert duration of `at - now` to ticks,
+    /// it will be rounded towards positive infinity.
+    ///
+    /// Therefore, event won't be available sooner than `Instant`.
+    ///
+    /// See: [`schedule`](Self::schedule).
+    pub fn schedule_instant_ceil(
+        &mut self,
+        event: T,
+        now: Instant,
+        at: Instant,
+        previous_val_key: Option<TimerKey>,
+    ) -> TimerKey {
+        let duration = at.saturating_duration_since(now);
+        let ticks = duration
+            .as_millis()
+            .div_ceil(self.tick_duration.as_millis());
+
+        self.schedule(event, ticks as u64, previous_val_key)
+    }
+
+    /// Cancel a scheduled event with the specified key.
     pub fn cancel(&mut self, key: TimerKey) {
         let Some(entry) = self.entries.get(key.0) else {
             return;
         };
 
         let bucket = &mut self.slots[entry.slot_index];
-        if bucket.len() > 0 {
+        if !bucket.is_empty() {
             let index_to_remove = entry.bucket_index;
             let last_index = bucket.len() - 1;
 
@@ -113,7 +132,7 @@ impl<T> TimerWheel<T> {
 
     /// Make next tick.
     ///
-    /// Writes all scheduled values for this tick into `out` vector.
+    /// Writes all scheduled events for this tick into `out` vector.
     pub fn tick(&mut self, out: &mut Vec<T>) -> usize {
         let slot_index = (self.current_tick as usize) & self.mask;
         self.current_tick += 1;
@@ -121,14 +140,33 @@ impl<T> TimerWheel<T> {
         let slot = &mut self.slots[slot_index];
         let count = slot.len();
 
-        for (value, key) in slot.drain(..) {
-            out.push(value);
+        for (event, key) in slot.drain(..) {
+            out.push(event);
 
             if self.entries.contains(key.0) {
                 self.entries.remove(key.0);
             }
         }
+
         count
+    }
+
+    /// Waits for the next [`tick`](Self::tick) until it's not empty.
+    ///
+    /// # Cancel Safety
+    ///
+    /// Cancel safe. If this method was interrupted at `sleep()` point,
+    /// the `next_tick_at` variable should contain an updated time when the next tick should happen.
+    pub async fn next(&mut self, out: &mut Vec<T>, next_tick_at: &mut Instant) -> usize {
+        loop {
+            Runtime::sleep_until(*next_tick_at).await;
+            *next_tick_at += self.tick_duration;
+
+            let count = self.tick(out);
+            if count != 0 {
+                return count;
+            };
+        }
     }
 }
 

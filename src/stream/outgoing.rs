@@ -1,5 +1,4 @@
-use crate::Spec;
-use crate::backend::stream::{OutStreamBackend, StreamError};
+use crate::backend::stream::OutStreamBackend;
 use crate::exec::{Runtime, SendOnMt};
 use crate::log;
 use crate::stream::{Encoder, Error, Payload};
@@ -7,16 +6,19 @@ use crate::sync::oneshot::{OneshotReceiver, OneshotSender};
 use crate::sync::stream;
 use crate::sync::{SmartRc, oneshot};
 use crate::tracing::StreamSpan;
+use crate::{Spec, backend};
 use bytes::Bytes;
 use futures::{FutureExt, select_biased};
 use smallvec::SmallVec;
 use tracing::{Instrument, Level, Span};
 
 /// An outgoing direction of QUIC stream,
-/// acts like a bridge between protocol backend and application listener.
+/// acts like a bridge between protocol backend and application listener for a single stream.
 ///
-/// Its role is to receive incoming messages from app via channel,
-/// encode them, and send it to stream.
+/// `network_peer <-> quic_backend <-> Outgoing<S> <-> local_application`.
+///
+/// Its role is to receive incoming messages from app,
+/// encode them, and send it to peer.
 ///
 /// The entire flow is sequential: implementation won't write to the stream,
 /// unless the network peer is ready to receive the data.
@@ -34,7 +36,7 @@ where
     /// Channel for receiving messages from app.
     item_receiver: stream::Receiver<S>,
 
-    /// Channel for sending a cancellation error: stops the I/O loop.
+    /// Channel for sending a cancellation error: stops the stream I/O loop.
     cancel_sender: oneshot::Sender<Error<S>>,
 
     /// Channel for receiving a cancellation error.
@@ -67,8 +69,11 @@ where
         }
     }
 
-    /// Starts the I/O loop in a separate task: sends data to the channel
-    /// until 'FIN' is sent, or error is received.
+    /// Starts the stream I/O loop in a separate task.
+    ///
+    /// Listens for messages from application,
+    /// encodes them,
+    /// and sends them to the QUIC backend.
     ///
     /// Returns a cancellation sender.
     ///
@@ -171,11 +176,11 @@ where
 
                 return Ok(());
             } else {
-                while let Some(bytes) = {
+                while let Some(batch) = {
                     let result = Some(self.encode_next().await?);
                     result.filter(|it| !it.is_empty())
                 } {
-                    self.write_to_stream(bytes, false).await?;
+                    self.write_to_stream(batch, false).await?;
                 }
             }
         }
@@ -246,7 +251,7 @@ where
         {
             Ok(_) => Ok(()),
             Err(e) => match e {
-                StreamError::Finish => {
+                backend::Error::StreamFinish => {
                     if contains_data {
                         // Panic, because we've lost data.
                         panic!("bug: attempt to write Bytes into a finished QUIC stream");
@@ -254,15 +259,15 @@ where
 
                     Ok(())
                 }
-                StreamError::ResetSending(e) => {
+                backend::Error::StreamResetSending(e) => {
                     if cfg!(debug_assertions) {
                         panic!("bug: received StreamError::ResetSending({e}), redundant call");
                     }
 
                     Err(Error::ResetSending(e.into()))
                 }
-                StreamError::StopSending(e) => Err(Error::StopSending(e.into())),
-                StreamError::Other(e) => Err(Error::HangUp(e)),
+                backend::Error::StreamStopSending(e) => Err(Error::StopSending(e.into())),
+                other => Err(Error::HangUp(other.to_string().into())),
             },
         }
     }

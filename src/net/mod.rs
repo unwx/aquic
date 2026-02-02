@@ -39,10 +39,7 @@ pub trait Socket: Sized {
     /// Returns the number of messages successfully flushed to the network.
     ///
     /// In case of partial write, the caller should wait until [`ready_to_send`](Socket::ready_to_send) returns.
-    fn send<'a, B: Buf<'a>>(
-        &self,
-        messages: &[SendMsg<B>],
-    ) -> impl Future<Output = Result<usize>> + SendOnMt;
+    fn send<B: Buf>(&self, msgs: &[SendMsg<B>]) -> impl Future<Output = Result<usize>> + SendOnMt;
 
     // Waits until the socket become ready to send packets again.
     fn ready_to_send(&self) -> impl Future<Output = ()> + SendOnMt;
@@ -51,7 +48,7 @@ pub trait Socket: Sized {
     ///
     /// The `msgs` slice will be filled with incoming packets.
     /// Returns the number of messages successfully read.
-    fn recv<'a, B: BufMut<'a>>(
+    fn recv<B: BufMut>(
         &self,
         msgs: &mut [RecvMsg<B>],
     ) -> impl Future<Output = Result<usize>> + SendOnMt;

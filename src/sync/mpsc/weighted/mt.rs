@@ -72,7 +72,7 @@ impl<T: Send + Unpin + 'static> WeightedSender<T> for Sender<T> {
             current = self.shared.occupation.load(Acquire);
         }
 
-        if let Err(_) = self.sender.send((value, weight)) {
+        if self.sender.send((value, weight)).is_err() {
             self.shared.open.store(false, Release);
 
             // No receivers left, we can safely store just `0`.

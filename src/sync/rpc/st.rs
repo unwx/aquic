@@ -67,23 +67,31 @@ where
     }
 
     async fn send(&self, args: T) -> Result<R, SendError> {
-        let mut storage = self.storage.borrow_mut();
-        let version = storage.next_version();
-        let key = storage.insert((State::Pending(None), version));
+        let version;
+        let key;
 
-        if let Err(_) = self.sender.send(Call {
-            args,
-            callback: Some(Callback {
-                storage: self.storage.clone(),
-                key,
-                version,
-            }),
-        }) {
-            storage.remove(key);
-            return async { Err(SendError::Closed) };
+        {
+            let mut storage = self.storage.borrow_mut();
+            version = storage.next_version();
+            key = storage.insert((State::Pending(None), version));
+
+            if self
+                .sender
+                .send(Call {
+                    args,
+                    callback: Some(Callback {
+                        storage: self.storage.clone(),
+                        key,
+                        version,
+                    }),
+                })
+                .is_err()
+            {
+                storage.remove(key);
+                return Err(SendError::Closed);
+            }
         }
 
-        drop(storage);
         ResponseFuture {
             storage: self.storage.clone(),
             key,
@@ -102,7 +110,7 @@ where
     }
 }
 
-impl<T, R> Debug for crate::sync::rpc::mt::Remote<T, R> {
+impl<T, R> Debug for Remote<T, R> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("st::Remote").finish()
     }
@@ -127,7 +135,9 @@ pub(crate) struct Callback<R> {
 impl<R> RemoteCallback<R> for Callback<R> {
     //noinspection DuplicatedCode
     fn on_result(self, result: R) {
-        let Some((state, version)) = self.storage.borrow_mut().get_mut(self.key) else {
+        let mut storage = self.storage.borrow_mut();
+
+        let Some((state, version)) = storage.get_mut(self.key) else {
             return;
         };
         if self.version != *version {
@@ -184,7 +194,7 @@ impl<R> Drop for Callback<R> {
 }
 
 
-pub struct ResponseFuture<R> {
+pub(crate) struct ResponseFuture<R> {
     storage: Rc<RefCell<Storage<R>>>,
     key: usize,
     version: u32,
@@ -209,7 +219,7 @@ impl<R> Future for ResponseFuture<R> {
                 Poll::Pending
             }
             State::Ready(_) => {
-                if let State::Ready(val) = slab.remove(self.key) {
+                if let State::Ready(val) = slab.remove(self.key).0 {
                     return Poll::Ready(Ok(val));
                 }
 

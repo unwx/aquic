@@ -58,11 +58,12 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let mut shared = self.shared.borrow_mut();
 
+        #[allow(clippy::collapsible_if)]
         if Rc::strong_count(&self.shared) == 2 && shared.receiver_exists {
             if let Some(waker) = shared.receiver_waker.take() {
                 waker.wake();
             }
-        }
+        };
     }
 }
 

@@ -1,5 +1,5 @@
-use std::time::{Duration, Instant};
 use crate::conditional;
+use std::time::{Duration, Instant};
 
 conditional! {
     multithread,
@@ -41,7 +41,7 @@ conditional! {
 
 
 /// Provides an API to work with async runtime.
-pub(crate) struct Runtime {}
+pub struct Runtime {}
 
 #[cfg(feature = "tokio")]
 impl Runtime {
@@ -52,7 +52,7 @@ impl Runtime {
     {
         tokio::spawn(future);
     }
-    
+
     pub async fn sleep(duration: Duration) {
         tokio::time::sleep(duration).await;
     }

@@ -69,14 +69,15 @@ pub struct Receiver<T> {
 
 impl<T: Clone> OneshotReceiver<T> for Receiver<T> {
     async fn recv(&self) -> Option<T> {
-        let shared = self.shared.borrow();
+        let listener = {
+            let shared = self.shared.borrow();
 
-        if let Some(value) = shared.value.as_ref() {
-            return Some(value.clone());
-        }
+            if let Some(value) = shared.value.as_ref() {
+                return Some(value.clone());
+            }
 
-        let listener = shared.notify.listen();
-        drop(shared);
+            shared.notify.listen()
+        };
 
         if let Some(listener) = listener {
             listener.await;

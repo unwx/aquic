@@ -55,13 +55,17 @@ where
             .insert(Mutex::new(Some(State::Pending(None))))
             .expect("unable to insert an RPC call state: sharded-slab's shard is full");
 
-        if let Err(_) = self.sender.send(Call {
-            args,
-            callback: Some(Callback {
-                storage: self.storage.clone(),
-                key,
-            }),
-        }) {
+        if self
+            .sender
+            .send(Call {
+                args,
+                callback: Some(Callback {
+                    storage: self.storage.clone(),
+                    key,
+                }),
+            })
+            .is_err()
+        {
             self.storage.remove(key);
             return Err(SendError::Closed);
         }
@@ -176,7 +180,7 @@ impl<R> Drop for Callback<R> {
 }
 
 
-pub struct ResponseFuture<R> {
+pub(crate) struct ResponseFuture<R> {
     storage: Arc<Slab<R>>,
     key: usize,
 }

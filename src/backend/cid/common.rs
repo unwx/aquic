@@ -1,7 +1,6 @@
-use crate::backend::NoopConnIdMeta;
-use crate::backend::cid::{ConnIdError, ConnIdGenerator, ConnectionId};
-use crate::util::ArrayVec;
+use crate::backend::cid::{ConnectionId, ConnectionIdGenerator, IdError, NoopIdMeta};
 use rand::{RngCore, rng};
+use smallvec::SmallVec;
 use std::time::Duration;
 
 /// A [ConnIdGenerator] implementation that
@@ -31,14 +30,14 @@ impl RandConnIdGenerator {
     }
 }
 
-impl ConnIdGenerator for RandConnIdGenerator {
-    type Meta = NoopConnIdMeta;
+impl ConnectionIdGenerator for RandConnIdGenerator {
+    type Meta = NoopIdMeta;
 
-    fn generate_cid(&mut self) -> ConnectionId {
-        let mut buf = ArrayVec::zeroed();
-        rng().fill_bytes(&mut buf.as_slice_all_mut()[..self.length]);
+    fn generate(&mut self) -> ConnectionId {
+        let mut buffer = SmallVec::from_elem(0, self.length);
+        rng().fill_bytes(&mut buffer.as_mut_slice()[..self.length]);
 
-        ConnectionId(buf)
+        ConnectionId(buffer)
     }
 
     fn cid_len(&self) -> usize {
@@ -53,11 +52,11 @@ impl ConnIdGenerator for RandConnIdGenerator {
         self.length == cid.len()
     }
 
-    fn decrypt(&self, _cid: &mut ConnectionId) -> Result<(), ConnIdError> {
+    fn decrypt(&self, _cid: &mut ConnectionId) -> Result<(), IdError> {
         Ok(())
     }
 
-    fn parse(&self, _cid: &ConnectionId) -> Result<Self::Meta, ConnIdError> {
-        Ok(NoopConnIdMeta)
+    fn parse(&self, _cid: &ConnectionId) -> Result<Self::Meta, IdError> {
+        Ok(NoopIdMeta)
     }
 }

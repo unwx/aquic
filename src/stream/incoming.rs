@@ -1,5 +1,4 @@
-use crate::Spec;
-use crate::backend::stream::{InStreamBackend, StreamError};
+use crate::backend::stream::InStreamBackend;
 use crate::exec::{Runtime, SendOnMt};
 use crate::log;
 use crate::stream::{Decoder, Error, Payload};
@@ -7,17 +6,20 @@ use crate::sync::oneshot::{OneshotReceiver, OneshotSender};
 use crate::sync::stream;
 use crate::sync::{SmartRc, oneshot};
 use crate::tracing::StreamSpan;
+use crate::{Spec, backend};
 use futures::{FutureExt, select_biased};
 use tracing::{Instrument, Level, Span};
 
 /// An incoming direction of QUIC stream,
-/// acts like a bridge between protocol backend and application listener.
+/// acts like a bridge between protocol backend and application listener for a single stream.
 ///
-/// Its role is to read incoming stream data,
-/// decode it, and send it via channel.
+/// `network_peer <-> quic_backend <-> Incoming<S> <-> local_application`.
 ///
-/// The entire flow is sequential: implementation won't read from the stream,
-/// unless the listener is ready to receive the data.
+/// Its role is to read incoming stream data from backend,
+/// decode it, and send it to app.
+///
+/// The entire flow is sequential: implementation won't read from backend,
+/// unless the app is ready to receive the data.
 pub(crate) struct Incoming<S, CId>
 where
     S: Spec,
@@ -38,7 +40,7 @@ where
     /// Channel for receiving a cancellation error.
     cancel_receiver: oneshot::Receiver<Error<S>>,
 
-    /// `true`, if 'FIN' was received from the stream.
+    /// `true`, if 'FIN' was received from backend.
     draining: bool,
 }
 
@@ -65,8 +67,11 @@ where
         }
     }
 
-    /// Starts the I/O loop in a separate task: reads data from the stream
-    /// until 'FIN' or error is received.
+    /// Starts the stream I/O loop in a separate task.
+    ///
+    /// Listens for data from QUIC backend,
+    /// decodes it,
+    /// sends it to app.
     ///
     /// Returns a cancellation sender.
     ///
@@ -188,18 +193,18 @@ where
             Ok(it) => it,
             Err(e) => {
                 return match e {
-                    StreamError::Finish => {
+                    backend::Error::StreamFinish => {
                         panic!("bug: received StreamError::Finish, but self.draining is false")
                     }
-                    StreamError::StopSending(e) => {
+                    backend::Error::StreamStopSending(e) => {
                         if cfg!(debug_assertions) {
                             panic!("bug: received StreamError::StopSending({e}), redundant call")
                         }
 
                         Err(Error::StopSending(e.into()))
                     }
-                    StreamError::ResetSending(e) => Err(Error::ResetSending(e.into())),
-                    StreamError::Other(e) => Err(Error::HangUp(e)),
+                    backend::Error::StreamResetSending(e) => Err(Error::ResetSending(e.into())),
+                    other => Err(Error::HangUp(other.to_string().into())),
                 };
             }
         };

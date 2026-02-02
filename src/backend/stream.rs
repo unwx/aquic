@@ -1,3 +1,4 @@
+use crate::backend::Error;
 use crate::core::{QuicCommand, QuicResponse};
 use crate::exec::SendOnMt;
 use crate::stream::{Chunk, Priority, StreamId};
@@ -5,39 +6,22 @@ use crate::sync::rpc;
 use crate::sync::rpc::SendError;
 use bytes::Bytes;
 use smallvec::SmallVec;
-use std::borrow::Cow;
-
-#[derive(Debug, Clone)]
-pub(crate) enum StreamError {
-    /// Stream is finished.
-    Finish,
-
-    /// Stream is terminated with `STOP_SENDING` frame.
-    StopSending(u64),
-
-    /// Stream is terminated with `RESET_SENDING` frame.
-    ResetSending(u64),
-
-    /// Other stream error.
-    Other(Cow<'static, str>),
-}
-
 
 /// Provides [`QuicBackend`][crate::backend::QuicBackend] API,
 /// limiting to methods required only for incoming(read) stream direction.
 ///
 /// All the communication with `QuicBackend` is done using channels, asynchronously.
-pub struct InStreamBackend<CId: SendOnMt + Unpin + 'static> {
+pub(crate) struct InStreamBackend<CId: SendOnMt + Unpin + 'static> {
     cid: CId,
     sid: StreamId,
-    remote: rpc::Remote<QuicCommand<CId>, QuicResponse<CId>>,
+    remote: rpc::Remote<QuicCommand<CId>, QuicResponse>,
 }
 
 impl<CId: Clone + SendOnMt + Unpin + 'static> InStreamBackend<CId> {
     pub fn new(
         cid: CId,
         sid: StreamId,
-        remote: rpc::Remote<QuicCommand<CId>, QuicResponse<CId>>,
+        remote: rpc::Remote<QuicCommand<CId>, QuicResponse>,
     ) -> Self {
         Self { cid, sid, remote }
     }
@@ -47,10 +31,10 @@ impl<CId: Clone + SendOnMt + Unpin + 'static> InStreamBackend<CId> {
     /// # Cancel Safety
     ///
     /// Not cancal safe, chunks will be lost forever.
-    pub(crate) async fn recv(
+    pub async fn recv(
         &mut self,
         max_total_size: usize,
-    ) -> Result<Result<(SmallVec<[Chunk; 32]>, bool), StreamError>, SendError> {
+    ) -> Result<Result<(SmallVec<[Chunk; 32]>, bool), Error>, SendError> {
         todo!();
     }
 
@@ -65,17 +49,17 @@ impl<CId: Clone + SendOnMt + Unpin + 'static> InStreamBackend<CId> {
 /// limiting to methods required only for outgoing(write) stream direction.
 ///
 /// All the communication with `QuicBackend` is done using channels, asynchronously.
-pub struct OutStreamBackend<CId: SendOnMt + Unpin + 'static> {
+pub(crate) struct OutStreamBackend<CId: SendOnMt + Unpin + 'static> {
     cid: CId,
     sid: StreamId,
-    remote: rpc::Remote<QuicCommand<CId>, QuicResponse<CId>>,
+    remote: rpc::Remote<QuicCommand<CId>, QuicResponse>,
 }
 
 impl<CId: Clone + SendOnMt + Unpin + 'static> OutStreamBackend<CId> {
     pub fn new(
         cid: CId,
         sid: StreamId,
-        remote: rpc::Remote<QuicCommand<CId>, QuicResponse<CId>>,
+        remote: rpc::Remote<QuicCommand<CId>, QuicResponse>,
     ) -> Self {
         Self { cid, sid, remote }
     }
@@ -97,7 +81,7 @@ impl<CId: Clone + SendOnMt + Unpin + 'static> OutStreamBackend<CId> {
         &mut self,
         batch: SmallVec<[Bytes; 32]>,
         fin: bool,
-    ) -> Result<Result<(), StreamError>, SendError> {
+    ) -> Result<Result<(), Error>, SendError> {
         todo!();
     }
 

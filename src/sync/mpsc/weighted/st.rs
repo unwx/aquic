@@ -30,23 +30,24 @@ pub(crate) struct Sender<T> {
 impl<T: Unpin + 'static> WeightedSender<T> for Sender<T> {
     async fn send(&self, value: T, weight: usize) -> Result<(), SendError> {
         loop {
-            let mut shared = self.shared.borrow_mut();
+            let listener = {
+                let mut shared = self.shared.borrow_mut();
 
-            if !shared.open {
-                return Err(SendError);
-            }
-            if has_capacity(shared.occupation, weight, shared.bound) {
-                shared.occupation += weight;
-                break;
-            }
+                if !shared.open {
+                    return Err(SendError);
+                }
+                if has_capacity(shared.occupation, weight, shared.bound) {
+                    shared.occupation += weight;
+                    break;
+                }
 
-            let listener = shared.event.listen();
-            drop(shared);
+                shared.event.listen()
+            };
 
             listener.await; // Cancel safe: we haven't modified anything yet.
         }
 
-        if let Err(_) = self.sender.send((value, weight)) {
+        if self.sender.send((value, weight)).is_err() {
             let mut shared = self.shared.borrow_mut();
             shared.open = false;
             shared.occupation = 0;
