@@ -1,8 +1,8 @@
 use crate::stream::codec::{Decoder, Encoder};
 use crate::sync::stream;
-use crate::util::CowBytes;
 use crate::{Estimate, Spec};
 use aquic_macros::supports;
+use bytes::Bytes;
 use std::borrow::Cow;
 use std::fmt::{Debug, Display, Formatter};
 
@@ -126,11 +126,11 @@ impl<S: Spec> std::error::Error for Error<S> {}
 #[derive(Debug, Clone)]
 pub enum Chunk {
     /// Chunk of data from an ordered QUIC stream.
-    Ordered(CowBytes),
+    Ordered(Bytes),
 
     /// Chunk of data and a stream offset.
     #[supports(quinn)]
-    Unordered(CowBytes, u64),
+    Unordered(Bytes, u64),
 }
 
 /// Represents a piece of data received from a stream.

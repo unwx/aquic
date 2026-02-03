@@ -8,7 +8,6 @@ use crate::backend::{OutEvents, Result};
 use crate::core::ConstBuf;
 use crate::net::{Buf, MAX_PACKET_SIZE, RecvMsg, SendMsg, ServerName, SoFeat};
 use crate::stream::{Chunk, Priority, StreamId};
-use crate::util::CowBytes;
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
     ClientConfig, ConnectError, ConnectionError, DatagramEvent, Dir, Endpoint, Event, FinishError,
@@ -500,12 +499,9 @@ where
                     threshold = threshold.saturating_sub(chunk.bytes.len());
 
                     if ordered {
-                        output.push(Chunk::Ordered(CowBytes::Shared(chunk.bytes)));
+                        output.push(Chunk::Ordered(chunk.bytes));
                     } else {
-                        output.push(Chunk::Unordered(
-                            CowBytes::Shared(chunk.bytes),
-                            chunk.offset,
-                        ));
+                        output.push(Chunk::Unordered(chunk.bytes, chunk.offset));
                     }
                 }
                 Ok(None) => {

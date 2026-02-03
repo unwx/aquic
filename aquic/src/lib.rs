@@ -13,7 +13,6 @@ pub mod backend;
 pub mod net;
 pub mod stream;
 pub mod sync;
-pub mod util;
 
 
 mod core;
