@@ -241,10 +241,12 @@ pub trait QuicBackend: Sized {
         bidirectional: bool,
     ) -> Result<StreamId>;
 
+    /// Writes chunks of stream data into `&mut out`.
+    /// The total number of bytes **should not** exceed `threshold`.
+    ///
     /// # Returns
     ///
     /// - Chunks of stream data, and whether the stream is finished (bool `FIN` flag).
-    ///   The number of chunks **must not** exceed `32`, and the total number of bytes **should not** exceed `threshold`.
     /// - [Error::Closed] if backend is closed.
     /// - [Error::UnknownConnection] if there is no connection with provided `connection_id`.
     /// - [Error::UnknownStream] if there is no stream with provided `stream_id`, or stream was previously finished/terminated.
@@ -264,13 +266,14 @@ pub trait QuicBackend: Sized {
         connection_id: &Self::StableConnectionId,
         stream_id: StreamId,
         threshold: usize,
-    ) -> Result<(SmallVec<[Chunk; 32]>, bool)>;
+        out: &mut Vec<Chunk>,
+    ) -> Result<bool>;
 
-    /// Sends a chunk of bytes,
+    /// Sends a match of bytes,
     /// and optionally sets `FIN` frame, which means a successful end of the stream direction.
     ///
     /// Returns `false` if partial write happened, and application need to invoke this method again.
-    /// All sent values are removed from the `&mut chunks` vector.
+    /// All sent values are removed from the `&mut batch` vector.
     ///
     /// **Note**: it is possible to provide empty chunk with `FIN` flag set to true.
     ///
@@ -279,7 +282,7 @@ pub trait QuicBackend: Sized {
     /// - [Error::Closed] if backend is closed.
     /// - [Error::UnknownConnection] if there is no connection with provided `connection_id`.
     /// - [Error::UnknownStream] if there is no stream with provided `stream_id`: it might be closed or previously terminated.
-    /// - [Error::StreamFinish] if the specified stream is finished.
+    /// - [Error::StreamFinish] if the specified stream was finished before this call.
     /// - [Error::StreamStopSending] if the specified stream is terminated by peer.
     /// - [Error::Other] on other, unexpected error.
     /// - [Error::Fatal] if backend is no longer functional due to internal error.
@@ -294,7 +297,7 @@ pub trait QuicBackend: Sized {
         &mut self,
         connection_id: &Self::StableConnectionId,
         stream_id: StreamId,
-        chunks: &mut SmallVec<[Bytes; 32]>,
+        batch: &mut Vec<Bytes>,
         fin: bool,
     ) -> Result<bool>;
 

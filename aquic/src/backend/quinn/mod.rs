@@ -464,7 +464,8 @@ where
         connection_id: &Self::StableConnectionId,
         stream_id: StreamId,
         mut threshold: usize,
-    ) -> Result<(SmallVec<[Chunk; 32]>, bool)> {
+        out: &mut Vec<Chunk>,
+    ) -> Result<bool> {
         if !self.open {
             return Err(Error::Closed);
         }
@@ -490,18 +491,16 @@ where
             ),
         })?;
 
-        let mut output = SmallVec::<[Chunk; 32]>::new();
         let mut fin = false;
-
-        while threshold != 0 && output.len() < output.inline_size() {
+        while threshold != 0 {
             match chunks.next(threshold) {
                 Ok(Some(chunk)) => {
                     threshold = threshold.saturating_sub(chunk.bytes.len());
 
                     if ordered {
-                        output.push(Chunk::Ordered(chunk.bytes));
+                        out.push(Chunk::Ordered(chunk.bytes));
                     } else {
-                        output.push(Chunk::Unordered(chunk.bytes, chunk.offset));
+                        out.push(Chunk::Unordered(chunk.bytes, chunk.offset));
                     }
                 }
                 Ok(None) => {
@@ -524,18 +523,18 @@ where
             drop(chunks);
             connection.unordered_streams.remove(&stream_id);
         }
-        if output.is_empty() && !fin {
+        if out.is_empty() && !fin {
             return Err(Error::StreamFinish);
         }
 
-        Ok((output, fin))
+        Ok(fin)
     }
 
     fn stream_send(
         &mut self,
         connection_id: &Self::StableConnectionId,
         stream_id: StreamId,
-        chunks: &mut SmallVec<[Bytes; 32]>,
+        batch: &mut Vec<Bytes>,
         fin: bool,
     ) -> Result<bool> {
         if !self.open {
@@ -546,14 +545,14 @@ where
         };
 
         let mut stream = connection.send_stream(u64_into_varint(stream_id).into());
-        while let Some(mut chunk) = chunks.pop() {
-            match stream.write(chunk.as_ref()) {
+        while let Some(mut bytes) = batch.pop() {
+            match stream.write(bytes.as_ref()) {
                 Ok(write) => {
-                    if write == chunk.len() {
+                    if write == bytes.len() {
                         continue;
                     }
 
-                    chunks.push(chunk.split_to(write));
+                    batch.push(bytes.split_to(write));
                     break;
                 }
 
@@ -569,7 +568,7 @@ where
             };
         }
 
-        if fin && chunks.is_empty() {
+        if fin && batch.is_empty() {
             match stream.finish() {
                 Ok(_) => {
                     // Do nothing, success.
@@ -583,7 +582,7 @@ where
             }
         }
 
-        let partial_write = !chunks.is_empty();
+        let partial_write = !batch.is_empty();
         Ok(partial_write)
     }
 

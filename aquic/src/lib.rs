@@ -1,7 +1,6 @@
 use crate::backend::QuicBackend;
 use crate::exec::{SendOnMt, SyncOnMt};
 use crate::net::{SoFeat, Socket};
-use crate::stream::codec::{Decoder, Encoder};
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -10,10 +9,10 @@ use std::net::SocketAddr;
 
 
 pub mod backend;
+pub mod dgram;
 pub mod net;
 pub mod stream;
 pub mod sync;
-
 
 mod core;
 mod exec;
@@ -119,10 +118,20 @@ pub trait Spec: SendOnMt + SyncOnMt + 'static {
     type Error: Error;
 
     /// Stream encoder.
-    type Encoder: Encoder<Item = Self::Item> + SendOnMt + 'static;
+    type StreamEncoder: stream::Encoder<Item = Self::Item, Error = Self::StreamEncoderError>
+        + SendOnMt
+        + 'static;
 
     /// Stream decoder.
-    type Decoder: Decoder<Item = Self::Item> + SendOnMt + 'static;
+    type StreamDecoder: stream::Decoder<Item = Self::Item, Error = Self::StreamDecoderError>
+        + SendOnMt
+        + 'static;
+
+    /// [Spec::StreamEncoder] error type.
+    type StreamEncoderError: std::error::Error + Clone + Send + Sync + 'static;
+
+    /// [Spec::StreamDecoder] error type.
+    type StreamDecoderError: std::error::Error + Clone + Send + Sync + 'static;
 
 
     /// Returns an application error on internal error, such as:
@@ -134,18 +143,26 @@ pub trait Spec: SendOnMt + SyncOnMt + 'static {
     /// This error is used to notify the peer about the incident, when possible.
     fn on_hangup() -> Self::Error;
 
-    /// Converts [`Encoder`] error into application error.
-    fn on_encoder_error(error: &<Self::Encoder as Encoder>::Error) -> Self::Error;
+    /// Converts [`stream::Encoder`] error into application error.
+    fn on_stream_encoder_error(error: &Self::StreamEncoderError) -> Self::Error;
 
-    /// Converts [`Decoder`] error into application error.
-    fn on_decoder_error(error: &<Self::Decoder as Decoder>::Error) -> Self::Error;
+    /// Converts [`stream::Decoder`] error into application error.
+    fn on_stream_decoder_error(error: &Self::StreamDecoderError) -> Self::Error;
 
 
     /// Creates a new [`Encoder`] instance.
-    fn new_encoder(&self) -> Self::Encoder;
+    fn new_stream_encoder(&self) -> Self::StreamEncoder;
 
     /// Creates a new [`Decoder`] instance.
-    fn new_decoder(&self) -> Self::Decoder;
+    fn new_stream_decoder(&self) -> Self::StreamDecoder;
+
+    /// Returns a maximum total number of bytes,
+    /// that decoder wants to receive in a single [`decode()`][stream::Decoder::decode] call.
+    fn stream_decoder_max_batch_size(&self) -> usize;
+
+    /// Returns a total number of bytes,
+    /// that encoder perceives as "enough" to flush the encoded output.
+    fn stream_encoder_max_batch_size(&self) -> usize;
 
     /// The maximum capacity of the stream channel.
     ///
@@ -197,6 +214,14 @@ macro_rules! conditional {
     };
 }
 
+macro_rules! debug_panic {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            panic!($($arg)*);
+        }
+    };
+}
+
 /// Write a log with a dynamic log level.
 macro_rules! log {
     ($lvl:expr, $($arg:tt)+) => {
@@ -211,4 +236,5 @@ macro_rules! log {
 }
 
 use conditional;
+use debug_panic;
 use log;

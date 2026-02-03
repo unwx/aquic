@@ -1,9 +1,8 @@
-use crate::stream::codec::{Decoder, Encoder};
 use crate::stream::{Error, Payload, Priority};
-use crate::sync::mpsc::weighted;
 use crate::sync::mpsc::weighted::{WeightedReceiver, WeightedSender};
+use crate::sync::mpsc::{self, weighted};
 use crate::sync::oneshot;
-use crate::sync::oneshot::{OneshotReceiver, OneshotSender, SendError, TryRecvError};
+use crate::sync::oneshot::{OneshotReceiver, OneshotSender, SendError};
 use crate::sync::stream::cell::PriorityCell;
 use crate::{Estimate, Spec};
 use futures::{FutureExt, select_biased};
@@ -186,7 +185,7 @@ impl<S: Spec> Sender<S> {
     /// Abruptly terminates the stream direction with [Error::Decoder].
     ///
     /// If the direction is already closed, this operation is a no-op.
-    pub(crate) fn terminate_due_decoder(&mut self, error: <S::Decoder as Decoder>::Error) {
+    pub(crate) fn terminate_due_decoder(&mut self, error: S::StreamDecoderError) {
         self.close(Error::Decoder(error));
     }
 
@@ -211,8 +210,8 @@ impl<S: Spec> Sender<S> {
     pub fn error(&self) -> Option<Error<S>> {
         match self.error_receiver.try_recv() {
             Ok(err) => Some(err),
-            Err(TryRecvError::Closed) => Some(Self::fallback_error()),
-            Err(TryRecvError::Empty) => None,
+            Err(oneshot::TryRecvError::Closed) => Some(Self::fallback_error()),
+            Err(oneshot::TryRecvError::Empty) => None,
         }
     }
 
@@ -358,7 +357,7 @@ impl<S: Spec> Receiver<S> {
 
         match event {
             Event::Err(err) => {
-                let err = err.unwrap_or_else(|| Self::fallback_error());
+                let err = err.unwrap_or_else(|| Self::err_rx_fallback_error());
                 Err(self.close(err))
             }
             Event::Item(result) => match result {
@@ -374,10 +373,43 @@ impl<S: Spec> Receiver<S> {
                     Ok(item)
                 }
                 None => {
-                    let err = Error::HangUp("Receiver.item_receiver is unavailable".into());
+                    let err = Self::item_rx_fallback_error();
                     Err(self.close(err))
                 }
             },
+        }
+    }
+
+    /// Try to receive a next chunk of data.
+    ///
+    /// More: [`recv()`][Receiver::recv].
+    pub fn try_recv(&mut self) -> Result<Option<Payload<S::Item>>, Error<S>> {
+        match self.error_receiver.try_recv() {
+            Ok(e) => {
+                return Err(self.close(e));
+            }
+            Err(oneshot::TryRecvError::Closed) => {
+                return Err(self.close(Self::err_rx_fallback_error()));
+            }
+            Err(oneshot::TryRecvError::Empty) => {
+                // Do nothing, channel is open.
+            }
+        };
+
+        match self.item_receiver.try_recv() {
+            Ok(item) => {
+                if item.is_fin() {
+                    let err = self.close(Error::Finish);
+
+                    if !matches!(err, Error::Finish) {
+                        return Err(err);
+                    }
+                }
+
+                Ok(Some(item))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Closed) => Err(self.close(Self::item_rx_fallback_error())),
         }
     }
 
@@ -391,7 +423,7 @@ impl<S: Spec> Receiver<S> {
     /// Abruptly terminates the stream direction with [Error::Encoder].
     ///
     /// If the direction is already closed, this operation is a no-op.
-    pub(crate) fn terminate_due_encoder(&mut self, error: <S::Encoder as Encoder>::Error) {
+    pub(crate) fn terminate_due_encoder(&mut self, error: S::StreamEncoderError) {
         self.close(Error::Encoder(error));
     }
 
@@ -422,8 +454,8 @@ impl<S: Spec> Receiver<S> {
     pub fn error(&self) -> Option<Error<S>> {
         match self.error_receiver.try_recv() {
             Ok(err) => Some(err),
-            Err(TryRecvError::Closed) => Some(Self::fallback_error()),
-            Err(TryRecvError::Empty) => None,
+            Err(oneshot::TryRecvError::Closed) => Some(Self::err_rx_fallback_error()),
+            Err(oneshot::TryRecvError::Empty) => None,
         }
     }
 
@@ -464,13 +496,17 @@ impl<S: Spec> Receiver<S> {
     fn close(&mut self, error: Error<S>) -> Error<S> {
         match self.error_sender.send(error.clone()) {
             Ok(_) => error,
-            Err(SendError::Closed) => Self::fallback_error(),
+            Err(SendError::Closed) => Self::err_rx_fallback_error(),
             Err(SendError::Full) => self.error().expect("bug: there must be an error present"),
         }
     }
 
-    fn fallback_error() -> Error<S> {
+    fn err_rx_fallback_error() -> Error<S> {
         Error::HangUp("Receiver.error_receiver is unavailable".into())
+    }
+
+    fn item_rx_fallback_error() -> Error<S> {
+        Error::HangUp("Receiver.item_receiver is unavailable".into())
     }
 }
 

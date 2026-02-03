@@ -1,4 +1,3 @@
-use crate::stream::codec::{Decoder, Encoder};
 use crate::sync::stream;
 use crate::{Estimate, Spec};
 use aquic_macros::supports;
@@ -7,10 +6,11 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display, Formatter};
 
 
-pub mod codec;
+mod codec;
 mod incoming;
 mod outgoing;
 
+pub use codec::*;
 pub(crate) use incoming::*;
 pub(crate) use outgoing::*;
 
@@ -59,10 +59,10 @@ pub enum Error<S: Spec> {
     ResetSending(S::Error),
 
     /// Deserialization of the incoming message failed.
-    Decoder(<S::Decoder as Decoder>::Error),
+    Decoder(S::StreamDecoderError),
 
     /// Serialization of the outgoing message failed.
-    Encoder(<S::Encoder as Encoder>::Error),
+    Encoder(S::StreamEncoderError),
 
     /// A QUIC connection, this stream belongs to, is closed.
     Connection,

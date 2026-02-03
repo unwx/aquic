@@ -2,7 +2,6 @@ use crate::exec::SendOnMt;
 use crate::stream::{Chunk, Payload};
 use aquic_macros::supports;
 use bytes::Bytes;
-use smallvec::SmallVec;
 use std::future::Future;
 
 /// A QUIC connection consists of multiple streams where data flows.
@@ -20,17 +19,17 @@ use std::future::Future;
 #[supports]
 pub trait Decoder {
     /// The type of the decoded entity.
-    type Item: SendOnMt + 'static;
+    type Item;
 
     /// The type of error in case of decoding failures.
     ///
     /// Clones should be cheap.
-    type Error: std::error::Error + Clone + Send + Sync + 'static;
+    type Error: std::error::Error;
 
     /// Returns `true` if the decoder supports an unordered stream.
     ///
     /// If a current [`QUIC Backend`][crate::backend::QuicBackend] supports unordered streams too,
-    /// then [`read()`][Decoder::read] will be populated with [`Chunk::Unordered`].
+    /// then [`decode()`][Decoder::decode] will be populated with [`Chunk::Unordered`].
     ///
     /// **Note**: for most cases an application wants an ordered stream,
     /// which will be decoded into ordered sequence of messages.
@@ -43,13 +42,13 @@ pub trait Decoder {
     #[supports(quinn)]
     fn supports_unordered() -> bool;
 
-    /// Returns a maximum size for a **sum** of bytes
-    /// that decoder wants to receive in a single [`read()`][Decoder::read] call.
-    fn max_batch_size(&self) -> usize;
-
-    /// Notifies about new available data for decoding.
+    /// Decodes the next batch of byte chunks.
+    /// Available items are written into `out_items`.
     ///
     /// If `fin` is `true`, this indicates the successful end of the stream; no further data will arrive.
+    /// It is expected, that method returns all pending items on `FIN`.
+    ///
+    /// **Note**: it is expected that `&mut in_batch` will become empty after this call.
     ///
     /// # Cancel Safety
     ///
@@ -58,30 +57,12 @@ pub trait Decoder {
     /// If the future is dropped before completion, the [`Decoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
     /// [`Decoder`] will not be used again after cancellation.
-    fn read(
+    fn decode(
         &mut self,
-        chunks: SmallVec<[Chunk; 32]>,
+        in_batch: &mut Vec<Chunk>,
+        out_items: &mut Vec<Self::Item>,
         fin: bool,
     ) -> impl Future<Output = Result<(), Self::Error>> + SendOnMt;
-
-    /// Returns the next decoded item, or `None` if there is no item available.
-    ///
-    /// A specific item will not be returned twice (unless it was explicitly received twice).
-    ///
-    /// # Cancel Safety
-    ///
-    /// This method is **not required** to be cancel-safe.
-    ///
-    /// If the future is dropped before completion, the [`Decoder`] may be left
-    /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`Decoder`] will not be used again after cancellation.
-    fn next_item(
-        &mut self,
-    ) -> impl Future<Output = Result<Option<Self::Item>, Self::Error>> + SendOnMt;
-
-    /// Returns `true` if decoder received `fin` previously in [`read()`][Decoder::read],
-    /// and has no more data in [`next_item()`][Decoder::next_item].
-    fn is_fin(&self) -> bool;
 }
 
 /// [`Encoder`] is a stateful object responsible for a single outgoing QUIC stream.
@@ -96,14 +77,14 @@ pub trait Decoder {
 /// The library is optimized for both blocking and non-blocking implementations.
 pub trait Encoder {
     /// The type of the entity to be encoded.
-    type Item: SendOnMt + 'static;
+    type Item;
 
     /// The type of error in case of encoding failures.
     ///
     /// Clones should be cheap.
-    type Error: std::error::Error + Clone + Send + Sync + 'static;
+    type Error: std::error::Error;
 
-    /// Queues an item to be written to the stream.
+    /// Encodes the next payload into `out_batch`.
     ///
     /// # Cancel Safety
     ///
@@ -112,26 +93,9 @@ pub trait Encoder {
     /// If the future is dropped before completion, the [`Encoder`] may be left
     /// in an inconsistent or invalid state. However, it is guaranteed that the
     /// [`Encoder`] will not be used again after cancellation.
-    fn write(
+    fn encode(
         &mut self,
-        payload: Payload<Self::Item>,
+        in_payload: Payload<Self::Item>,
+        out_batch: &mut Vec<Bytes>,
     ) -> impl Future<Output = Result<(), Self::Error>> + SendOnMt;
-
-    /// Returns the next chunk of raw bytes to be sent to the peer,
-    /// or empty if there is nothing to send.
-    ///
-    /// # Cancel Safety
-    ///
-    /// This method is **not required** to be cancel-safe.
-    ///
-    /// If the future is dropped before completion, the [`Encoder`] may be left
-    /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`Encoder`] will not be used again after cancellation.
-    fn next_buffer(
-        &mut self,
-    ) -> impl Future<Output = Result<SmallVec<[Bytes; 32]>, Self::Error>> + SendOnMt;
-
-    /// Returns `true` if encoder received `fin` previously in [`write()`][Encoder::write],
-    /// and has no more data in [`next_buffer()`][Encoder::next_buffer].
-    fn is_fin(&self) -> bool;
 }

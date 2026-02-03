@@ -1,7 +1,10 @@
+use std::borrow::Cow;
+
 use crate::backend::stream::InStreamBackend;
+use crate::debug_panic;
 use crate::exec::{Runtime, SendOnMt};
 use crate::log;
-use crate::stream::{Decoder, Error, Payload};
+use crate::stream::{Chunk, Decoder, Error, Payload};
 use crate::sync::oneshot::{OneshotReceiver, OneshotSender};
 use crate::sync::stream;
 use crate::sync::{SmartRc, oneshot};
@@ -25,11 +28,20 @@ where
     S: Spec,
     CId: SendOnMt + Unpin + 'static,
 {
+    /// A reference to protocol specification.
+    spec: SmartRc<S>,
+
     /// An API to communicate with QUIC implementation.
     backend: InStreamBackend<CId>,
 
     /// Decoder for decoding raw bytes stream.
-    decoder: S::Decoder,
+    decoder: S::StreamDecoder,
+
+    /// Buffered chunks of bytes.
+    decoder_in_batch: Option<Vec<Chunk>>,
+
+    /// Batch of decoded items.
+    decoder_out_batch: Vec<S::Item>,
 
     /// Channel for sending decoded items.
     item_sender: stream::Sender<S>,
@@ -54,12 +66,18 @@ where
         backend: InStreamBackend<CId>,
         item_sender: stream::Sender<S>,
     ) -> Self {
-        let decoder = spec.new_decoder();
         let (cancel_sender, cancel_receiver) = oneshot::channel();
 
+        let decoder = spec.new_stream_decoder();
+        let decoder_in_batch = Some(Vec::with_capacity(4));
+        let decoder_out_batch = Vec::with_capacity(1);
+
         Self {
+            spec,
             backend,
             decoder,
+            decoder_in_batch,
+            decoder_out_batch,
             item_sender,
             cancel_sender,
             cancel_receiver,
@@ -96,7 +114,7 @@ where
             select_biased! {
                 e = cancel_receiver.recv().fuse() => {
                     self.close(e.unwrap_or_else(
-                        || Error::HangUp("Incoming.cancel_receiver is unavailable".into())
+                        || Error::HangUp("'stream::Incoming.cancel_receiver' is unavailable".into())
                     ));
                 }
                 e = self.io_loop().fuse() => {
@@ -126,7 +144,7 @@ where
                 },
                 app_err = app_error_receiver.recv().fuse() => {
                     let app_err = app_err.unwrap_or_else(
-                        || Error::HangUp("Incoming.item_sender.error_receiver is unavailable".into())
+                        || Error::HangUp("'stream::Incoming.item_sender.error_receiver' is unavailable".into())
                     );
 
                     match &app_err {
@@ -153,30 +171,16 @@ where
     async fn io_loop(&mut self) -> Result<(), Error<S>> {
         loop {
             self.read_from_stream().await?;
+            self.decode().await?;
+            self.send().await?;
 
             if self.draining {
-                let mut current = self.decode_next().await?;
-
-                if current.is_none() {
-                    self.send(None, true).await?;
-                }
-
-                while let Some(item) = current {
-                    let fin = self.decoder.is_fin();
-                    self.send(Some(item), fin).await?;
-                    current = if fin { None } else { self.decode_next().await? };
-                }
-
                 return Ok(());
-            } else {
-                while let Some(item) = self.decode_next().await? {
-                    self.send(Some(item), false).await?;
-                }
             }
         }
     }
 
-    /// Reads bytes from the stream into the [Decoder].
+    /// Reads bytes from the stream into the [Self::decoder_in_batch].
     ///
     /// Does nothing if we've received 'FIN' before.
     async fn read_from_stream(&mut self) -> Result<(), Error<S>> {
@@ -184,23 +188,47 @@ where
             return Ok(());
         }
 
-        let (chunks, fin) = match self
+        let batch = match self.decoder_in_batch.take() {
+            Some(it) => it,
+            None => {
+                return Err(Self::panic_on_debug(
+                    "'stream::Incoming.decoder_in_batch' is empty at 'read_from_stream()' point"
+                        .into(),
+                ));
+            }
+        };
+        if !batch.is_empty() {
+            self.decoder_in_batch = Some(batch);
+
+            const MSG: &str =
+                "'stream::Incoming.decoder_in_batch' is not empty at 'read_from_stream()' point";
+
+            if self.draining {
+                return Err(Self::panic_on_debug(MSG.into()));
+            }
+
+            debug_panic!("{MSG}");
+            return Ok(()); // Let the loop process the rest...
+        }
+
+        let (batch, fin) = match self
             .backend
-            .recv(self.decoder.max_batch_size())
+            .recv(batch, self.spec.stream_decoder_max_batch_size())
             .await
-            .map_err(|e| Error::HangUp(format!("Incoming.backend is unavailable: {e}").into()))?
-        {
+            .map_err(|e| {
+                Error::HangUp(format!("'stream::Incoming.backend' is unavailable: {e}").into())
+            })? {
             Ok(it) => it,
             Err(e) => {
                 return match e {
                     backend::Error::StreamFinish => {
-                        panic!("bug: received StreamError::Finish, but self.draining is false")
+                        // `batch` is not recovered, as there is no more need on it.
+
+                        self.draining = true;
+                        return Ok(());
                     }
                     backend::Error::StreamStopSending(e) => {
-                        if cfg!(debug_assertions) {
-                            panic!("bug: received StreamError::StopSending({e}), redundant call")
-                        }
-
+                        debug_panic!("received 'Error::StreamStopSending({e})', redundant call?");
                         Err(Error::StopSending(e.into()))
                     }
                     backend::Error::StreamResetSending(e) => Err(Error::ResetSending(e.into())),
@@ -209,25 +237,59 @@ where
             }
         };
 
-        if chunks.is_empty() && !fin {
-            return Ok(());
-        }
-
         if fin {
             self.draining = true;
         }
 
-        self.decoder.read(chunks, fin).await.map_err(Error::Decoder)
+        self.decoder_in_batch = Some(batch);
+        Ok(())
     }
 
-    /// Tries to decode next item.
-    async fn decode_next(&mut self) -> Result<Option<S::Item>, Error<S>> {
-        self.decoder.next_item().await.map_err(Error::Decoder)
+    /// Tries to decode [Self::decoder_in_batch] into [Self::decoder_out_batch].
+    async fn decode(&mut self) -> Result<(), Error<S>> {
+        let Some(in_batch) = self.decoder_in_batch.as_mut() else {
+            return Err(Self::panic_on_debug(
+                "'stream::Incoming.decoder_in_buffer' is absent at 'decode()' point".into(),
+            ));
+        };
+
+        if !self.decoder_out_batch.is_empty() {
+            const MSG: &str =
+                "'stream::Incoming.decoder_out_batch' is not empty at 'decode()' point";
+
+            if self.draining {
+                return Err(Self::panic_on_debug(MSG.into()));
+            }
+
+            debug_panic!("{MSG}");
+            return Ok(()); // Let the loop process the rest.
+        }
+
+        self.decoder
+            .decode(in_batch, &mut self.decoder_out_batch, self.draining)
+            .await
+            .map_err(Error::Decoder)
+    }
+
+    /// Send all decoded items from [Self::decoder_out_batch] to the application.
+    async fn send(&mut self) -> Result<(), Error<S>> {
+        if self.decoder_out_batch.is_empty() && self.draining {
+            return self.send_item(None, true).await;
+        }
+
+        while let Some(item) = self.decoder_out_batch.pop() {
+            self.send_item(
+                Some(item),
+                self.draining && self.decoder_out_batch.is_empty(),
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     /// Sends a decoded message to the application.
-    async fn send(&mut self, item: Option<S::Item>, fin: bool) -> Result<(), Error<S>> {
-        let empty = item.is_none();
+    async fn send_item(&mut self, item: Option<S::Item>, fin: bool) -> Result<(), Error<S>> {
         let payload = match (item, fin) {
             (Some(item), true) => Payload::Last(item),
             (Some(item), false) => Payload::Item(item),
@@ -242,21 +304,16 @@ where
             Err(e) => match &e {
                 Error::StopSending(_) | Error::HangUp(_) => Err(e),
 
-                Error::Finish => {
-                    if empty {
-                        return Ok(());
-                    }
-
-                    // Panic, because we've lost a message.
-                    panic!("bug: attempt to write a new message into a finished stream::Sender");
-                }
+                Error::Finish => Err(Self::panic_on_debug(
+                    "attempt to write a new message into a finished 'stream::Sender'".into(),
+                )),
 
                 Error::ResetSending(_)
                 | Error::Decoder(_)
                 | Error::Encoder(_)
-                | Error::Connection => {
-                    panic!("bug: received unexpected error from stream::Sender: {e}");
-                }
+                | Error::Connection => Err(Self::panic_on_debug(
+                    format!("received unexpected error from 'stream::Sender': {e}").into(),
+                )),
             },
         }
     }
@@ -303,7 +360,7 @@ where
 
             // Occurred Decoder::Error, notify both sides.
             Error::Decoder(codec_err) => {
-                let proto_err = S::on_decoder_error(&codec_err);
+                let proto_err = S::on_stream_decoder_error(&codec_err);
                 self.item_sender.terminate_due_decoder(codec_err);
                 self.backend.stop_sending(proto_err.into());
                 span.on_internal();
@@ -323,12 +380,22 @@ where
             }
 
             Error::Encoder(codec_err) => {
+                let e: Cow<'static, str> = format!(
+                    "Received unexpected encoder error in stream::Incoming: \
+                    {codec_err}"
+                )
+                .into();
+                debug_panic!("{e}");
+
+                self.item_sender.hangup(e);
+                self.backend.stop_sending(S::on_hangup().into());
                 span.on_internal();
-                panic!(
-                    "bug: received unexpected encoder error in incoming stream: {}",
-                    &codec_err
-                );
             }
         };
+    }
+
+    fn panic_on_debug(msg: Cow<'static, str>) -> Error<S> {
+        debug_panic!("{msg}");
+        Error::HangUp(msg)
     }
 }

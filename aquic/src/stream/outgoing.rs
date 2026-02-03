@@ -1,4 +1,7 @@
+use std::borrow::Cow;
+
 use crate::backend::stream::OutStreamBackend;
+use crate::debug_panic;
 use crate::exec::{Runtime, SendOnMt};
 use crate::log;
 use crate::stream::{Encoder, Error, Payload};
@@ -9,7 +12,6 @@ use crate::tracing::StreamSpan;
 use crate::{Spec, backend};
 use bytes::Bytes;
 use futures::{FutureExt, select_biased};
-use smallvec::SmallVec;
 use tracing::{Instrument, Level, Span};
 
 /// An outgoing direction of QUIC stream,
@@ -27,11 +29,17 @@ where
     S: Spec,
     CId: SendOnMt + Unpin + 'static,
 {
+    /// A reference to protocol specification.
+    spec: SmartRc<S>,
+
     /// An API to communicate with QUIC implementation.
     backend: OutStreamBackend<CId>,
 
     /// Encoder for encoding messages into bytes.
-    encoder: S::Encoder,
+    encoder: S::StreamEncoder,
+
+    /// Batch of decoded items.
+    encoder_batch: Option<Vec<Bytes>>,
 
     /// Channel for receiving messages from app.
     item_receiver: stream::Receiver<S>,
@@ -56,12 +64,16 @@ where
         backend: OutStreamBackend<CId>,
         item_receiver: stream::Receiver<S>,
     ) -> Self {
-        let encoder = spec.new_encoder();
         let (cancel_sender, cancel_receiver) = oneshot::channel();
 
+        let encoder = spec.new_stream_encoder();
+        let encoder_batch = Some(Vec::with_capacity(4));
+
         Self {
+            spec,
             backend,
             encoder,
+            encoder_batch,
             item_receiver,
             cancel_sender,
             cancel_receiver,
@@ -98,7 +110,7 @@ where
             select_biased! {
                 e = cancel_receiver.recv().fuse() => {
                     self.close(e.unwrap_or_else(
-                        || Error::HangUp("Outgoing.cancel_receiver is unavailable".into())
+                        || Error::HangUp("'stream::Outgoing.cancel_receiver' is unavailable".into())
                     ));
                 }
                 e = self.io_loop().fuse() => {
@@ -128,7 +140,7 @@ where
                 },
                 app_err = app_error_receiver.recv().fuse() => {
                     let app_err = app_err.unwrap_or_else(
-                        || Error::HangUp("Outgoing.item_receiver.error_receiver is unavailable".into())
+                        || Error::HangUp("'stream::Outgoing.item_receiver.error_receiver' is unavailable".into())
                     );
 
                     match &app_err {
@@ -154,55 +166,100 @@ where
     /// Runs the primary I/O loop.
     async fn io_loop(&mut self) -> Result<(), Error<S>> {
         loop {
-            self.recv_item().await?;
+            self.recv().await?;
+            self.write_to_stream().await?;
 
             if self.draining {
-                let mut current = self.encode_next().await?;
-
-                if current.is_empty() {
-                    self.write_to_stream(SmallVec::new(), true).await?;
-                }
-
-                while !current.is_empty() {
-                    let fin = self.encoder.is_fin();
-                    self.write_to_stream(current, fin).await?;
-
-                    current = if fin {
-                        SmallVec::new()
-                    } else {
-                        self.encode_next().await?
-                    }
-                }
-
                 return Ok(());
-            } else {
-                while let Some(batch) = {
-                    let result = Some(self.encode_next().await?);
-                    result.filter(|it| !it.is_empty())
-                } {
-                    self.write_to_stream(batch, false).await?;
-                }
             }
         }
     }
 
-    /// Receives item from the app channel, and move it into [Encoder].
-    ///
-    /// Does nothing if we've received 'FIN' before.
-    async fn recv_item(&mut self) -> Result<(), Error<S>> {
+    /// Receives items from the application, until one of the conditions is true:
+    /// - No more items in the channel.
+    /// - Total amount of bytes buffered exceeding [Spec::stream_encoder_max_batch_size].
+    async fn recv(&mut self) -> Result<(), Error<S>> {
         if self.draining {
             return Ok(());
         }
 
-        let payload = match self.item_receiver.recv().await {
+        let Some(mut batch) = self.encoder_batch.take() else {
+            return Err(Self::panic_on_debug(
+                "'stream::Outgoing::encoder_batch' is absent at 'recv()' point".into(),
+            ));
+        };
+
+        if !batch.is_empty() {
+            self.encoder_batch = Some(batch);
+
+            const MSG: &str = "'stream::Outgoing.encoder_batch' must be empty at 'recv()' point";
+
+            if self.draining {
+                return Err(Self::panic_on_debug(MSG.into()));
+            }
+
+            debug_panic!("{MSG}");
+            return Ok(()); // Let the loop process the remaining...
+        }
+
+        if !self.recv_item(true, &mut batch).await? {
+            self.encoder_batch = Some(batch);
+            return Ok(());
+        }
+
+        let mut total_bytes = batch.iter().map(|it| it.len()).sum::<usize>();
+        let mut previous_batch_len = batch.len();
+        let threshold = self.spec.stream_encoder_max_batch_size();
+
+        while total_bytes < threshold && !self.draining {
+            if !self.recv_item(false, &mut batch).await? {
+                break;
+            }
+
+            if !batch.is_empty() && batch.len() > previous_batch_len {
+                previous_batch_len = batch.len();
+                total_bytes += batch[previous_batch_len..]
+                    .iter()
+                    .map(|it| it.len())
+                    .sum::<usize>();
+            }
+        }
+
+        self.encoder_batch = Some(batch);
+        Ok(())
+    }
+
+    /// Receives item from the application, and encodes it into [Self::encoder_batch].
+    ///
+    /// Does nothing if we've received 'FIN' before.
+    ///
+    /// Returns false if no item was written.
+    async fn recv_item(
+        &mut self,
+        blocking: bool,
+        buffer: &mut Vec<Bytes>,
+    ) -> Result<bool, Error<S>> {
+        if self.draining {
+            return Ok(false);
+        }
+
+        let payload_result = if blocking {
+            self.item_receiver.recv().await.map(Some)
+        } else {
+            self.item_receiver.try_recv()
+        };
+
+        let payload = match payload_result {
             Ok(it) => it,
             Err(e) => match &e {
                 Error::Finish => {
-                    if cfg!(debug_assertions) {
-                        panic!("bug: received Error::Finish, but self.draining is false")
-                    }
+                    // 'Error::Finish' means that stream was finished before the `recv()` call.
+                    // There is an issue somewhere, but not critical I guess?
+                    debug_panic!(
+                        "received 'Finish' error from 'stream::Receiver' when 'self.draining' is false"
+                    );
 
-                    Payload::Done
+                    Some(Payload::Done)
                 }
                 Error::ResetSending(_) | Error::HangUp(_) => {
                     return Err(e);
@@ -212,64 +269,61 @@ where
                 | Error::Decoder(_)
                 | Error::Encoder(_)
                 | Error::Connection => {
-                    panic!("bug: received unexpected error from stream::Receiver: {e}");
+                    return Err(Self::panic_on_debug(
+                        format!("received unexpected error from 'stream::Receiver': {e}").into(),
+                    ));
                 }
             },
+        };
+
+        let Some(payload) = payload else {
+            return Ok(false);
         };
 
         if payload.is_fin() {
             self.draining = true;
         }
 
-        self.encoder.write(payload).await.map_err(Error::Encoder)
-    }
-
-    /// Returns next encoded buffer.
-    async fn encode_next(&mut self) -> Result<SmallVec<[Bytes; 32]>, Error<S>> {
-        self.encoder.next_buffer().await.map_err(Error::Encoder)
+        self.encoder
+            .encode(payload, buffer)
+            .await
+            .map(|_| true)
+            .map_err(Error::Encoder)
     }
 
     /// Writes data to stream until every byte is sent.
-    ///
-    /// Automatically repeats on partial writes.
-    async fn write_to_stream(
-        &mut self,
-        batch: SmallVec<[Bytes; 32]>,
-        fin: bool,
-    ) -> Result<(), Error<S>> {
+    async fn write_to_stream(&mut self) -> Result<(), Error<S>> {
         if let Some(priority) = self.item_receiver.priority_once() {
             self.backend.set_priority(priority);
         }
 
-        let contains_data = !batch.is_empty();
+        let Some(batch) = self.encoder_batch.take() else {
+            return Err(Self::panic_on_debug(
+                "'stream::Outgoing::encoder_batch' is absent at 'write_to_stream()' point".into(),
+            ));
+        };
 
-        match self
-            .backend
-            .send(batch, fin)
-            .await
-            .map_err(|e| Error::HangUp(format!("Outgoing.backend is unavailable: {e}").into()))?
-        {
-            Ok(_) => Ok(()),
-            Err(e) => match e {
-                backend::Error::StreamFinish => {
-                    if contains_data {
-                        // Panic, because we've lost data.
-                        panic!("bug: attempt to write Bytes into a finished QUIC stream");
+        let batch = match self.backend.send(batch, self.draining).await.map_err(|e| {
+            Error::HangUp(format!("'stream::Outgoing.backend' is unavailable: {e}").into())
+        })? {
+            Ok(it) => it,
+            Err(e) => {
+                return match e {
+                    backend::Error::StreamFinish => Err(Self::panic_on_debug(
+                        "'stream::Outgoing': attempt to write bytes into a finished QUIC stream, message loss?".into(),
+                    )),
+                    backend::Error::StreamResetSending(e) => {
+                        debug_panic!("received 'Error::StreamResetSending({e})', redundant call?");
+                        Err(Error::ResetSending(e.into()))
                     }
+                    backend::Error::StreamStopSending(e) => Err(Error::StopSending(e.into())),
+                    other => Err(Error::HangUp(other.to_string().into())),
+                };
+            }
+        };
 
-                    Ok(())
-                }
-                backend::Error::StreamResetSending(e) => {
-                    if cfg!(debug_assertions) {
-                        panic!("bug: received StreamError::ResetSending({e}), redundant call");
-                    }
-
-                    Err(Error::ResetSending(e.into()))
-                }
-                backend::Error::StreamStopSending(e) => Err(Error::StopSending(e.into())),
-                other => Err(Error::HangUp(other.to_string().into())),
-            },
-        }
+        self.encoder_batch = Some(batch);
+        Ok(())
     }
 
 
@@ -314,7 +368,7 @@ where
 
             // Occurred Encoder::Error, notify both sides.
             Error::Encoder(codec_err) => {
-                let proto_err = S::on_encoder_error(&codec_err);
+                let proto_err = S::on_stream_encoder_error(&codec_err);
                 self.item_receiver.terminate_due_encoder(codec_err);
                 self.backend.reset_sending(proto_err.into());
                 span.on_internal();
@@ -334,12 +388,22 @@ where
             }
 
             Error::Decoder(codec_err) => {
+                let e: Cow<'static, str> = format!(
+                    "Received unexpected decoder error in stream::Outgoing: \
+                    {codec_err}"
+                )
+                .into();
+                debug_panic!("{e}");
+
+                self.item_receiver.hangup(e);
+                self.backend.reset_sending(S::on_hangup().into());
                 span.on_internal();
-                panic!(
-                    "bug: received unexpected decoder error in outgoing stream: {}",
-                    &codec_err
-                );
             }
         }
+    }
+
+    fn panic_on_debug(msg: Cow<'static, str>) -> Error<S> {
+        debug_panic!("{msg}");
+        Error::HangUp(msg)
     }
 }

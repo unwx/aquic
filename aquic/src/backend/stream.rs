@@ -5,7 +5,6 @@ use crate::stream::{Chunk, Priority, StreamId};
 use crate::sync::rpc;
 use crate::sync::rpc::SendError;
 use bytes::Bytes;
-use smallvec::SmallVec;
 
 /// Provides [`QuicBackend`][crate::backend::QuicBackend] API,
 /// limiting to methods required only for incoming(read) stream direction.
@@ -33,8 +32,9 @@ impl<CId: Clone + SendOnMt + Unpin + 'static> InStreamBackend<CId> {
     /// Not cancal safe, chunks will be lost forever.
     pub async fn recv(
         &mut self,
+        buffer: Vec<Chunk>,
         max_total_size: usize,
-    ) -> Result<Result<(SmallVec<[Chunk; 32]>, bool), Error>, SendError> {
+    ) -> Result<Result<(Vec<Chunk>, bool), Error>, SendError> {
         todo!();
     }
 
@@ -79,9 +79,9 @@ impl<CId: Clone + SendOnMt + Unpin + 'static> OutStreamBackend<CId> {
     /// Not cancel safe, partial write may happen.
     pub async fn send(
         &mut self,
-        batch: SmallVec<[Bytes; 32]>,
+        batch: Vec<Bytes>,
         fin: bool,
-    ) -> Result<Result<(), Error>, SendError> {
+    ) -> Result<Result<Vec<Bytes>, Error>, SendError> {
         todo!();
     }
 
