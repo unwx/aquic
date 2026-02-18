@@ -1,6 +1,7 @@
 use crate::sync::mpsc;
+use crate::sync::mpsc::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
+use crate::sync::mpsc::unbounded;
 use crate::sync::mpsc::unbounded::UnboundedSender;
-use crate::sync::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
 use slab::Slab;
 use std::cell::RefCell;
 use std::fmt::{Debug, Formatter};
@@ -47,7 +48,7 @@ impl<R> DerefMut for Storage<R> {
 
 
 pub(crate) struct Remote<T, R> {
-    sender: mpsc::unbounded::Sender<Call<T, R>>,
+    sender: unbounded::Sender<Call<T, R>>,
     storage: Rc<RefCell<Storage<R>>>,
 }
 
@@ -167,7 +168,6 @@ impl<R> RemoteCallback<R> for Callback<R> {
 }
 
 impl<R> Drop for Callback<R> {
-    //noinspection DuplicatedCode
     fn drop(&mut self) {
         let Ok(mut storage) = self.storage.try_borrow_mut() else {
             return;

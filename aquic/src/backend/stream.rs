@@ -2,8 +2,7 @@ use crate::backend::Error;
 use crate::core::{QuicCommand, QuicResponse};
 use crate::exec::SendOnMt;
 use crate::stream::{Chunk, Priority, StreamId};
-use crate::sync::rpc;
-use crate::sync::rpc::SendError;
+use crate::sync::mpsc::rpc::{self, SendError};
 use bytes::Bytes;
 
 /// Provides [`QuicBackend`][crate::backend::QuicBackend] API,

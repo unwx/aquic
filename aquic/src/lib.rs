@@ -1,7 +1,7 @@
 use crate::backend::QuicBackend;
 use crate::exec::{SendOnMt, SyncOnMt};
 use crate::net::{SoFeat, Socket};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::io;
@@ -51,19 +51,167 @@ pub trait Error:
     fn reason(self) -> Bytes;
 }
 
+
+/// Specification of the custom protocol,
+/// built on top of QUIC.
+pub trait Spec: SendOnMt + SyncOnMt + 'static {
+    /// Stream communication primitive: an item to be decoded and encoded, sent and received.
+    type StreamItem: Estimate + SendOnMt + Unpin + 'static;
+
+    /// Datagram extension communication primitive: an item to be decoded and encoded, sent and received.
+    type DgramItem: Estimate + SendOnMt + Unpin + 'static;
+
+    /// Custom application error.
+    type Error: Error;
+
+
+    /// Stream encoder.
+    type StreamEncoder: stream::Encoder<Item = Self::StreamItem, Error = Self::StreamEncoderError>
+        + SendOnMt
+        + 'static;
+
+    /// Stream decoder.
+    type StreamDecoder: stream::Decoder<Item = Self::StreamItem, Error = Self::StreamDecoderError>
+        + SendOnMt
+        + 'static;
+
+    /// Datagram encoder.
+    type DgramEncoder: dgram::Encoder<Item = Self::DgramItem> + SendOnMt + 'static;
+
+    /// Datagram decoder.
+    type DgramDecoder: dgram::Decoder<Item = Self::DgramItem> + SendOnMt + 'static;
+
+
+    /// [Spec::StreamEncoder] error type.
+    type StreamEncoderError: std::error::Error + Clone + Send + Sync + 'static;
+
+    /// [Spec::StreamDecoder] error type.
+    type StreamDecoderError: std::error::Error + Clone + Send + Sync + 'static;
+
+
+    /// Returns an application error on internal error, such as:
+    /// - [`stream::Sender`](sync::stream::Sender) was dropped because of panic.
+    ///
+    /// - [`backend::QuicEndpoint`] provider has a bug, or this library has a bug
+    ///   leading to unrecoverable connection state.
+    ///
+    /// This error is used to notify the peer about the incident, when possible.
+    fn on_hangup() -> Self::Error;
+
+    /// Converts [`stream::Encoder`] error into application error.
+    fn on_stream_encoder_error(error: &Self::StreamEncoderError) -> Self::Error;
+
+    /// Converts [`stream::Decoder`] error into application error.
+    fn on_stream_decoder_error(error: &Self::StreamDecoderError) -> Self::Error;
+
+
+    /// Creates a new [`stream::Encoder`] instance.
+    fn new_stream_encoder(&self) -> Self::StreamEncoder;
+
+    /// Creates a new [`stream::Decoder`] instance.
+    fn new_stream_decoder(&self) -> Self::StreamDecoder;
+
+    /// Creates a new [`dgram::Encoder`] instance.
+    fn new_dgram_encoder(&self) -> Self::DgramEncoder;
+
+    /// Creates a new [`dgram::Decoder`] instance.
+    fn new_dgram_decoder(&self) -> Self::DgramDecoder;
+
+
+    /// Returns a total number of encoded bytes,
+    /// that is enough to flush the encoded output to the network.
+    ///
+    /// May be `zero` for an immediate effect.
+    ///
+    /// **Notes**:
+    /// - it has effect only if there are pending items to be encoded:
+    ///   it won't block & wait for new items.
+    /// - it is recommended to set `QuicBackend` stream buffer size larger than `stream_encoder_max_batch_size`
+    ///   to avoid partial writes bottleneck.
+    /// - setting a large value might not be efficient, as ideally batch size should not exceed peer's flow control limit.
+    fn stream_encoder_max_batch_size(&self) -> usize;
+
+    /// Returns a maximum total number of bytes,
+    /// that is allowed to pass in a single [`decode()`][stream::Decoder::decode] call.
+    ///
+    /// **Note**: it is recommended to set [`stream_channel_bound`][Spec::stream_channel_bound] accordingly,
+    /// as each decoded item goes into the channel afterwards.
+    fn stream_decoder_max_batch_size(&self) -> usize;
+
+    /// Returns a total number of encoded bytes,
+    /// that is enough to flush the encoded output to the network.
+    ///
+    /// May be `zero` for an immediate effect.
+    ///
+    /// **Notes**:
+    /// - it has effect only if there are pending items to be encoded:
+    ///   it won't block & wait for new items.
+    /// - it is recommended to set `QuicBackend` datagram buffer size larger than `dgram_encoder_max_batch_size`
+    ///   to avoid partial writes bottleneck (or outgoing packet loss).
+    /// - setting a large value might not be efficient, as peer might drop packets exceeding his buffer capacity.
+    fn dgram_encoder_max_batch_size(&self) -> usize;
+
+    /// Returns a maximum desired total number of bytes,
+    /// that should to pass in a single [`decode()`][dgram::Decoder::decode] call.
+    ///
+    /// May be `zero`, to allow only a single datagram.
+    ///
+    /// **Notes**:
+    /// - it is recommended to set [`dgram_channel_bound`][Spec::dgram_channel_bound] accordingly,
+    ///   as each decoded item goes into the channel afterwards, and **will be dropped** if channel is full.
+    /// - real batch size may exceed the specified desired value, up to a single extra datagram.
+    fn dgram_decoder_max_batch_size(&self) -> usize;
+
+    /// The maximum capacity of the stream channel.
+    ///
+    /// **Note**: each item inside the stream channel might occupy available space differently,
+    /// depending on item's [`Estimate`] implementation.
+    fn stream_channel_bound(&self) -> usize;
+
+    /// The maximum capacity of the dgram channel.
+    ///
+    /// **Note**: each item inside the datagram channel might occupy available space differently,
+    /// depending on item's [`Estimate`] implementation.
+    fn dgram_channel_bound(&self) -> usize;
+}
+
+
+/// Everything that [`protocol`](Spec) needs to work on the network level.
+pub trait Engine: SendOnMt + SyncOnMt + 'static {
+    /// Socket to use for network I/O.
+    type Socket: Socket;
+
+    /// QUIC protocol implementation provider.
+    type QuicBackend: QuicBackend;
+
+    /// Creates a new socket and binds it to the specified address.
+    ///
+    /// Implementation may customize socket options before returning it.
+    fn bind_socket(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Socket>>;
+
+    /// Creates a new [`QuicBackend`] instance.
+    fn new_quic_backend(
+        &self,
+        socket_addr: SocketAddr,
+        socket_features: &HashSet<SoFeat>,
+    ) -> Self::QuicBackend;
+}
+
+
 /// Makes a custom estimation of [Self], which can be `zero`.
-///
-/// Returned value will be used as `weight` in [sync::stream::channel]
-/// for the current value.
 ///
 /// # What for
 ///
-/// As [sync::stream::channel] is a bounded channel,
-/// it needs to know how many items it can hold inside for `Receiver` to consume,
-/// until it exceeds the `bound`.
+/// Bounded stream/datagram channels:
+/// - [sync::stream].
+/// - [sync::dgram].
 ///
-/// [sync::stream::channel] doesn't just count the number of items,
-/// it allows for each item to has its own weight (size, volume, cost, etc).
+/// As these channels are bounded,
+/// they need to know how many items they can hold inside for a `Receiver` to consume,
+/// until internal buffer exceeds the `bound` and blocks further `send()` attempts.
+///
+/// These channels don't just count the number of items,
+/// they allow for each item to have its own weight (you can call it size, volume, cost, etc).
 ///
 /// Therefore, using this estimation method, it is possible to achieve something like this:
 ///
@@ -92,106 +240,34 @@ pub trait Error:
 ///           match self {
 ///               Self::Handshake(id) => id.len(),
 ///               Self::Item(payload) => payload.len(),
-///               Self::LargeItem(path) => path.as_os_str().len(),
+///               Self::LargeItem(path) => path.as_os_str().len(), // Item is stored on disk, not on RAM.
 ///               Self::Ping => 1,
-///               Self::Bye => 1,
+///               Self::Bye => 0,
 ///           }
 ///       }
 ///   }
 /// ```
 ///
 /// Therefore, with a `bound` of `1024` we can handle a lot `Handshake`/`LargeItem`/`Ping` messages,
-/// and limited `Item` messages until their memory occupation exceeds ~`1024`.
+/// or limited number of `Item` messages until their memory occupation exceeds ~`1024`.
 pub trait Estimate {
-    fn estimate(&self) -> usize {
-        usize::MAX
-    }
+    /// Returned value can be any value, including `zero` or `usize::MAX`.
+    fn estimate(&self) -> usize;
 }
 
-/// Specification of the custom protocol,
-/// built on top of QUIC.
-pub trait Spec: SendOnMt + SyncOnMt + 'static {
-    /// Stream communication primitive: an item to be decoded or encoded, sent or received.
-    type Item: Estimate + SendOnMt + Unpin + 'static;
-
-    /// Custom application error.
-    type Error: Error;
-
-    /// Stream encoder.
-    type StreamEncoder: stream::Encoder<Item = Self::Item, Error = Self::StreamEncoderError>
-        + SendOnMt
-        + 'static;
-
-    /// Stream decoder.
-    type StreamDecoder: stream::Decoder<Item = Self::Item, Error = Self::StreamDecoderError>
-        + SendOnMt
-        + 'static;
-
-    /// [Spec::StreamEncoder] error type.
-    type StreamEncoderError: std::error::Error + Clone + Send + Sync + 'static;
-
-    /// [Spec::StreamDecoder] error type.
-    type StreamDecoderError: std::error::Error + Clone + Send + Sync + 'static;
-
-
-    /// Returns an application error on internal error, such as:
-    /// - [`stream::Sender`](sync::stream::Sender) was dropped because of panic.
-    ///
-    /// - [`backend::QuicEndpoint`] provider has a bug, or this library has a bug
-    ///   leading to unrecoverable connection state.
-    ///
-    /// This error is used to notify the peer about the incident, when possible.
-    fn on_hangup() -> Self::Error;
-
-    /// Converts [`stream::Encoder`] error into application error.
-    fn on_stream_encoder_error(error: &Self::StreamEncoderError) -> Self::Error;
-
-    /// Converts [`stream::Decoder`] error into application error.
-    fn on_stream_decoder_error(error: &Self::StreamDecoderError) -> Self::Error;
-
-
-    /// Creates a new [`Encoder`] instance.
-    fn new_stream_encoder(&self) -> Self::StreamEncoder;
-
-    /// Creates a new [`Decoder`] instance.
-    fn new_stream_decoder(&self) -> Self::StreamDecoder;
-
-    /// Returns a maximum total number of bytes,
-    /// that decoder wants to receive in a single [`decode()`][stream::Decoder::decode] call.
-    fn stream_decoder_max_batch_size(&self) -> usize;
-
-    /// Returns a total number of bytes,
-    /// that encoder perceives as "enough" to flush the encoded output.
-    fn stream_encoder_max_batch_size(&self) -> usize;
-
-    /// The maximum capacity of the stream channel.
-    ///
-    /// **Note**: please make sure to get acquainted with [`Estimate`],
-    /// as each item inside the stream channel might occupy available space differently.
-    fn stream_channel_bound(&self) -> usize;
+macro_rules! impl_estimate {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl Estimate for $t {
+                fn estimate(&self) -> usize {
+                    self.len()
+                }
+            }
+        )+
+    };
 }
 
-
-/// Everything that [`protocol`](Spec) needs to work on the network level.
-pub trait Engine: SendOnMt + SyncOnMt + 'static {
-    /// Socket to use for network I/O.
-    type Socket: Socket;
-
-    /// QUIC protocol implementation provider.
-    type QuicBackend: QuicBackend;
-
-    /// Creates a new socket and binds it to the specified address.
-    ///
-    /// Implementation may customize socket options before returning it.
-    fn bind_socket(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Socket>>;
-
-    /// Creates a new [`QuicBackend`] instance.
-    fn new_quic_backend(
-        &self,
-        socket_addr: SocketAddr,
-        socket_features: &HashSet<SoFeat>,
-    ) -> Self::QuicBackend;
-}
+impl_estimate!(Bytes, BytesMut, Vec<u8>, [u8], &[u8]);
 
 
 /// Conditional code:
@@ -214,6 +290,7 @@ macro_rules! conditional {
     };
 }
 
+/// Panics if `debug_assertions` is enabled.
 macro_rules! debug_panic {
     ($($arg:tt)*) => {
         if cfg!(debug_assertions) {

@@ -1,7 +1,9 @@
 use crossfire::mpsc::List;
 
-use crate::sync::mpsc::unbounded::{UnboundedReceiver, UnboundedSender};
-use crate::sync::mpsc::{SendError, TryRecvError};
+use crate::sync::{
+    SendError, TryRecvError,
+    mpsc::unbounded::{UnboundedReceiver, UnboundedSender},
+};
 
 pub(crate) fn channel<T: Send + Unpin + 'static>() -> (Sender<T>, Receiver<T>) {
     let (sender, receiver) = crossfire::mpsc::unbounded_async();
@@ -22,8 +24,8 @@ impl<T: Send + Unpin + 'static> Clone for Sender<T> {
 }
 
 impl<T: Send + Unpin + 'static> UnboundedSender<T> for Sender<T> {
-    fn send(&self, value: T) -> Result<(), SendError> {
-        self.inner.send(value).map_err(|_| SendError)
+    fn send(&self, value: T) -> Result<(), SendError<T>> {
+        self.inner.send(value).map_err(|v| SendError(v.0))
     }
 
     fn is_closed(&self) -> bool {

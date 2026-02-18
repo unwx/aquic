@@ -1,5 +1,5 @@
 use crate::sync::mpsc::unbounded::{UnboundedReceiver, UnboundedSender};
-use crate::sync::mpsc::{SendError, TryRecvError};
+use crate::sync::{SendError, TryRecvError};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::poll_fn;
@@ -27,10 +27,10 @@ pub(crate) struct Sender<T> {
 }
 
 impl<T: Unpin + 'static> UnboundedSender<T> for Sender<T> {
-    fn send(&self, value: T) -> Result<(), SendError> {
+    fn send(&self, value: T) -> Result<(), SendError<T>> {
         let mut shared = self.shared.borrow_mut();
         if !shared.receiver_exists {
-            return Err(SendError);
+            return Err(SendError(value));
         }
 
         shared.deque.push_back(value);

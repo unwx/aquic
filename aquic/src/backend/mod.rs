@@ -6,7 +6,6 @@ use crate::net::{Buf, MAX_PACKET_SIZE, RecvMsg, SendMsg, ServerName, SoFeat};
 use crate::stream::{Chunk, Priority, StreamId};
 use aquic_macros::supports;
 use bytes::Bytes;
-use smallvec::SmallVec;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -25,17 +24,14 @@ conditional! {
     pub use quinn::*;
 }
 
-pub mod cid;
-pub mod stream;
-pub mod util;
+pub(crate) mod dgram;
+pub(crate) mod stream;
 
+pub mod cid;
+pub mod util;
 
 mod types;
 pub use types::*;
-
-
-// By design,
-// a single `QuicBackend` should be able serve multiple [`protocol specifications`](crate::Spec).
 
 /// QUIC protocol implementation provider.
 ///
@@ -43,13 +39,8 @@ pub use types::*;
 /// `QuicBackend` is intended to be invoked from real network I/O loop.
 #[supports]
 pub trait QuicBackend: Sized {
-    // TODO(feat): dgrams.
-
     /// Implementation configuration.
     type Config;
-
-    /// Scheduled event, to wake up [QuicBackend] later with.
-    type WakeEvent;
 
     /// As QUIC connection IDs may change from time to time for a single connection,
     /// `StableConnectionId` should always stay the same.
@@ -81,15 +72,18 @@ pub trait QuicBackend: Sized {
     /// therefore this method can be called with any delay: there is no interval.
     fn tick(&mut self, now: Instant);
 
+    /// Returns container with previously written backend events inside.
+    fn events(&mut self) -> &mut BackendEvents<Self::StableConnectionId>;
+
 
     /// Notifies that backend should prepare to shutdown.
-    fn prepare_to_shutdown(&self, deadline: Instant);
+    ///
+    /// **Note**: all connections and streams are notified about incoming shutdown automatically.
+    fn prepare_to_shutdown(&mut self, deadline: Instant);
 
     /// Polled after [`prepare_to_shutdown()`][QuicBackend::prepare_to_shutdown] to check,
     /// whether backend is ready to be closed or not (in case it's ready before the deadline).
-    ///
-    /// **Note**: all connections and streams are notified about incoming shutdown automatically.
-    fn ready_to_shutdown(&self) -> bool;
+    fn ready_to_shutdown(&mut self) -> bool;
 
     /// Closes the `QuicBackend`,
     /// and then queues `CONNECTION_CLOSE` frames for all its connections with the specified application `err` and `reason`.
@@ -102,6 +96,8 @@ pub trait QuicBackend: Sized {
 
 
     /// Queues an attempt to connect to the specified peer.
+    ///
+    /// **Note**: there is no need to produce [Created](crate::core::event::ConnectionEvent::Created) event.
     ///
     /// # Returns
     ///
@@ -119,10 +115,11 @@ pub trait QuicBackend: Sized {
     /// Queues a `CONNECTION_CLOSE` frame with the specified application `err` and `reason`.
     /// This method does **not** wait until all connection streams are finished/closed.
     ///
-    /// If backend is closed, this operation is no-op.
+    /// **Note**: there is no need to produce [Closed](crate::core::event::ConnectionEvent::Closed) or similar event.
     ///
     /// # Returns
     ///
+    /// - [Error::Closed] if backend is closed.
     /// - [Error::UnknownConnection] if there is no such connection (**may** be closed earlier).
     /// - [Error::Other] on other, unexpected error.
     /// - [Error::Fatal] if backend is no longer functional due to internal error.
@@ -135,7 +132,6 @@ pub trait QuicBackend: Sized {
 
 
     /// Writes packets to be sent to the peer into `messages`.
-    /// If there are pending events available, they can be written into `events` too.
     ///
     /// **May** write nothing, if there is no packet or buffer available.
     ///
@@ -145,11 +141,7 @@ pub trait QuicBackend: Sized {
     /// there may be pending `CONNECTION_CLOSE` frames.
     ///
     /// - [Error::Fatal] if backend is no longer functional due to internal error.
-    fn send_prepare(
-        &mut self,
-        messages: &mut Vec<SendMsg<Self::OutBuf>>,
-        events: &mut OutEvents<Self::StableConnectionId>,
-    ) -> Result<()>;
+    fn send_prepare(&mut self, messages: &mut Vec<SendMsg<Self::OutBuf>>) -> Result<()>;
 
     /// Notifies that some or all of the previous packets were flushed,
     /// and you may reuse their buffers again.
@@ -164,7 +156,7 @@ pub trait QuicBackend: Sized {
 
     /// Receives packets from peer,
     /// handles them,
-    /// and writes outgoing events into `events`.
+    /// and writes outgoing events.
     ///
     /// **Note**: this method **must** handle at least one message after all internal buffers are returned via [`send_done()`][QuicBackend::send_done],
     /// or it will be considered as fatal error.
@@ -179,14 +171,10 @@ pub trait QuicBackend: Sized {
     ///
     /// **Note**: If the returned number of messages is not equal to `messages.len()`,
     /// this method will be invoked again **only** after [`send_prepare()`][QuicBackend::send_prepare] & [`send_done()`][QuicBackend::send_done].
-    fn recv(
-        &mut self,
-        messages: &mut [RecvMsg<ConstBuf<MAX_PACKET_SIZE>>],
-        events: &mut OutEvents<Self::StableConnectionId>,
-    ) -> Result<usize>;
+    fn recv(&mut self, messages: &mut [RecvMsg<ConstBuf<MAX_PACKET_SIZE>>]) -> Result<usize>;
 
 
-    /// Sleep until there is an internal event that must be handled,
+    /// Sleeps until there is an internal event that must be handled,
     /// for example connection timeout.
     ///
     /// It's recommended to take a look at [`TimerWheel::next()`][`crate::backend::util::TimerWheel::next`],
@@ -199,13 +187,20 @@ pub trait QuicBackend: Sized {
 
     /// Invoked when [`sleep()`][QuicBackend::sleep] gets interrupted.
     ///
-    /// If backend is closed, this operation is no-op.
-    ///
     /// # Returns
     ///
+    /// - [Error::Closed] if backend is closed.
     /// - [Error::Fatal] if backend is no longer functional due to internal error.
     fn on_alarm(&mut self) -> Result<()>;
 
+
+    /// Notifies about the local address update.
+    ///
+    /// # Returns
+    ///
+    /// - [Error::Closed] if backend is closed.
+    /// - [Error::Fatal] if backend is no longer functional due to internal error.
+    fn local_address_changed(&mut self, address: SocketAddr) -> Result<()>;
 
     /// Returns the peer's certificate chain (if any) as a vector of DER-encoded
     /// buffers.
@@ -269,13 +264,14 @@ pub trait QuicBackend: Sized {
         out: &mut Vec<Chunk>,
     ) -> Result<bool>;
 
-    /// Sends a match of bytes,
+    /// Sends a batch of bytes,
     /// and optionally sets `FIN` frame, which means a successful end of the stream direction.
     ///
-    /// Returns `false` if partial write happened, and application need to invoke this method again.
+    /// If partial write happened application needs to invoke this method again.
     /// All sent values are removed from the `&mut batch` vector.
     ///
     /// **Note**: it is possible to provide empty chunk with `FIN` flag set to true.
+    /// Partial write is impossible in this case.
     ///
     /// # Returns
     ///
@@ -299,7 +295,7 @@ pub trait QuicBackend: Sized {
         stream_id: StreamId,
         batch: &mut Vec<Bytes>,
         fin: bool,
-    ) -> Result<bool>;
+    ) -> Result<()>;
 
     /// Sends a `STOP_SENDING(err)` frame,
     /// that tells to peer that we want to abort the stream direction
@@ -378,4 +374,61 @@ pub trait QuicBackend: Sized {
         connection_id: &Self::StableConnectionId,
         stream_id: StreamId,
     ) -> Result<()>;
+
+
+    /// Writes batch of datagrams into `&mut out`.
+    /// The total number of bytes **should not** exceed `threshold`.
+    ///
+    /// # Returns
+    ///
+    /// - Total amount of bytes written.
+    /// - [Error::Closed] if backend is closed.
+    /// - [Error::UnknownConnection] if there is no connection with provided `connection_id`.
+    /// - [Error::DgramDisabled] datagram support is disabled.
+    /// - [Error::Other] on other, unexpected error.
+    /// - [Error::Fatal] if backend is no longer functional due to internal error.
+    fn dgram_recv(
+        &mut self,
+        connection_id: &Self::StableConnectionId,
+        out: &mut Vec<Bytes>,
+        threshold: usize,
+    ) -> Result<usize>;
+
+    /// Sends a batch of datagrams.
+    ///
+    /// All datagrams that exceed `min(pmtu, peer_max_dgram_len)` are going to be dropped.
+    ///
+    /// If [`dgram_set_drop_unsent()`](Self::dgram_set_drop_unsent) was set before, then backend must drop datagrams that cannot fit internal buffer.
+    /// Otherwise partial write must happen.
+    ///
+    /// If partial write happened, application needs to invoke this method again.
+    /// All sent values are removed from the `&mut batch` vector.
+    ///
+    /// # Returns
+    ///
+    /// - [Error::Closed] if backend is closed.
+    /// - [Error::UnknownConnection] if there is no connection with provided `connection_id`.
+    /// - [Error::DgramDisabled] datagram support is disabled.
+    /// - [Error::DgramDisabledPeer] peer disabled sending datagrams.
+    /// - [Error::Other] on other, unexpected error.
+    /// - [Error::Fatal] if backend is no longer functional due to internal error.
+    fn dgram_send(
+        &mut self,
+        connection_id: &Self::StableConnectionId,
+        batch: &mut Vec<Bytes>,
+    ) -> Result<()>;
+
+    /// Makes [`dgram_send()`](QuicBackend::dgram_send) drop unsent packets,
+    /// instead of leaving them for retried `dgram_send()` call.
+    ///
+    /// By default, all unsent packets are not dropped, and may be retried later.
+    ///
+    /// # Returns
+    ///
+    /// - [Error::Closed] if backend is closed.
+    /// - [Error::UnknownConnection] if there is no connection with provided `connection_id`.
+    /// - [Error::DgramDisabled] datagram support is disabled.
+    /// - [Error::Other] on other, unexpected error.
+    /// - [Error::Fatal] if backend is no longer functional due to internal error.
+    fn dgram_set_drop_unsent(&mut self, connection_id: &Self::StableConnectionId) -> Result<()>;
 }

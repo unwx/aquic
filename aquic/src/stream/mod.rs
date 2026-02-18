@@ -108,7 +108,7 @@ impl<S: Spec> Display for Error<S> {
             Self::Decoder(e) => write!(f, "decoder error ({e})"),
             Self::Encoder(e) => write!(f, "encoder error ({e})"),
             Self::Connection => write!(f, "connection is closed"),
-            Self::HangUp(e) => write!(f, "hang up ({e})"),
+            Self::HangUp(e) => write!(f, "hang-up ({e})"),
         }
     }
 }

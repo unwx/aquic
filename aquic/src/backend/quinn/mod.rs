@@ -1,21 +1,22 @@
+use crate::backend::Result;
 use crate::backend::cid::ConnectionIdGenerator;
 use crate::backend::quinn::connection::{Connection, Connections};
 use crate::backend::quinn::io::{IO, VecBuf};
 use crate::backend::quinn::shared::{SyncConnectionIdGenerator, u64_into_varint};
 use crate::backend::quinn::time::{Time, TimeoutEvent};
-use crate::backend::{ConnectionEvent, Error, QuicBackend, StreamEvent};
-use crate::backend::{OutEvents, Result};
+use crate::backend::{BackendEvents, ConnectionEvent, DatagramEvent, StreamEvent};
+use crate::backend::{Error, QuicBackend};
 use crate::core::ConstBuf;
 use crate::net::{Buf, MAX_PACKET_SIZE, RecvMsg, SendMsg, ServerName, SoFeat};
 use crate::stream::{Chunk, Priority, StreamId};
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
-    ClientConfig, ConnectError, ConnectionError, DatagramEvent, Dir, Endpoint, Event, FinishError,
-    IdleTimeout, ReadError, ReadableError, ServerConfig, Transmit, TransportConfig, WriteError,
+    ClientConfig, ConnectError, ConnectionError, Dir, Endpoint, Event, FinishError, IdleTimeout,
+    ReadError, ReadableError, SendDatagramError, ServerConfig, Transmit, TransportConfig,
+    WriteError,
 };
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use rustls::pki_types::CertificateDer;
-use smallvec::SmallVec;
 use std::any::type_name;
 use std::collections::HashSet;
 use std::future::{self};
@@ -35,7 +36,7 @@ mod time;
 pub use config::*;
 
 
-type QuinnConnectionId = quinn_proto::ConnectionHandle;
+pub type QuinnConnectionId = quinn_proto::ConnectionHandle;
 type QuinnConnection = quinn_proto::Connection;
 type QuinnConnectionEvent = quinn_proto::ConnectionEvent;
 type QuinnStreamEvent = quinn_proto::StreamEvent;
@@ -57,6 +58,9 @@ pub struct QuinnBackend<CIdGen> {
     /// All time/clock-related fields.
     time: Time,
 
+    /// Events produced by this backend.
+    events: BackendEvents<QuinnConnectionId>,
+
     /// Socket's bind address.
     socket_addr: SocketAddr,
 
@@ -72,7 +76,6 @@ where
     CIdGen: ConnectionIdGenerator + 'static,
 {
     type Config = Config;
-    type WakeEvent = TimeoutEvent;
     type StableConnectionId = QuinnConnectionId;
     type ConnectionIdGenerator = CIdGen;
     type OutBuf = VecBuf;
@@ -80,7 +83,7 @@ where
     fn new(
         mut config: Self::Config,
         connection_id_generator: Self::ConnectionIdGenerator,
-        socket_addr: SocketAddr,
+  cargo +nightly fmt      socket_addr: SocketAddr,
         socket_features: &HashSet<SoFeat>,
     ) -> Self {
         config.validate();
@@ -93,6 +96,7 @@ where
         }
 
         let connections = Connections::new();
+        let events = BackendEvents::new();
         let io = IO::new(&config, socket_features.contains(&SoFeat::Mmsg));
         let time = Time::new(&config);
         let quinn = Quinn::new(config, socket_features);
@@ -102,6 +106,7 @@ where
             connections,
             io,
             time,
+            events,
             socket_addr,
             open: true,
             _phantom: PhantomData,
@@ -112,12 +117,16 @@ where
         self.time.clock = now;
     }
 
+    fn events(&mut self) -> &mut BackendEvents<Self::StableConnectionId> {
+        &mut self.events
+    }
 
-    fn prepare_to_shutdown(&self, _deadline: Instant) {
+
+    fn prepare_to_shutdown(&mut self, _deadline: Instant) {
         // We don't have anything to do.
     }
 
-    fn ready_to_shutdown(&self) -> bool {
+    fn ready_to_shutdown(&mut self) -> bool {
         self.connections.all.is_empty()
     }
 
@@ -176,6 +185,9 @@ where
         err: u64,
         reason: Bytes,
     ) -> Result<()> {
+        if !self.open {
+            return Err(Error::Closed);
+        }
         let Some(connection) = self.connections.all.get_mut(connection_id) else {
             return Err(Error::UnknownConnection);
         };
@@ -187,11 +199,7 @@ where
     }
 
 
-    fn send_prepare(
-        &mut self,
-        messages: &mut Vec<SendMsg<Self::OutBuf>>,
-        _: &mut OutEvents<Self::StableConnectionId>,
-    ) -> Result<()> {
+    fn send_prepare(&mut self, messages: &mut Vec<SendMsg<Self::OutBuf>>) -> Result<()> {
         messages.append(&mut self.io.pending);
 
         if !self.io.has_primary_buffer() {
@@ -221,6 +229,7 @@ where
             }
 
             Self::schedule_connection_timeout(connection_id, connection, &mut self.time);
+            Self::check_max_dgram_size_update(connection_id, connection, &mut self.events, false);
         }
 
         Ok(())
@@ -235,11 +244,9 @@ where
     }
 
     #[allow(clippy::explicit_counter_loop)]
-    fn recv(
-        &mut self,
-        messages: &mut [RecvMsg<ConstBuf<MAX_PACKET_SIZE>>],
-        out_events: &mut OutEvents<Self::StableConnectionId>,
-    ) -> Result<usize> {
+    fn recv(&mut self, messages: &mut [RecvMsg<ConstBuf<MAX_PACKET_SIZE>>]) -> Result<usize> {
+        use quinn_proto::DatagramEvent;
+
         if !self.io.has_any_buffer() {
             return Ok(0);
         }
@@ -272,7 +279,7 @@ where
                         &mut self.connections,
                         &mut self.quinn,
                         &mut self.time,
-                        out_events,
+                        &mut self.events,
                     );
                 }
 
@@ -333,7 +340,7 @@ where
                             );
 
                             let outgoing_event = ConnectionEvent::Created(connection_id);
-                            out_events.push_connection_event(outgoing_event);
+                            self.events.push_connection(outgoing_event);
                         }
                         Err(e) => {
                             if let Some(transmit) = e.response {
@@ -390,7 +397,7 @@ where
     fn on_alarm(&mut self) -> Result<()> {
         if !self.open {
             self.time.timeout_events.clear();
-            return Ok(());
+            return Err(Error::Closed);
         }
 
         while let Some(event) = self.time.timeout_events.pop() {
@@ -408,6 +415,27 @@ where
     }
 
 
+    fn local_address_changed(&mut self, _address: SocketAddr) -> Result<()> {
+        if !self.open {
+            return Err(Error::Closed);
+        }
+
+        for (connection_id, connection) in &mut self.connections.all {
+            connection.local_address_changed();
+            connection.path_changed(self.time.clock);
+
+            let max_dgram_size = Self::max_dgram_size(connection);
+            if connection.last_max_dgram_size != max_dgram_size {
+                connection.last_max_dgram_size = max_dgram_size;
+
+                let outgoing_event = DatagramEvent::OutMaxLen(*connection_id, max_dgram_size);
+                self.events.push_datagram(outgoing_event);
+            }
+        }
+
+        Ok(())
+    }
+
     fn peer_cert_chain(
         &mut self,
         connection_id: &Self::StableConnectionId,
@@ -415,7 +443,7 @@ where
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        let Some(connection) = self.connections.all.get(connection_id) else {
             return Err(Error::UnknownConnection);
         };
         let Some(identity) = connection.crypto_session().peer_identity() else {
@@ -536,7 +564,7 @@ where
         stream_id: StreamId,
         batch: &mut Vec<Bytes>,
         fin: bool,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if !self.open {
             return Err(Error::Closed);
         }
@@ -582,8 +610,7 @@ where
             }
         }
 
-        let partial_write = !batch.is_empty();
-        Ok(partial_write)
+        Ok(())
     }
 
     fn stream_stop_sending(
@@ -675,6 +702,93 @@ where
         connection.unordered_streams.insert(stream_id);
         Ok(())
     }
+
+
+    fn dgram_recv(
+        &mut self,
+        connection_id: &Self::StableConnectionId,
+        out: &mut Vec<Bytes>,
+        threshold: usize,
+    ) -> Result<usize> {
+        if !self.open {
+            return Err(Error::Closed);
+        }
+        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+            return Err(Error::UnknownConnection);
+        };
+
+        let mut datagrams = connection.datagrams();
+        let mut received = 0;
+
+        while received < threshold {
+            let Some(bytes) = datagrams.recv() else {
+                break;
+            };
+
+            received += bytes.len();
+            out.push(bytes);
+        }
+
+        Ok(received)
+    }
+
+    fn dgram_send(
+        &mut self,
+        connection_id: &Self::StableConnectionId,
+        batch: &mut Vec<Bytes>,
+    ) -> Result<()> {
+        if !self.open {
+            return Err(Error::Closed);
+        }
+        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+            return Err(Error::UnknownConnection);
+        };
+
+        let drop_unsent = connection.drop_unsent_datagrams;
+        let mut too_large_dgrams = false;
+
+        while let Some(bytes) = batch.pop() {
+            if let Err(e) = connection.datagrams().send(bytes, drop_unsent) {
+                match e {
+                    SendDatagramError::UnsupportedByPeer => {
+                        return Err(Error::DgramDirectionDisabled);
+                    }
+                    SendDatagramError::Disabled => {
+                        return Err(Error::DgramDisabled);
+                    }
+                    SendDatagramError::TooLarge => {
+                        too_large_dgrams = true;
+                        continue;
+                    }
+                    SendDatagramError::Blocked(bytes) => {
+                        batch.push(bytes);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if drop_unsent {
+            batch.clear();
+        }
+        if too_large_dgrams {
+            Self::check_max_dgram_size_update(*connection_id, connection, &mut self.events, true);
+        }
+
+        Ok(())
+    }
+
+    fn dgram_set_drop_unsent(&mut self, connection_id: &Self::StableConnectionId) -> Result<()> {
+        if !self.open {
+            return Err(Error::Closed);
+        }
+        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+            return Err(Error::UnknownConnection);
+        };
+
+        connection.drop_unsent_datagrams = true;
+        Ok(())
+    }
 }
 
 impl<CidGen> QuinnBackend<CidGen> {
@@ -684,10 +798,17 @@ impl<CidGen> QuinnBackend<CidGen> {
         connections: &mut Connections,
         time: &mut Time,
     ) {
-        let mut internal_connection = Connection {
-            inner: connection,
-            unordered_streams: FxHashSet::with_hasher(FxBuildHasher),
-            timeout_key: None,
+        let mut internal_connection = {
+            let mtu = connection.current_mtu();
+
+            Connection {
+                inner: connection,
+                timeout_key: None,
+                unordered_streams: FxHashSet::with_hasher(FxBuildHasher),
+                drop_unsent_datagrams: false,
+                last_pmtu: mtu,
+                last_max_dgram_size: 0,
+            }
         };
 
         Self::schedule_connection_timeout(connection_id, &mut internal_connection, time);
@@ -724,7 +845,7 @@ impl<CidGen> QuinnBackend<CidGen> {
         connections: &mut Connections,
         quinn: &mut Quinn,
         time: &mut Time,
-        out_events: &mut OutEvents<QuinnConnectionId>,
+        out_events: &mut BackendEvents<QuinnConnectionId>,
     ) {
         let Some(connection) = connections.all.get_mut(&connection_id) else {
             return;
@@ -750,11 +871,11 @@ impl<CidGen> QuinnBackend<CidGen> {
             match event {
                 Event::Connected => {
                     let outgoing_event = ConnectionEvent::Active(connection_id);
-                    out_events.push_connection_event(outgoing_event);
+                    out_events.push_connection(outgoing_event);
                 }
                 Event::HandshakeDataReady => {
                     let outgoing_event = ConnectionEvent::HandshakeDataReady(connection_id);
-                    out_events.push_connection_event(outgoing_event);
+                    out_events.push_connection(outgoing_event);
                 }
                 Event::ConnectionLost { reason } => {
                     let outgoing_event = match reason {
@@ -799,7 +920,7 @@ impl<CidGen> QuinnBackend<CidGen> {
                     };
 
                     if let Some(event) = outgoing_event {
-                        out_events.push_connection_event(event);
+                        out_events.push_connection(event);
                     }
                     if connection.is_drained() {
                         connections.modified.swap_remove(&connection_id);
@@ -812,15 +933,19 @@ impl<CidGen> QuinnBackend<CidGen> {
                     Self::handle_stream_event(connection_id, stream_event, connection, out_events);
                 }
 
-                // TODO(feat): QUIC connection datagrams.
-                Event::DatagramReceived => todo!(),
-                Event::DatagramsUnblocked => todo!(),
+                Event::DatagramReceived => {
+                    out_events.push_datagram(DatagramEvent::InActive(connection_id));
+                }
+                Event::DatagramsUnblocked => {
+                    out_events.push_datagram(DatagramEvent::OutActive(connection_id));
+                }
             }
         }
 
         if !connection.is_drained() {
             connections.modified.insert(connection_id);
             Self::schedule_connection_timeout(connection_id, connection, time);
+            Self::check_max_dgram_size_update(connection_id, connection, out_events, false);
         }
     }
 
@@ -828,7 +953,7 @@ impl<CidGen> QuinnBackend<CidGen> {
         connection_id: QuinnConnectionId,
         stream_event: QuinnStreamEvent,
         connection: &mut Connection,
-        out_events: &mut OutEvents<QuinnConnectionId>,
+        out_events: &mut BackendEvents<QuinnConnectionId>,
     ) {
         let outgoing_event = match stream_event {
             QuinnStreamEvent::Opened { dir } => {
@@ -858,7 +983,7 @@ impl<CidGen> QuinnBackend<CidGen> {
             }
         };
 
-        out_events.push_stream_event(outgoing_event);
+        out_events.push_stream(outgoing_event);
     }
 
 
@@ -901,6 +1026,34 @@ impl<CidGen> QuinnBackend<CidGen> {
         );
 
         connection.timeout_key = Some(key);
+    }
+
+    fn check_max_dgram_size_update(
+        connection_id: QuinnConnectionId,
+        connection: &mut Connection,
+        out_events: &mut BackendEvents<QuinnConnectionId>,
+        force: bool,
+    ) {
+        let current_mtu = connection.current_mtu();
+        if current_mtu == connection.last_pmtu && !force {
+            return;
+        }
+
+        connection.last_pmtu = current_mtu;
+        let max_dgram_size = Self::max_dgram_size(connection);
+
+        if max_dgram_size == connection.last_max_dgram_size && !force {
+            return;
+        }
+
+        let event = DatagramEvent::OutMaxLen(connection_id, max_dgram_size);
+        connection.last_max_dgram_size = max_dgram_size;
+        out_events.push_datagram(event);
+    }
+
+    fn max_dgram_size(connection: &mut Connection) -> u16 {
+        let as_usize = connection.datagrams().max_size().unwrap_or(0);
+        u16::try_from(as_usize).unwrap_or(u16::MAX)
     }
 }
 

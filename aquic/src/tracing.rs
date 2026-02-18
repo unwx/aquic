@@ -101,16 +101,63 @@ impl From<ConnectionSpan> for Span {
 }
 
 
+/// A [Span] for a QUIC datagram flow.
+#[derive(Clone)]
+pub(crate) struct DgramSpan(Span);
+
+impl DgramSpan {
+    const CLOSE_KIND: &'static str = "close_kind";
+
+    /// Creates a new [Span] for a QUIC datagram direction.
+    ///
+    /// It belongs to a connection, which span provided as argument.
+    #[inline]
+    pub fn new<CId: Value>(parent: &ConnectionSpan, id: CId, direction: Direction) -> Self {
+        DgramSpan(debug_span!(
+            parent: &parent.0,
+            "quic_dgram",
+            connection_id = id,
+            direction = %direction,
+            close_kind = field::Empty,
+        ))
+    }
+
+    #[inline]
+    pub fn on_connection_close(&self) {
+        self.0.record(Self::CLOSE_KIND, "connection_close");
+    }
+
+    #[inline]
+    pub fn on_internal(&self) {
+        self.0.record(Self::CLOSE_KIND, "internal");
+    }
+
+    #[inline]
+    pub fn on_normal_end(&self) {
+        self.0.record(Self::CLOSE_KIND, "end");
+    }
+}
+
+impl From<Span> for DgramSpan {
+    fn from(span: Span) -> Self {
+        DgramSpan(span)
+    }
+}
+
+impl From<DgramSpan> for Span {
+    fn from(span: DgramSpan) -> Self {
+        span.0
+    }
+}
+
+
 /// A [Span] for a QUIC stream.
 #[derive(Clone)]
 pub(crate) struct StreamSpan(Span);
 
 impl StreamSpan {
-    const STREAM_ID: &'static str = "stream_id";
-    const DIRECTION: &'static str = "direction";
-    const INITIATOR: &'static str = "initiator";
     const CLOSE_CODE: &'static str = "close_code";
-    const CLOSE_REASON: &'static str = "close_reason";
+    const CLOSE_KIND: &'static str = "close_kind";
 
     /// Creates a new [Span] for a QUIC stream.
     ///
@@ -119,7 +166,7 @@ impl StreamSpan {
     pub fn new(
         parent: &ConnectionSpan,
         id: StreamId,
-        direction: StreamDirection,
+        direction: Direction,
         initiator: Initiator,
     ) -> Self {
         StreamSpan(debug_span!(
@@ -127,37 +174,37 @@ impl StreamSpan {
             "quic_stream",
             stream_id = id,
             direction = %direction,
-            initiator= %initiator,
+            initiator = %initiator,
             close_code = field::Empty,
-            close_reason = field::Empty,
+            close_kind = field::Empty,
         ))
     }
 
     #[inline]
     pub fn on_reset_stream(&self, code: u64) {
         self.0.record(Self::CLOSE_CODE, code);
-        self.0.record(Self::CLOSE_REASON, "reset_stream");
+        self.0.record(Self::CLOSE_KIND, "reset_stream");
     }
 
     #[inline]
     pub fn on_stop_sending(&self, code: u64) {
         self.0.record(Self::CLOSE_CODE, code);
-        self.0.record(Self::CLOSE_REASON, "stop_sending");
+        self.0.record(Self::CLOSE_KIND, "stop_sending");
     }
 
     #[inline]
     pub fn on_connection_close(&self) {
-        self.0.record(Self::CLOSE_REASON, "connection_close");
+        self.0.record(Self::CLOSE_KIND, "connection_close");
     }
 
     #[inline]
     pub fn on_internal(&self) {
-        self.0.record(Self::CLOSE_REASON, "internal");
+        self.0.record(Self::CLOSE_KIND, "internal");
     }
 
     #[inline]
     pub fn on_fin(&self) {
-        self.0.record(Self::CLOSE_REASON, "fin");
+        self.0.record(Self::CLOSE_KIND, "fin");
     }
 }
 
@@ -175,12 +222,12 @@ impl From<StreamSpan> for Span {
 
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum StreamDirection {
+pub(crate) enum Direction {
     In,
     Out,
 }
 
-impl Display for StreamDirection {
+impl Display for Direction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::In => write!(f, "in"),

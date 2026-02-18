@@ -1,18 +1,17 @@
-use crate::sync::mpsc::unbounded::{UnboundedReceiver, UnboundedSender, st};
+use crate::sync::mpsc::unbounded::{self, UnboundedReceiver, UnboundedSender};
 use crate::sync::mpsc::weighted::{WeightedReceiver, WeightedSender, has_capacity};
-use crate::sync::mpsc::{SendError, TryRecvError};
+use crate::sync::{SendError, TryRecvError, TrySendError};
 use event_listener::Event;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 #[rustfmt::skip]
 pub(crate) fn channel<T: Unpin + 'static>(bound: usize) -> (Sender<T>, Receiver<T>) {
-    let (sender, receiver) = st::channel();
+    let (sender, receiver) = unbounded::channel();
     let shared = Rc::new(RefCell::new(Shared {
         event: Event::new(),
         occupation: 0,
         bound: bound.max(1),
-        open: true,
     }));
 
     (
@@ -23,36 +22,58 @@ pub(crate) fn channel<T: Unpin + 'static>(bound: usize) -> (Sender<T>, Receiver<
 
 
 pub(crate) struct Sender<T> {
-    sender: st::Sender<(T, usize)>,
+    sender: unbounded::Sender<(T, usize)>,
     shared: Rc<RefCell<Shared>>,
 }
 
 impl<T: Unpin + 'static> WeightedSender<T> for Sender<T> {
-    async fn send(&self, value: T, weight: usize) -> Result<(), SendError> {
+    async fn send(&self, value: T, weight: usize) -> Result<(), SendError<T>> {
         loop {
-            let listener = {
-                let mut shared = self.shared.borrow_mut();
+            let mut shared = self.shared.borrow_mut();
 
-                if !shared.open {
-                    return Err(SendError);
-                }
-                if has_capacity(shared.occupation, weight, shared.bound) {
-                    shared.occupation += weight;
-                    break;
-                }
+            if self.sender.is_closed() {
+                return Err(SendError(value));
+            }
+            if has_capacity(shared.occupation, weight, shared.bound) {
+                shared.occupation += weight;
+                break;
+            }
 
-                shared.event.listen()
-            };
+            let listener = shared.event.listen();
+            drop(shared);
 
-            listener.await; // Cancel safe: we haven't modified anything yet.
+            // Cancel safe: we haven't modified anything yet.
+            listener.await;
         }
 
-        if self.sender.send((value, weight)).is_err() {
+        if let Err(e) = self.sender.send((value, weight)) {
             let mut shared = self.shared.borrow_mut();
-            shared.open = false;
+
+            // No receiver exists, we can safely store just `0`.
             shared.occupation = 0;
             shared.event.notify(usize::MAX);
-            return Err(SendError);
+            return Err(SendError(e.0.0));
+        }
+
+        Ok(())
+    }
+
+    fn try_send(&self, value: T, weight: usize) -> Result<(), TrySendError> {
+        let mut shared = self.shared.borrow_mut();
+
+        if self.sender.is_closed() {
+            return Err(TrySendError::Closed);
+        }
+        if !has_capacity(shared.occupation, weight, shared.bound) {
+            return Err(TrySendError::Full);
+        }
+
+        shared.occupation += weight;
+        if self.sender.send((value, weight)).is_err() {
+            // No receiver exists, we can safely store just `0`.
+            shared.occupation = 0;
+            shared.event.notify(usize::MAX);
+            return Err(TrySendError::Closed);
         }
 
         Ok(())
@@ -63,7 +84,7 @@ impl<T: Unpin + 'static> WeightedSender<T> for Sender<T> {
     }
 
     fn is_closed(&self) -> bool {
-        !self.shared.borrow().open
+        self.sender.is_closed()
     }
 }
 
@@ -78,7 +99,7 @@ impl<T> Clone for Sender<T> {
 
 
 pub(crate) struct Receiver<T> {
-    receiver: st::Receiver<(T, usize)>,
+    receiver: unbounded::Receiver<(T, usize)>,
     shared: Rc<RefCell<Shared>>,
 }
 
@@ -113,12 +134,15 @@ impl<T: Unpin + 'static> WeightedReceiver<T> for Receiver<T> {
     fn occupation(&self) -> usize {
         self.shared.borrow().occupation
     }
+
+    fn is_closed(&self) -> bool {
+        self.receiver.is_closed()
+    }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let mut shared = self.shared.borrow_mut();
-        shared.open = false;
         shared.occupation = 0;
         shared.event.notify(usize::MAX);
     }
@@ -130,5 +154,4 @@ struct Shared {
     pub event: Event,
     pub occupation: usize,
     pub bound: usize,
-    pub open: bool,
 }

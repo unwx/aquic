@@ -39,6 +39,15 @@ pub(super) struct Connection {
     /// Streams that may receive byte-chunks immediately,
     /// not in sequential order.
     pub unordered_streams: FxHashSet<StreamId>,
+
+    /// Drop datagrams when internal **send** buffer is full.
+    pub drop_unsent_datagrams: bool,
+
+    /// Last known path MTU for this connection.
+    pub last_pmtu: u16,
+
+    /// Last known outgoing datagram size.
+    pub last_max_dgram_size: u16,
 }
 
 impl Deref for Connection {

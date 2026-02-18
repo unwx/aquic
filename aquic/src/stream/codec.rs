@@ -7,7 +7,17 @@ use std::future::Future;
 /// A QUIC connection consists of multiple streams where data flows.
 ///
 /// [`Decoder`] is a stateful object responsible for a single incoming QUIC stream.
-/// Its primary goal is to decode the raw byte stream into meaningful entities of type [`Self::Item`].
+/// Its primary goal is to decode the protocol-formatted raw byte stream into meaningful entities of type [`Self::Item`].
+/// It may also uncompress the traffic, etc.
+///
+/// **Note**: it doesn't meant to replace deserializers.
+/// By design, they should work together: `raw-stream-of-bytes -> decoder -> application-deserializer`,
+/// where `application-deserializer` may be anything:
+/// - JSON deserializer ([Self::Item] would probably be complete chunk of JSON in [Bytes]).
+/// - Documents deserializer ([Self::Item] would probably be a handle to output-stream: decoder writes to /tmp file, while deserializer reads from it).
+/// - Just file saver ([Self::item] would probably be a handle to a filename, etc).
+///
+/// Though, of course, it is up to application how to use it.
 ///
 /// # Non-blocking implementation
 ///
@@ -48,8 +58,6 @@ pub trait Decoder {
     /// If `fin` is `true`, this indicates the successful end of the stream; no further data will arrive.
     /// It is expected, that method returns all pending items on `FIN`.
     ///
-    /// **Note**: it is expected that `&mut in_batch` will become empty after this call.
-    ///
     /// # Cancel Safety
     ///
     /// This method is **not required** to be cancel-safe.
@@ -66,7 +74,17 @@ pub trait Decoder {
 }
 
 /// [`Encoder`] is a stateful object responsible for a single outgoing QUIC stream.
-/// Its primary goal is to encode meaningful entities of type [`Self::Item`] into a raw byte stream.
+/// Its primary goal is to encode meaningful entities of type [`Self::Item`] into a protocol-formatted raw byte stream.
+/// It may also compress the traffic, etc.
+///
+/// **Note**: it doesn't meant to replace serializers.
+/// By design, they should work together: `application-serializer -> encoder -> raw-stream-of-bytes`,
+/// where `application-deserializer` may be anything:
+/// - JSON serializer ([Self::Item] would probably be complete chunk of JSON in [Bytes], encoder makes sure to send this chunk properly, ensuring protocol formatting).
+/// - Documents serializer ([Self::Item] would probably be a handle to input-stream: serializer writes to /tmp file, while encoder reads from it).
+/// - Just file loader ([Self::item] would probably be a handle to a filename, etc).
+///
+/// Though, of course, it is up to application how to use it.
 ///
 /// # Non-blocking implementation
 ///

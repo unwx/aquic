@@ -1,6 +1,6 @@
-use crate::sync::mpsc;
+use crate::sync::mpsc::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
+use crate::sync::mpsc::unbounded;
 use crate::sync::mpsc::unbounded::UnboundedSender;
-use crate::sync::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -30,7 +30,7 @@ where
     T: Send + Unpin + 'static,
     R: Send + Unpin + 'static,
 {
-    sender: mpsc::unbounded::Sender<Call<T, R>>,
+    sender: unbounded::Sender<Call<T, R>>,
 
     // According to `shared_slab` doc, each returned key on `insert` has a generation included,
     // therefore we don't need to track generations ourselves.
@@ -42,7 +42,7 @@ where
     T: Send + Unpin + 'static,
     R: Send + Unpin + 'static,
 {
-    fn new(sender: mpsc::unbounded::Sender<Call<T, R>>) -> Self {
+    fn new(sender: unbounded::Sender<Call<T, R>>) -> Self {
         Self {
             sender,
             storage: Arc::new(sharded_slab::Slab::new_with_config::<SlabConfig>()),
@@ -118,7 +118,6 @@ pub(crate) struct Callback<R> {
 }
 
 impl<R> RemoteCallback<R> for Callback<R> {
-    //noinspection DuplicatedCode
     fn on_result(self, result: R) {
         let Some(entry) = self.storage.get(self.key) else {
             return;
@@ -152,7 +151,6 @@ impl<R> RemoteCallback<R> for Callback<R> {
 }
 
 impl<R> Drop for Callback<R> {
-    //noinspection DuplicatedCode
     fn drop(&mut self) {
         let Some(entry) = self.storage.get(self.key) else {
             return;
@@ -214,11 +212,8 @@ impl<R> Future for ResponseFuture<R> {
 
 impl<R> Drop for ResponseFuture<R> {
     fn drop(&mut self) {
-        let Some(entry) = self.storage.get(self.key) else {
-            return;
-        };
-
-        self.storage.remove(self.key);
-        drop(entry);
+        if self.storage.contains(self.key) {
+            self.storage.remove(self.key);
+        }
     }
 }

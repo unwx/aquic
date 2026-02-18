@@ -3,7 +3,7 @@ use crate::exec::SendOnMt;
 use crate::sync::mpsc;
 use std::fmt::{Debug, Display, Formatter};
 
-/// Failure on RPC call.
+/// RPC call failure.
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum SendError {
     /// Channel is closed, unable to make a request.
@@ -34,21 +34,20 @@ where
     R: SendOnMt + Unpin + 'static,
     C: SendOnMt + Unpin + 'static,
 {
-    /// Create a new client with a specified `sender`.
+    /// Creates new client with the specified `sender`.
     fn new(sender: mpsc::unbounded::Sender<RemoteCall<T, C>>) -> Self;
 
-    /// Make a call with provided `args` and wait for the result.
+    /// Makes a call with provided `args` and waits for the result.
     ///
     /// # Cancel safety.
     ///
-    /// This method is cancel safe, but, obviously, the result is going to be lost.
+    /// Depends on the destination API: side effects possible.
     fn send(&self, args: T) -> impl Future<Output = Result<R, SendError>> + SendOnMt;
 
-    /// Make a call with provided `args`, but ignore the response.
+    /// Makes a call with provided `args` but ignores the response.
     fn send_and_forget(&self, args: T) -> Result<(), SendError>;
 }
 
-/// Callback to a specific RPC call.
 pub(crate) trait RemoteCallback<R> {
     fn on_result(self, result: R);
 }
@@ -62,11 +61,8 @@ pub(crate) struct RemoteCall<T, C> {
 conditional! {
     multithread,
 
-    pub(crate) mod mt;
+    mod mt;
 
-    /// [RemoteCall], its concrete implementation depends on the current async environment.
-    ///
-    /// On current async env it's **thread safe**.
     pub(crate) type Remote<T, R> = mt::Remote<T, R>;
 
     pub(crate) type Callback<R> = mt::Callback<R>;
@@ -77,11 +73,8 @@ conditional! {
 conditional! {
     not(multithread),
 
-    pub(crate) mod st;
+    mod st;
 
-    /// [RemoteCall], its concrete implementation depends on the current async environment.
-    ///
-    /// On current async env it's **not thread safe**.
     pub(crate) type Remote<T, R> = st::Remote<T, R>;
 
     pub(crate) type Callback<R> = st::Callback<R>;
