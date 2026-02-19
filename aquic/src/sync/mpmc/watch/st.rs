@@ -1,10 +1,9 @@
-use event_listener::Event;
-
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::usize;
 
 use crate::sync::mpmc::watch::{WatchReceiver, WatchSender};
+use crate::sync::util::event::Event;
 use crate::sync::{SendError, TryRecvError};
 
 const INITIAL_SENDER_VERSION: usize = 0;
@@ -54,7 +53,7 @@ impl<T> WatchSender<T> for Sender<T> {
             value,
             version: next_version,
         });
-        shared.event.notify(usize::MAX);
+        shared.event.notify_all();
         Ok(())
     }
 
@@ -79,7 +78,7 @@ impl<T> Drop for Sender<T> {
         shared.sender_count -= 1;
 
         if shared.sender_count == 0 {
-            shared.event.notify(usize::MAX);
+            shared.event.notify_all();
         }
     }
 }
@@ -159,7 +158,7 @@ impl<T> Drop for Receiver<T> {
 #[derive(Debug)]
 struct Shared<T> {
     pub item: Option<Item<T>>,
-    pub event: Event, // TODO(perf): replace with a not thread-safe intrusive list?
+    pub event: Event,
     pub sender_count: usize,
     pub receiver_count: usize,
 }

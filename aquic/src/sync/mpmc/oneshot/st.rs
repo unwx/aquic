@@ -1,10 +1,10 @@
-use event_listener::Event;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::usize;
 
 use crate::sync::TryRecvError;
 use crate::sync::mpmc::oneshot::{OneshotReceiver, OneshotSender, SendError};
+use crate::sync::util::event::Event;
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Rc::new(RefCell::new(Shared {
@@ -39,7 +39,7 @@ impl<T: Clone> OneshotSender<T> for Sender<T> {
         }
 
         shared.container = Some(value);
-        shared.event.notify(usize::MAX);
+        shared.event.notify_all();
         Ok(())
     }
 
@@ -64,7 +64,7 @@ impl<T> Drop for Sender<T> {
         shared.sender_count -= 1;
 
         if shared.sender_count == 0 {
-            shared.event.notify(usize::MAX);
+            shared.event.notify_all();
         }
     }
 }

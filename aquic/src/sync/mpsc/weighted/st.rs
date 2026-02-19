@@ -1,7 +1,7 @@
 use crate::sync::mpsc::unbounded::{self, UnboundedReceiver, UnboundedSender};
 use crate::sync::mpsc::weighted::{WeightedReceiver, WeightedSender, has_capacity};
+use crate::sync::util::event::Event;
 use crate::sync::{SendError, TryRecvError, TrySendError};
-use event_listener::Event;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -51,7 +51,7 @@ impl<T: Unpin + 'static> WeightedSender<T> for Sender<T> {
 
             // No receiver exists, we can safely store just `0`.
             shared.occupation = 0;
-            shared.event.notify(usize::MAX);
+            shared.event.notify_all();
             return Err(SendError(e.0.0));
         }
 
@@ -72,7 +72,7 @@ impl<T: Unpin + 'static> WeightedSender<T> for Sender<T> {
         if self.sender.send((value, weight)).is_err() {
             // No receiver exists, we can safely store just `0`.
             shared.occupation = 0;
-            shared.event.notify(usize::MAX);
+            shared.event.notify_all();
             return Err(TrySendError::Closed);
         }
 
@@ -112,7 +112,7 @@ impl<T: Unpin + 'static> WeightedReceiver<T> for Receiver<T> {
         shared.occupation -= weight;
 
         if has_capacity(shared.occupation, weight, shared.bound) {
-            shared.event.notify(usize::MAX);
+            shared.event.notify_all();
         }
 
         Some(value)
@@ -125,7 +125,7 @@ impl<T: Unpin + 'static> WeightedReceiver<T> for Receiver<T> {
         shared.occupation -= weight;
 
         if has_capacity(shared.occupation, weight, shared.bound) {
-            shared.event.notify(usize::MAX);
+            shared.event.notify_all();
         }
 
         Ok(value)
@@ -144,13 +144,12 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let mut shared = self.shared.borrow_mut();
         shared.occupation = 0;
-        shared.event.notify(usize::MAX);
+        shared.event.notify_all();
     }
 }
 
 
 struct Shared {
-    // TODO(perf): replace with a not thread-safe intrusive list?
     pub event: Event,
     pub occupation: usize,
     pub bound: usize,

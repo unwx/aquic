@@ -7,8 +7,8 @@ edition = "2024"
 [features]
 quiche = ["dep:quiche"]
 quinn = ["dep:quinn-proto", "dep:rustls"]
-tokio = ["dep:tokio", "dep:crossfire", "dep:sharded-slab"]
-monoio = ["dep:monoio"]
+tokio = ["dep:tokio", "dep:event-listener", "dep:crossfire", "dep:sharded-slab"]
+monoio = ["dep:monoio", "dep:intrusive-collections"]
 server-util = ["dep:bitvec", "dep:aes", "dep:zeroize"]
 default = []
 
@@ -26,9 +26,12 @@ quiche = { version = "0.24", optional = true }
 quinn-proto = { version = "0.11", optional = true }
 
 # for `Send` async runtimes
-event-listener = { version = "5.4" } # TODO(refactor): should be optional, for `Send` runtimes only.
+event-listener = { version = "5.4", optional = true }
 crossfire = { version = "3.0", optional = true }
 sharded-slab = { version = "0.1", optional = true }
+
+# for `!Send` async runtimes
+intrusive-collections = { version = "0.10.0", optional = true }
 
 # for `quinn` feature
 rustls = { version = "0.23", optional = true }

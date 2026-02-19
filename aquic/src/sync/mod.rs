@@ -6,6 +6,8 @@ pub mod mpmc;
 pub mod mpsc;
 pub mod stream;
 
+pub(crate) mod util;
+
 
 /// Channel is closed.
 #[derive(Clone, PartialEq, Eq, Hash)]
