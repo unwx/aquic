@@ -1,4 +1,4 @@
-use event_listener::Event;
+use event_listener::{Event, listener};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::{Arc, OnceLock};
@@ -92,7 +92,7 @@ impl<T: Clone + Send + Sync> OneshotReceiver<T> for Receiver<T> {
                 Err(TryRecvError::Empty) => {}
             }
 
-            let listener = self.shared.event.listen();
+            listener!(self.shared.event => listener);
 
             match self.try_recv() {
                 Ok(value) => {

@@ -1,7 +1,7 @@
-use event_listener::Event;
+use event_listener::{Event, listener};
 
+use std::cell::Cell;
 use std::sync::{Arc, RwLock};
-use std::usize;
 
 use crate::sync::mpmc::watch::{WatchReceiver, WatchSender};
 use crate::sync::{SendError, TryRecvError};
@@ -24,7 +24,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     };
     let receiver = Receiver {
         shared,
-        last_seen_version: INITIAL_RECEIVER_VERSION,
+        last_seen_version: Cell::new(INITIAL_RECEIVER_VERSION),
     };
 
     (sender, receiver)
@@ -93,7 +93,7 @@ impl<T> Drop for Sender<T> {
 #[derive(Debug)]
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
-    last_seen_version: usize,
+    last_seen_version: Cell<usize>,
 }
 
 impl<T: Clone + Send + Sync> WatchReceiver<T> for Receiver<T> {
@@ -109,7 +109,7 @@ impl<T: Clone + Send + Sync> WatchReceiver<T> for Receiver<T> {
                 Err(TryRecvError::Empty) => {}
             }
 
-            let listener = self.shared.event.listen();
+            listener!(self.shared.event => listener);
 
             match self.try_recv_inner(false) {
                 Ok(value) => {
@@ -139,12 +139,12 @@ impl<T: Clone + Send + Sync> WatchReceiver<T> for Receiver<T> {
 }
 
 impl<T: Clone> Receiver<T> {
-    fn try_recv_inner(&mut self, ignore_version: bool) -> Result<T, TryRecvError> {
+    fn try_recv_inner(&self, ignore_version: bool) -> Result<T, TryRecvError> {
         let state = self.shared.state.read().unwrap();
 
         if let Some(item) = state.item.as_ref() {
-            if ignore_version || self.last_seen_version != item.version {
-                self.last_seen_version = item.version;
+            if ignore_version || self.last_seen_version.get() != item.version {
+                self.last_seen_version.set(item.version);
                 return Ok(item.value.clone());
             }
         }
@@ -163,7 +163,7 @@ impl<T> Clone for Receiver<T> {
 
         Self {
             shared: self.shared.clone(),
-            last_seen_version: self.last_seen_version,
+            last_seen_version: self.last_seen_version.clone(),
         }
     }
 }

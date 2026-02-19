@@ -83,7 +83,7 @@ where
     fn new(
         mut config: Self::Config,
         connection_id_generator: Self::ConnectionIdGenerator,
-  cargo +nightly fmt      socket_addr: SocketAddr,
+        socket_addr: SocketAddr,
         socket_features: &HashSet<SoFeat>,
     ) -> Self {
         config.validate();

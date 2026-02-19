@@ -1,7 +1,7 @@
 use crate::sync::mpsc::unbounded::{self, UnboundedReceiver, UnboundedSender};
 use crate::sync::mpsc::weighted::{WeightedReceiver, WeightedSender, has_capacity};
 use crate::sync::{SendError, TryRecvError, TrySendError};
-use event_listener::Event;
+use event_listener::{Event, listener};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -57,7 +57,7 @@ impl<T: Send + Unpin + 'static> WeightedSender<T> for Sender<T> {
             // - Sender created a listener.
             // - Sender's listener doesn't affected, it will wait for the next signal.
 
-            let listener = self.shared.event.listen();
+            listener!(self.shared.event => listener);
             if self.is_closed() {
                 return Err(SendError(value));
             }
