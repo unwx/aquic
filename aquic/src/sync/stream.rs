@@ -1,9 +1,9 @@
 use crate::stream::{Error, Payload, Priority};
 use crate::sync::TryRecvError;
 use crate::sync::mpmc::oneshot::{self, OneshotReceiver, OneshotSender};
+use crate::sync::mpmc::watch::{self, WatchReceiver, WatchSender};
 use crate::sync::mpsc::weighted;
 use crate::sync::mpsc::weighted::{WeightedReceiver, WeightedSender};
-use crate::sync::stream::cell::PriorityCell;
 use crate::{Estimate, Spec};
 use futures::{FutureExt, select_biased};
 use std::any::type_name;
@@ -26,21 +26,21 @@ pub(crate) fn channel<S: Spec>(
 ) -> (Sender<S>, Receiver<S>) {
     let (item_sender, item_receiver) = weighted::channel(bound);
     let (error_sender, error_receiver) = oneshot::channel();
-    let priority_cell = PriorityCell::new();
+    let (priority_sender, priority_receiver) = watch::channel();
 
     let stream_sender = Sender {
         item_sender,
         error_sender: error_sender.clone(),
         error_receiver: error_receiver.clone(),
         shutdown_warn_receiver: shutdown_warn_receiver.clone(),
-        priority_cell: priority_cell.clone(),
+        priority_sender,
     };
     let stream_receiver = Receiver {
         item_receiver,
         error_sender,
         error_receiver,
         shutdown_warn_receiver,
-        priority_cell,
+        priority_receiver,
     };
 
     (stream_sender, stream_receiver)
@@ -83,8 +83,8 @@ pub struct Sender<S: Spec> {
     /// Listen for a warning, that connection is going to be closed at informed point of time.
     shutdown_warn_receiver: oneshot::Receiver<Instant>,
 
-    /// Dynamic stream priority.
-    priority_cell: PriorityCell,
+    /// Send stream priority updates.
+    priority_sender: watch::Sender<Priority>,
 }
 
 impl<S: Spec> Sender<S> {
@@ -233,7 +233,7 @@ impl<S: Spec> Sender<S> {
 
     /// Updates the priority of the stream direction.
     pub fn set_priority(&self, priority: Priority) {
-        self.priority_cell.set(priority);
+        let _ = self.priority_sender.send(priority);
     }
 
 
@@ -307,8 +307,8 @@ pub struct Receiver<S: Spec> {
     /// Listen for a warning, that connection is going to be closed at informed point of time.
     shutdown_warn_receiver: oneshot::Receiver<Instant>,
 
-    /// Dynamic stream priority.
-    priority_cell: PriorityCell,
+    /// Listen for stream priority updates.
+    priority_receiver: watch::Receiver<Priority>,
 }
 
 impl<S: Spec> Receiver<S> {
@@ -472,7 +472,7 @@ impl<S: Spec> Receiver<S> {
 
     /// Checks if the stream priority has changed and returns `Some(new_val)` if so.
     pub(crate) fn priority_once(&mut self) -> Option<Priority> {
-        self.priority_cell.take()
+        self.priority_receiver.try_recv().ok()
     }
 
 
@@ -514,95 +514,5 @@ impl<S: Spec> Drop for Receiver<S> {
         };
 
         self.close(error);
-    }
-}
-
-
-mod cell {
-    use crate::conditional;
-    use crate::stream::Priority;
-
-    conditional! {
-        multithread,
-
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicU16;
-        use std::sync::atomic::Ordering::AcqRel;
-        use std::sync::atomic::Ordering::Release;
-
-        const EMPTY: u16 = u16::MAX;
-
-        pub struct PriorityCell {
-            inner: Arc<AtomicU16>,
-        }
-
-        impl PriorityCell {
-            pub fn new() -> Self {
-                Self {
-                    inner: Arc::new(AtomicU16::new(EMPTY))
-                }
-            }
-
-            pub fn set(&self, priority: Priority) {
-                self.inner.store(Self::pack(priority), Release);
-            }
-
-            pub fn take(&self) -> Option<Priority> {
-                Self::unpack(self.inner.swap(EMPTY, AcqRel))
-            }
-
-
-            fn pack(priority: Priority) -> u16 {
-                let incremental = priority.incremental as u8;
-                u16::from_ne_bytes([priority.urgency, incremental])
-            }
-
-            fn unpack(value: u16) -> Option<Priority> {
-                if value == EMPTY {
-                    return None;
-                }
-
-                let [urgency, incremental] = value.to_ne_bytes();
-                Some(Priority {
-                    urgency,
-                    incremental: incremental != 0,
-                })
-            }
-        }
-    }
-
-    conditional! {
-        not(multithread),
-
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        pub struct PriorityCell {
-            inner: Rc<Cell<Option<Priority>>>
-        }
-
-        impl PriorityCell {
-            pub fn new() -> Self {
-                Self {
-                    inner: Rc::new(Cell::new(None))
-                }
-            }
-
-            pub fn set(&self, priority: Priority) {
-                self.inner.replace(Some(priority));
-            }
-
-            pub fn take(&self) -> Option<Priority> {
-                self.inner.take()
-            }
-        }
-    }
-
-    impl Clone for PriorityCell {
-        fn clone(&self) -> Self {
-            Self {
-                inner: self.inner.clone(),
-            }
-        }
     }
 }
