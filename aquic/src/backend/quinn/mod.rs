@@ -999,17 +999,15 @@ impl<CidGen> QuinnBackend<CidGen> {
             return;
         };
 
-        let Some(timeout) = connection.poll_timeout() else {
-            if let Some(previous_key) = connection.timeout_key {
-                // No more need in `on_timeout()` call.
-                timer.cancel(previous_key);
-            }
+        if let Some(previous_key) = connection.timeout_key {
+            timer.cancel(previous_key);
+        }
 
+        let Some(timeout) = connection.poll_timeout() else {
             return;
         };
 
         if time.next_timeout_tick.is_none() {
-            // Make sure to create an accurate TimerWheel clock, if it's absent.
             time.next_timeout_tick = Some(time.clock + time.timeout_tick_duration);
         }
 
@@ -1021,13 +1019,7 @@ impl<CidGen> QuinnBackend<CidGen> {
         //
         // In most cases `self.clock` should be almost identical to `Instant::now()`,
         // therefore the lag should not exceed a few ms.
-        let key = timer.schedule_instant_ceil(
-            TimeoutEvent(connection_id),
-            time.clock,
-            timeout,
-            connection.timeout_key,
-        );
-
+        let key = timer.schedule_instant_ceil(TimeoutEvent(connection_id), time.clock, timeout);
         connection.timeout_key = Some(key);
     }
 

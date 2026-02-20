@@ -44,16 +44,7 @@ impl<T> TimerWheel<T> {
     /// # Panics
     ///
     /// If `duration_ticks` exceeds `max_schedule` value that was set at [`new`](TimerWheel::new) method.
-    pub fn schedule(
-        &mut self,
-        event: T,
-        duration_ticks: u64,
-        previous_val_key: Option<TimerKey>,
-    ) -> TimerKey {
-        if let Some(key) = previous_val_key {
-            self.cancel(key);
-        }
-
+    pub fn schedule(&mut self, event: T, duration_ticks: u64) -> TimerKey {
         assert!(
             duration_ticks <= self.mask as u64,
             "duration_ticks ({}) exceeds wheel capacity {}, please correctly estimate the capacity in the `new()` method",
@@ -86,19 +77,13 @@ impl<T> TimerWheel<T> {
     /// Therefore, event won't be available sooner than `Instant`.
     ///
     /// See: [`schedule`](Self::schedule).
-    pub fn schedule_instant_ceil(
-        &mut self,
-        event: T,
-        now: Instant,
-        at: Instant,
-        previous_val_key: Option<TimerKey>,
-    ) -> TimerKey {
+    pub fn schedule_instant_ceil(&mut self, event: T, now: Instant, at: Instant) -> TimerKey {
         let duration = at.saturating_duration_since(now);
         let ticks = duration
             .as_millis()
             .div_ceil(self.tick_duration.as_millis());
 
-        self.schedule(event, ticks as u64, previous_val_key)
+        self.schedule(event, ticks as u64)
     }
 
     /// Cancel a scheduled event with the specified key.
