@@ -11,7 +11,6 @@ use bitvec::prelude::BitVec;
 use bitvec::view::BitView;
 use rand::{RngCore, rng};
 use smallvec::SmallVec;
-use std::time::Duration;
 
 /// AES block size in bytes.
 const AES_BLOCK_SIZE: usize = 16;
@@ -66,9 +65,6 @@ pub struct ServerConnectionIdGenerator {
     /// How many bits of purely random padding to add at the end.
     entropy_bits: usize,
 
-    /// Generated Connection ID lifetime.
-    lifetime: Option<Duration>,
-
     /// Pre-initialized cipher for speed.
     cipher: Aes128,
 }
@@ -79,7 +75,6 @@ impl ServerConnectionIdGenerator {
     /// * `server_id_len` The length of `server_id` in bits (8-32).
     /// * `core_id_bits` The length of `core_id` in bits (0-16), where 0 means `core_id` is not used.
     /// * `entropy_bits` The length of just random Nonce bits, minimum `32`.
-    /// * `lifetime` Generated Connection ID lifetime.
     ///
     /// **Note**: `core_id` is an addition,
     /// and it's written in the place, [where `Nonce` should be written](https://datatracker.ietf.org/doc/html/draft-ietf-quic-load-balancers-14#name-cid-format).
@@ -96,7 +91,6 @@ impl ServerConnectionIdGenerator {
         server_id_bits: usize,
         core_id_bits: usize,
         entropy_bits: usize,
-        lifetime: Option<Duration>,
     ) -> Self {
         assert!(
             (8..=32).contains(&server_id_bits),
@@ -111,7 +105,6 @@ impl ServerConnectionIdGenerator {
             server_id_bits,
             core_id_bits,
             entropy_bits,
-            lifetime,
             cipher: Aes128::new(&GenericArray::from(key)),
         }
     }
@@ -187,10 +180,6 @@ impl ConnectionIdGenerator for ServerConnectionIdGenerator {
         bits += self.core_id_bits;
         bits += self.entropy_bits;
         bits.div_ceil(8).min(MAX_CID_LEN)
-    }
-
-    fn cid_lifetime(&self) -> Option<Duration> {
-        self.lifetime
     }
 
     fn validate(&self, cid: &ConnectionId) -> bool {

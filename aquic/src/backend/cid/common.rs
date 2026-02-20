@@ -1,32 +1,17 @@
 use crate::backend::cid::{ConnectionId, ConnectionIdGenerator, IdError, NoopIdMeta};
 use rand::{RngCore, rng};
 use smallvec::SmallVec;
-use std::time::Duration;
 
 /// A [ConnIdGenerator] implementation that
 /// simply generates random [ConnectionId] without any additional information.
 pub struct RandConnIdGenerator {
     length: usize,
-    lifetime: Option<Duration>,
 }
 
 impl RandConnIdGenerator {
     /// Create a new instance with a specified Connection ID length in bytes.
     pub fn new(length: usize) -> Self {
-        Self {
-            length,
-            lifetime: None,
-        }
-    }
-
-    /// Create a new instance with:
-    /// * `length` a Connection ID length in bytes.
-    /// * `lifetime` a Connection ID lifetime.
-    pub fn new_with_lifetime(length: usize, lifetime: Duration) -> Self {
-        Self {
-            length,
-            lifetime: Some(lifetime),
-        }
+        Self { length }
     }
 }
 
@@ -42,10 +27,6 @@ impl ConnectionIdGenerator for RandConnIdGenerator {
 
     fn cid_len(&self) -> usize {
         self.length
-    }
-
-    fn cid_lifetime(&self) -> Option<Duration> {
-        self.lifetime
     }
 
     fn validate(&self, cid: &ConnectionId) -> bool {

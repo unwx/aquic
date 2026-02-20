@@ -42,7 +42,7 @@ type QuinnConnectionEvent = quinn_proto::ConnectionEvent;
 type QuinnStreamEvent = quinn_proto::StreamEvent;
 
 
-/// The `quinn-proto` provider for the [QuicBackend].
+/// The `quinn-proto` QUIC backend provider.
 ///
 /// [Quinn Project](https://github.com/quinn-rs/quinn)
 pub struct QuinnBackend<CIdGen> {
@@ -89,7 +89,10 @@ where
         config.validate();
 
         {
-            let cid_gen = SyncConnectionIdGenerator::new(connection_id_generator);
+            let cid_gen = SyncConnectionIdGenerator::new(
+                connection_id_generator,
+                config.connection_id_lifetime,
+            );
             config
                 .endpoint
                 .cid_generator(move || Box::new(cid_gen.clone()));

@@ -43,4 +43,4 @@ impl Time {
 
 /// QUIC connection timed out.
 #[derive(Debug, Copy, Clone)]
-pub struct TimeoutEvent(pub QuinnConnectionId);
+pub(super) struct TimeoutEvent(pub QuinnConnectionId);

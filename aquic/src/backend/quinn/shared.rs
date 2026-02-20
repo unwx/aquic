@@ -52,9 +52,8 @@ pub(super) struct SyncConnectionIdGenerator<T> {
 }
 
 impl<T: ConnectionIdGenerator> SyncConnectionIdGenerator<T> {
-    pub fn new(inner: T) -> Self {
+    pub fn new(inner: T, lifetime: Option<Duration>) -> Self {
         let length = inner.cid_len();
-        let lifetime = inner.cid_lifetime();
 
         Self {
             inner: Arc::new(Mutex::new(inner)),

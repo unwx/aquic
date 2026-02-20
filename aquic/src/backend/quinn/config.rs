@@ -26,6 +26,10 @@ pub struct Config {
     /// - If `None`, the default [TransportConfig] will replace [ClientConfig::transport_config] with some overriden values.
     pub client_transport: Option<TransportConfig>,
 
+    /// Lifetime of a QUIC connection ID,
+    /// or `None` if they should not be rotated.
+    pub connection_id_lifetime: Option<Duration>,
+
     /// Number of internal buffers that are used for output operations
     /// (to send data from QUIC backend to network).
     ///
@@ -65,25 +69,18 @@ pub struct Config {
 }
 
 impl Config {
-    /// Adjusts config values in case they are invalid,
-    /// and prints a warning in such cases.
-    ///
-    /// Returns `false` if there was an invalid value.
-    pub fn validate(&mut self) -> bool {
-        let mut invalid = true;
-
+    /// Adjusts config values if they are invalid.
+    pub fn validate(&mut self) {
         if self.server.is_none() && self.client.is_none() {
             warn!(
                 "both `server` and `client` configurations were not provided: \
                 QuinnProvider is no-op"
             );
-            invalid = true;
         }
 
         if self.out_buffers_count == 0 {
             warn!("specified `config.out_buffers_count` is '0', this value is replaced with '1'");
             self.out_buffers_count = 1;
-            invalid = true;
         }
 
         if self.max_idle_timeout.as_millis() == 0 {
@@ -94,7 +91,6 @@ impl Config {
 
             // Make sure it's really zero.
             self.max_idle_timeout = Duration::ZERO;
-            invalid = true;
         }
         if IdleTimeout::try_from(self.max_idle_timeout).is_err() {
             warn!(
@@ -103,7 +99,6 @@ impl Config {
             );
 
             self.max_idle_timeout = Duration::ZERO;
-            invalid = true;
         }
 
         if self.max_timeout_miss.as_millis() == 0 {
@@ -113,7 +108,6 @@ impl Config {
             );
 
             self.max_timeout_miss = Duration::from_millis(15);
-            invalid = true;
         }
         if self.max_timeout_miss.as_millis() < 5 {
             warn!(
@@ -123,8 +117,6 @@ impl Config {
 
             // It's valid in some cases, but may be not in most.
         }
-
-        invalid
     }
 }
 
@@ -136,6 +128,7 @@ impl Default for Config {
             client: None,
             server_transport: None,
             client_transport: None,
+            connection_id_lifetime: None,
             out_buffers_count: 1,
             reserved_out_buffers_count: 0,
             max_idle_timeout: Duration::from_secs(30),
