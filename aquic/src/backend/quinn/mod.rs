@@ -393,7 +393,7 @@ where
 
         // `next_instant` is a &mut reference: it will be updated automatically.
         timer
-            .next(&mut self.time.timeout_events, next_instant)
+            .next(&mut self.time.timeout_events, self.time.clock, next_instant)
             .await;
     }
 

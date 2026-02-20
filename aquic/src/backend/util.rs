@@ -1,5 +1,8 @@
 use slab::Slab;
-use std::time::{Duration, Instant};
+use std::{
+    ops::Div,
+    time::{Duration, Instant},
+};
 
 use crate::exec::Runtime;
 
@@ -79,9 +82,7 @@ impl<T> TimerWheel<T> {
     /// See: [`schedule`](Self::schedule).
     pub fn schedule_instant_ceil(&mut self, event: T, now: Instant, at: Instant) -> TimerKey {
         let duration = at.saturating_duration_since(now);
-        let ticks = duration
-            .as_millis()
-            .div_ceil(self.tick_duration.as_millis());
+        let ticks = duration.as_nanos().div_ceil(self.tick_duration.as_nanos());
 
         self.schedule(event, ticks as u64)
     }
@@ -138,11 +139,39 @@ impl<T> TimerWheel<T> {
 
     /// Waits for the next [`tick`](Self::tick) until it's not empty.
     ///
+    /// If `next_tick_at` is behind `now`, all previous ticks will be processed too.
+    ///
     /// # Cancel Safety
     ///
     /// Cancel safe. If this method was interrupted at `sleep()` point,
     /// the `next_tick_at` variable should contain an updated time when the next tick should happen.
-    pub async fn next(&mut self, out: &mut Vec<T>, next_tick_at: &mut Instant) -> usize {
+    pub async fn next(
+        &mut self,
+        out: &mut Vec<T>,
+        now: Instant,
+        next_tick_at: &mut Instant,
+    ) -> usize {
+        {
+            let mut count = 0;
+
+            if now > *next_tick_at {
+                let skipped_ticks = now
+                    .saturating_duration_since(*next_tick_at)
+                    .as_nanos()
+                    // Should be the same as `div_floor()` for u128.
+                    .div(self.tick_duration.as_nanos()) as u32;
+
+                for _ in 0..skipped_ticks {
+                    count += self.tick(out);
+                }
+
+                *next_tick_at += self.tick_duration * skipped_ticks;
+                if count != 0 {
+                    return count;
+                }
+            }
+        }
+
         loop {
             Runtime::sleep_until(*next_tick_at).await;
             *next_tick_at += self.tick_duration;
