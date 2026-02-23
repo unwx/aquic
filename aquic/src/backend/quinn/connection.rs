@@ -34,7 +34,7 @@ pub(super) struct Connection {
     pub inner: QuinnConnection,
 
     /// [TimerWheel][crate::backend::util::TimerWheel] key for a scheduled [TimeoutEvent].
-    pub timeout_key: Option<TimerKey>,
+    pub timer_key: Option<TimerKey>,
 
     /// Streams that may receive byte-chunks immediately,
     /// not in sequential order.

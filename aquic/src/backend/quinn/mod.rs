@@ -19,7 +19,6 @@ use rustc_hash::{FxBuildHasher, FxHashSet};
 use rustls::pki_types::CertificateDer;
 use std::any::type_name;
 use std::collections::HashSet;
-use std::future::{self};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -380,20 +379,13 @@ where
 
 
     async fn sleep(&mut self) {
-        let Some(timer) = self.time.timeout_timer.as_mut() else {
-            future::pending::<()>().await;
-            return;
-        };
-
-        let Some(next_instant) = self.time.next_timeout_tick.as_mut() else {
-            // No timeout event is scheduled yet.
-            future::pending::<()>().await;
-            return;
-        };
-
-        // `next_instant` is a &mut reference: it will be updated automatically.
-        timer
-            .next(&mut self.time.timeout_events, self.time.clock, next_instant)
+        self.time
+            .timer
+            .next(
+                &mut self.time.fired_events,
+                self.time.clock,
+                &mut self.time.timer_next_tick_time,
+            )
             .await;
     }
 
@@ -806,7 +798,7 @@ impl<CidGen> QuinnBackend<CidGen> {
 
             Connection {
                 inner: connection,
-                timeout_key: None,
+                timer_key: None,
                 unordered_streams: FxHashSet::with_hasher(FxBuildHasher),
                 drop_unsent_datagrams: false,
                 last_pmtu: mtu,
@@ -995,21 +987,13 @@ impl<CidGen> QuinnBackend<CidGen> {
         connection: &mut Connection,
         time: &mut Time,
     ) {
-        let Some(timer) = time.timeout_timer.as_mut() else {
-            return;
-        };
-
-        if let Some(previous_key) = connection.timeout_key {
+        if let Some(previous_key) = connection.timer_key {
             timer.cancel(previous_key);
         }
 
         let Some(timeout) = connection.poll_timeout() else {
             return;
         };
-
-        if time.next_timeout_tick.is_none() {
-            time.next_timeout_tick = Some(time.clock + time.timeout_tick_duration);
-        }
 
         // `self.clock` may be in the past, but will never be in the future.
         //
@@ -1019,8 +1003,10 @@ impl<CidGen> QuinnBackend<CidGen> {
         //
         // In most cases `self.clock` should be almost identical to `Instant::now()`,
         // therefore the lag should not exceed a few ms.
-        let key = timer.schedule_instant_ceil(TimeoutEvent(connection_id), time.clock, timeout);
-        connection.timeout_key = Some(key);
+        let key = time
+            .timer
+            .schedule_at(TimeoutEvent(connection_id), time.clock, timeout);
+        connection.timer_key = Some(key);
     }
 
     fn check_max_dgram_size_update(

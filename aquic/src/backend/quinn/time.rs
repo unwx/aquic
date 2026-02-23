@@ -3,39 +3,39 @@ use std::time::{Duration, Instant};
 use crate::backend::{Config, quinn::QuinnConnectionId, util::TimerWheel};
 
 pub(super) struct Time {
-    /// Scheduled timeout events.
-    pub timeout_timer: Option<TimerWheel<TimeoutEvent>>,
+    /// Scheduled events.
+    pub timer: TimerWheel<TimeoutEvent>,
 
-    /// Fired timeout events
-    pub timeout_events: Vec<TimeoutEvent>,
+    /// Fired events.
+    pub fired_events: Vec<TimeoutEvent>,
 
-    /// Duration of the single `timeout_timer` tick.
-    pub timeout_tick_duration: Duration,
+    /// When the next `timer` tick should happen.
+    pub timer_next_tick_time: Instant,
 
-    /// Where the next timeout tick should happen.
-    pub next_timeout_tick: Option<Instant>,
-
-    /// Internal clock.
+    /// Internal clock, shows current time.
     pub clock: Instant,
 }
 
 impl Time {
     pub fn new(config: &Config) -> Self {
-        let timeout_timer = if config.max_idle_timeout.as_millis() == 0 {
-            Some(TimerWheel::new(
-                config.max_timeout_miss,
-                config.max_idle_timeout,
-            ))
+        debug_assert!(
+            config.max_timeout_miss.as_millis() > 0,
+            "provided config is invalid: 'max_timeout_miss.as_millis()' is zero"
+        );
+
+        let clock = Instant::now();
+
+        let timer = if config.max_idle_timeout.as_millis() != 0 {
+            TimerWheel::new(config.max_timeout_miss, config.max_idle_timeout)
         } else {
-            None
+            TimerWheel::with_capacity(Duration::from_hours(1), Duration::from_hours(1), 0, 0)
         };
 
         Self {
-            timeout_timer,
-            timeout_events: Vec::new(),
-            timeout_tick_duration: config.max_idle_timeout,
-            next_timeout_tick: None,
-            clock: Instant::now(),
+            timer,
+            fired_events: Vec::new(),
+            timer_next_tick_time: clock,
+            clock,
         }
     }
 }
