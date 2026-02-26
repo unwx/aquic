@@ -106,11 +106,11 @@ impl<T> TimerWheel<T> {
         let bucket = &mut self.buckets[bucket_index];
         let bucket_element_index = bucket.len();
 
-        let entry_index = self.entries.insert(Location {
+        let location_index = self.address_book.insert(Location {
             bucket_index,
             bucket_element_index,
         });
-        let timer_key = TimerKey(entry_index);
+        let timer_key = TimerKey(location_index);
 
         bucket.push((event, timer_key));
         timer_key
@@ -149,8 +149,8 @@ impl<T> TimerWheel<T> {
                 // After the `swap_remove()`
                 // item that was at `last_index` is now at `index_to_remove`.
 
-                if let Some(moved_entry) = self.entries.get_mut(moved_timer_key.0) {
-                    moved_entry.bucket_element_index = index_to_remove;
+                if let Some(moved_location) = self.address_book.get_mut(moved_timer_key.0) {
+                    moved_location.bucket_element_index = index_to_remove;
                 }
             } else {
                 bucket.pop();

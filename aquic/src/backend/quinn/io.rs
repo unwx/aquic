@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    backend::Config,
+    backend::quinn::Config,
     net::{Buf, MAX_PACKET_SIZE, SendMsg},
 };
 
@@ -120,15 +120,7 @@ impl Buf for VecBuf {
         self.0.len()
     }
 
-    fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-
     fn as_read_slice(&self) -> &[u8] {
         &self.as_slice()[..self.len()]
-    }
-
-    fn as_read_io_slice(&self) -> IoSlice<'_> {
-        IoSlice::new(self.as_read_slice())
     }
 }

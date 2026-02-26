@@ -267,7 +267,7 @@ where
                 message.from(),
                 Some(message.to()),
                 message.ecn().into(),
-                BytesMut::from(&message.slice_read()[..]),
+                BytesMut::from(&message.read_slice()[..]),
                 buffer,
             ) else {
                 continue;
@@ -391,11 +391,11 @@ where
 
     fn on_alarm(&mut self) -> Result<()> {
         if !self.open {
-            self.time.timeout_events.clear();
+            self.time.fired_events.clear();
             return Err(Error::Closed);
         }
 
-        while let Some(event) = self.time.timeout_events.pop() {
+        while let Some(event) = self.time.fired_events.pop() {
             let connection_id = event.0;
 
             let Some(connection) = self.connections.all.get_mut(&connection_id) else {
@@ -988,7 +988,7 @@ impl<CidGen> QuinnBackend<CidGen> {
         time: &mut Time,
     ) {
         if let Some(previous_key) = connection.timer_key {
-            timer.cancel(previous_key);
+            time.timer.cancel(previous_key);
         }
 
         let Some(timeout) = connection.poll_timeout() else {

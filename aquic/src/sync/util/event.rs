@@ -1,3 +1,5 @@
+// TODO(test): untested unsafe code.
+
 use intrusive_collections::{LinkedList, LinkedListLink, UnsafeRef, intrusive_adapter};
 use std::cell::RefCell;
 use std::fmt::Debug;

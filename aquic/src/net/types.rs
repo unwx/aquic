@@ -150,16 +150,15 @@ impl<B: BufMut> RecvMsg<B> {
 
     /// Returns a slice that is intended for writing a data received from peer.
     #[inline]
-    pub(crate) fn slice_write(&mut self) -> IoSliceMut<'_> {
+    pub fn write_slice(&mut self) -> IoSliceMut<'_> {
         debug_assert!(!self.has_data());
-        self.buf.as_mut_write_io_slice()
+        self.buf.as_write_io_slice()
     }
 
-    /// Returns a slice that is intended for reading the received data.
-    #[inline]
-    pub fn slice_read(&mut self) -> &mut [u8] {
+    /// Returns a slice that is intended for reading data received from peer.
+    pub fn read_slice(&mut self) -> &mut [u8] {
         debug_assert!(self.has_data());
-        self.buf.as_mut_read_slice()
+        self.buf.as_read_slice(self.read)
     }
 
     /// Returns `source` address.
@@ -407,20 +406,33 @@ pub trait Buf {
         self.len() == 0
     }
 
-    fn capacity(&self) -> usize;
-
     /// Returns `[..len()]` slice for reading.
     fn as_read_slice(&self) -> &[u8];
 
     /// Returns `[..len()]` I/O slice for reading.
-    fn as_read_io_slice(&self) -> IoSlice<'_>;
+    fn as_read_io_slice(&self) -> IoSlice<'_> {
+        IoSlice::new(self.as_read_slice())
+    }
 }
 
 /// A mutable buffer.
-pub trait BufMut: Buf {
-    /// Returns `[..len()]` slice for reading (and mutating).
-    fn as_mut_read_slice(&mut self) -> &mut [u8];
+pub trait BufMut {
+    fn capacity(&self) -> usize;
 
     /// Returns `[..capacity()]` slice for writing.
-    fn as_mut_write_io_slice(&mut self) -> IoSliceMut<'_>;
+    fn as_write_slice(&mut self) -> &mut [u8];
+
+    /// Returns `[..len()]` slice for reading.
+    ///
+    /// # Panics
+    ///
+    /// If `len` is greater than [BufMut::capacity].
+    fn as_read_slice(&mut self, len: usize) -> &mut [u8] {
+        &mut self.as_write_slice()[..len]
+    }
+
+    /// Returns `[..capacity()]` slice for writing.
+    fn as_write_io_slice(&mut self) -> IoSliceMut<'_> {
+        IoSliceMut::new(self.as_write_slice())
+    }
 }

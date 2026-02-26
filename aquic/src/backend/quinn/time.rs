@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
-use crate::backend::{Config, quinn::QuinnConnectionId, util::TimerWheel};
+use crate::backend::{
+    quinn::{Config, QuinnConnectionId},
+    util::TimerWheel,
+};
 
 pub(super) struct Time {
     /// Scheduled events.

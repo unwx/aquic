@@ -13,15 +13,13 @@ use std::time::Instant;
 conditional! {
     feature = "quiche",
 
-    mod quiche;
-    pub use quiche::*;
+    pub mod quiche;
 }
 
 conditional! {
     feature = "quinn",
 
-    mod quinn;
-    pub use quinn::*;
+    pub mod quinn;
 }
 
 pub(crate) mod dgram;
