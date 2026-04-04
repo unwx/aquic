@@ -9,8 +9,8 @@ use bitvec::field::BitField;
 use bitvec::order::Msb0;
 use bitvec::prelude::BitVec;
 use bitvec::view::BitView;
-use rand::{RngCore, rng};
-use smallvec::SmallVec;
+use rand::{Rng, rng};
+use typenum::U16;
 
 /// AES block size in bytes.
 const AES_BLOCK_SIZE: usize = 16;
@@ -22,10 +22,10 @@ const AES_BLOCK_SIZE_BITS: usize = AES_BLOCK_SIZE * 8;
 type Bits = BitArray<[u8; AES_BLOCK_SIZE], Msb0>;
 
 
-/// [ConnIdMeta] for a server Connection ID.
+/// [ConnectionIdMeta] for a server Connection ID.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ServerIdMeta {
-    /// Server ID (may optionally include other data, as region).
+    /// Server ID (may optionally include other data, like region).
     pub server_id: u32,
 
     /// A Core ID that is **mandatory** for routing in thread-per-core async runtimes like monoio,
@@ -46,9 +46,13 @@ impl ConnectionIdMeta for ServerIdMeta {
 /// that should be sufficient for most cases: can store `server_id` and `core_id`.
 ///
 /// In case you want to store advanced routing information like region, zone,
-/// you might want to store it inside `server_id` too.
+/// you might want to store it inside `server_id`.
 pub struct ServerConnectionIdGenerator {
-    /// Your Server ID (Routing Tag).
+    /// [First Octet](https://datatracker.ietf.org/doc/html/draft-ietf-quic-load-balancers-14#name-first-cid-octet)
+    /// to use.
+    first_octet: u8,
+
+    /// Server ID (Routing Tag).
     server_id: u32,
 
     /// Length of `server_id` in bits (8-32).
@@ -72,20 +76,23 @@ pub struct ServerConnectionIdGenerator {
 impl ServerConnectionIdGenerator {
     /// Creates new generator with a specified encryption key.
     ///
-    /// * `server_id_len` The length of `server_id` in bits (8-32).
-    /// * `core_id_bits` The length of `core_id` in bits (0-16), where 0 means `core_id` is not used.
-    /// * `entropy_bits` The length of just random Nonce bits, minimum `32`.
+    /// * `first_octet` the [First Octet](https://datatracker.ietf.org/doc/html/draft-ietf-quic-load-balancers-14#name-first-cid-octet)
+    ///    to use.
+    /// * `server_id_len`: the length of `server_id` in bits (8-32).
+    /// * `core_id_bits`: the length of `core_id` in bits (0-16), where 0 means `core_id` is not used.
+    /// * `entropy_bits`: the length of just random Nonce bits, minimum `32`.
     ///
-    /// **Note**: `core_id` is an addition,
-    /// and it's written in the place, [where `Nonce` should be written](https://datatracker.ietf.org/doc/html/draft-ietf-quic-load-balancers-14#name-cid-format).
+    /// **Note**: `core_id` is a custom made extension,
+    /// and it's written in the place [where `Nonce` should be written](https://datatracker.ietf.org/doc/html/draft-ietf-quic-load-balancers-14#name-cid-format).
     ///
     /// But it does not replace the `entropy_bits` value.
-    /// That is,
-    /// - if `core_id_bits` is `16`,
-    /// - and `entropy_bits` is `34`,
-    /// - then the resulting `Nonce` would be `50` bits long.
+    /// That is, if `server_id_bits` is `16`, `core_id_bits` is `16` and `entropy_bits` is `38`:
+    /// the resulting connection ID will be (8 + 16 + 16 + 38 = 78) bits long (where `8` is the First Octet).
+    ///
+    /// Though, you may want it to be rounded and be a multiple of 8.
     pub fn new(
-        key: [u8; 16],
+        key: &GenericArray<u8, U16>,
+        first_octet: u8,
         server_id: u32,
         core_id: u16,
         server_id_bits: usize,
@@ -96,26 +103,27 @@ impl ServerConnectionIdGenerator {
             (8..=32).contains(&server_id_bits),
             "server_id_bits must be in range [8..=32]"
         );
-        assert!(core_id_bits <= 16, "core_id_bits must be in range [0.=16]");
+        assert!(core_id_bits <= 16, "core_id_bits must be in range [0..=16]");
         assert!(entropy_bits >= 32, "entropy_bits must be in range [32..]");
 
         Self {
+            first_octet,
             server_id,
             core_id,
             server_id_bits,
             core_id_bits,
             entropy_bits,
-            cipher: Aes128::new(&GenericArray::from(key)),
+            cipher: Aes128::new(key),
         }
     }
 
     /// Helper to pack the bits: `[ FirstOctet | ServerID | CoreID | Padding ]`
-    fn build_cid(&self) -> SmallVec<[u8; MAX_CID_LEN]> {
-        let mut buffer = SmallVec::from_elem(0, self.cid_len());
-        buffer[0] = rng().next_u32() as u8;
+    fn build_cid(&self) -> ConnectionId {
+        let mut cid = [0u8; MAX_CID_LEN];
+        cid[0] = self.first_octet;
 
-        let plaintext = buffer.as_mut_slice()[1..].view_bits_mut::<Msb0>();
-        let mut offset = 0;
+        let plaintext = cid.as_mut_slice().view_bits_mut::<Msb0>();
+        let mut offset = 8;
 
         plaintext[offset..offset + self.server_id_bits].store_be(self.server_id);
         offset += self.server_id_bits;
@@ -139,9 +147,12 @@ impl ServerConnectionIdGenerator {
 
             let entropy = Self::random_bits(entropy_bits);
             plaintext[offset..(offset + entropy_bits)].copy_from_bitslice(&entropy);
+
+            offset += entropy_bits;
         }
 
-        buffer
+        ConnectionId::try_from_slice(&cid[..offset.div_ceil(8)])
+            .expect("'cid' length cannot exceed MAX_CID_LEN")
     }
 
     fn random_bits(bits_len: usize) -> BitVec<u8, Msb0> {
@@ -160,7 +171,7 @@ impl ServerConnectionIdGenerator {
 impl ConnectionIdGenerator for ServerConnectionIdGenerator {
     type Meta = ServerIdMeta;
 
-    fn generate(&mut self) -> ConnectionId {
+    fn generate(&self) -> ConnectionId {
         let mut cid = self.build_cid();
 
         // (1 for first octet) + (16 for plaintext: server_id + nonce)
@@ -171,7 +182,7 @@ impl ConnectionIdGenerator for ServerConnectionIdGenerator {
             encrypt_four_pass(&self.cipher, &mut cid.as_mut_slice()[1..]);
         }
 
-        ConnectionId(cid)
+        cid
     }
 
     fn cid_len(&self) -> usize {
@@ -224,7 +235,7 @@ impl ConnectionIdGenerator for ServerConnectionIdGenerator {
             });
         }
 
-        let plaintext = cid.0[1..].view_bits::<Msb0>();
+        let plaintext = cid.as_slice()[1..].view_bits::<Msb0>();
         let required_bits = self.server_id_bits + self.core_id_bits;
 
         if plaintext.len() < required_bits {

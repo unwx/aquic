@@ -1,8 +1,5 @@
-use crate::exec::SendOnMt;
-use crate::stream::{Chunk, Payload};
-use aquic_macros::supports;
+use crate::stream::Payload;
 use bytes::Bytes;
-use std::future::Future;
 
 /// A QUIC connection consists of multiple streams where data flows.
 ///
@@ -10,23 +7,7 @@ use std::future::Future;
 /// Its primary goal is to decode the protocol-formatted raw byte stream into meaningful entities of type [`Self::Item`].
 /// It may also uncompress the traffic, etc.
 ///
-/// **Note**: it doesn't meant to replace deserializers.
-/// By design, they should work together: `raw-stream-of-bytes -> decoder -> application-deserializer`,
-/// where `application-deserializer` may be anything:
-/// - JSON deserializer ([Self::Item] would probably be complete chunk of JSON in [Bytes]).
-/// - Documents deserializer ([Self::Item] would probably be a handle to output-stream: decoder writes to /tmp file, while deserializer reads from it).
-/// - Just file saver ([Self::item] would probably be a handle to a filename, etc).
-///
-/// Though, of course, it is up to application how to use it.
-///
-/// # Non-blocking implementation
-///
-/// While methods return `Future`s, a non-blocking implementation is not mandatory.
-/// Implementations should only be non-blocking if necessary (e.g., when performing
-/// expensive I/O operations).
-///
-/// The library is optimized for both blocking and non-blocking implementations.
-#[supports]
+/// **Note**: it doesn't meant to replace deserializers, though it may in some cases.
 pub trait Decoder {
     /// The type of the decoded entity.
     type Item;
@@ -36,63 +17,45 @@ pub trait Decoder {
     /// Clones should be cheap.
     type Error: std::error::Error;
 
-    /// Returns `true` if the decoder supports an unordered stream.
+    /// Returns a mutable buffer,
+    /// that is going to be used to receive incoming stream data.
     ///
-    /// If a current [`QUIC Backend`][crate::backend::QuicBackend] supports unordered streams too,
-    /// then [`decode()`][Decoder::decode] will be populated with [`Chunk::Unordered`].
+    /// This method paired with [`notify()`](Decoder::notify) are going to be invoked until `None` is received.
     ///
-    /// **Note**: for most cases an application wants an ordered stream,
-    /// which will be decoded into ordered sequence of messages.
+    /// The `mandatory` parameter specifies,
+    /// whether it is **mandatory** to return `Some` with a non-empty buffer, or not.
+    /// Usually, the first `recv()` call requires a mandatory buffer,
+    /// while the further calls do not.
     ///
-    /// Unordered stream is a feature when an application receives all stream frames immediately,
-    /// even if there are previous frames that are missing due to packet loss.
+    /// # Warning
     ///
-    /// Application may use unordered streams if there is no reason to preserve the order,
-    /// for example when writing to file ([`Chunk::Unordered`] contains offset too).
-    #[supports(quinn)]
-    fn supports_unordered() -> bool;
+    /// This method **must not** perform any expensive operation,
+    /// as it may be invoked from a network I/O loop thread.
+    fn recv(&mut self, mandatory: bool) -> Option<&mut [u8]>;
 
-    /// Decodes the next batch of byte chunks.
-    /// Available items are written into `out_items`.
+    /// Notifies that previously returned [`recv()`][Decoder::recv] buffer
+    /// was filled with `length` bytes of stream data.
     ///
-    /// If `fin` is `true`, this indicates the successful end of the stream; no further data will arrive.
-    /// It is expected, that method returns all pending items on `FIN`.
+    /// `FIN` flag indicates, whether it's a successful end of the stream, or not yet.
     ///
-    /// # Cancel Safety
+    /// # Warning
     ///
-    /// This method is **not required** to be cancel-safe.
+    /// This method **must not** perform any expensive operation,
+    /// as it may be invoked from a network I/O loop thread.
+    fn notify(&mut self, length: usize, fin: bool);
+
+    /// Decodes previously received stream data,
+    /// and returns a [Self::Item] if it's ready.
     ///
-    /// If the future is dropped before completion, the [`Decoder`] may be left
-    /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`Decoder`] will not be used again after cancellation.
-    fn decode(
-        &mut self,
-        in_batch: &mut Vec<Chunk>,
-        out_items: &mut Vec<Self::Item>,
-        fin: bool,
-    ) -> impl Future<Output = Result<(), Self::Error>> + SendOnMt;
+    /// This method is going to be invoked until `None`, `Some(FIN)` or `Err` is received.
+    fn decode(&mut self) -> Result<Option<Payload<Self::Item>>, Self::Error>;
 }
 
 /// [`Encoder`] is a stateful object responsible for a single outgoing QUIC stream.
 /// Its primary goal is to encode meaningful entities of type [`Self::Item`] into a protocol-formatted raw byte stream.
 /// It may also compress the traffic, etc.
 ///
-/// **Note**: it doesn't meant to replace serializers.
-/// By design, they should work together: `application-serializer -> encoder -> raw-stream-of-bytes`,
-/// where `application-deserializer` may be anything:
-/// - JSON serializer ([Self::Item] would probably be complete chunk of JSON in [Bytes], encoder makes sure to send this chunk properly, ensuring protocol formatting).
-/// - Documents serializer ([Self::Item] would probably be a handle to input-stream: serializer writes to /tmp file, while encoder reads from it).
-/// - Just file loader ([Self::item] would probably be a handle to a filename, etc).
-///
-/// Though, of course, it is up to application how to use it.
-///
-/// # Non-blocking implementation
-///
-/// While methods return `Future`s, a non-blocking implementation is not mandatory.
-/// Implementations should only be non-blocking if necessary (e.g., when performing
-/// expensive I/O operations or serialization).
-///
-/// The library is optimized for both blocking and non-blocking implementations.
+/// **Note**: it doesn't meant to replace serializers, though it may in some cases.
 pub trait Encoder {
     /// The type of the entity to be encoded.
     type Item;
@@ -102,18 +65,24 @@ pub trait Encoder {
     /// Clones should be cheap.
     type Error: std::error::Error;
 
-    /// Encodes the next payload into `out_batch`.
+    /// Receives and encodes a next payload.
+    fn encode(&mut self, payload: Payload<Self::Item>) -> Result<(), Self::Error>;
+
+    /// Returns `true` if all the previously encoded data
+    /// should be [`flushed`](Encoder::flush) immediately.
+    fn should_flush(&self) -> bool;
+
+    /// Returns chunks of bytes with a `FIN` flag, which specifies,
+    /// whether it's a successful end of the stream or not.
     ///
-    /// # Cancel Safety
+    /// This method is going to be invoked until `None` is received.
     ///
-    /// This method is **not required** to be cancel-safe.
+    /// # Bytes
     ///
-    /// If the future is dropped before completion, the [`Encoder`] may be left
-    /// in an inconsistent or invalid state. However, it is guaranteed that the
-    /// [`Encoder`] will not be used again after cancellation.
-    fn encode(
-        &mut self,
-        in_payload: Payload<Self::Item>,
-        out_batch: &mut Vec<Bytes>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + SendOnMt;
+    /// Little hint:
+    ///
+    /// If you use a custom bytes pool implementation,
+    /// like thread local `VecDeque<[u8; 4096]>`,
+    /// you can use [Bytes::from_owner] to free the borrowed bytes back to the pool.
+    fn flush(&mut self) -> Option<(Bytes, bool)>;
 }

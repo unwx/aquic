@@ -5,3 +5,7 @@ members = [
     "aquic",
     "aquic-macros",
 ]
+
+[workspace.lints.clippy]
+collapsible_if = "allow"
+large_futures = "warn"

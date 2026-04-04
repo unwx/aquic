@@ -1,135 +1,130 @@
-use crate::backend::Result;
-use crate::backend::cid::ConnectionIdGenerator;
-use crate::backend::quinn::connection::{Connection, Connections};
+use crate::backend::quinn::connection::{
+    Connection, ConnectionKey, Connections, QuinnConnectionId,
+};
 use crate::backend::quinn::io::{IO, VecBuf};
-use crate::backend::quinn::shared::{SyncConnectionIdGenerator, u64_into_varint};
-use crate::backend::quinn::time::{Time, TimeoutEvent};
+use crate::backend::quinn::time::{Time, TimerEvent};
 use crate::backend::{BackendEvents, ConnectionEvent, DatagramEvent, StreamEvent};
 use crate::backend::{Error, QuicBackend};
-use crate::core::ConstBuf;
-use crate::net::{Buf, MAX_PACKET_SIZE, RecvMsg, SendMsg, ServerName, SoFeat};
-use crate::stream::{Chunk, Priority, StreamId};
+use crate::backend::{Event, HaltKind, Result};
+use crate::debug_panic;
+use crate::net::{BufMut, MultiMsgFlattenIter, SendMsg, ServerName, SoFeat};
+use crate::stream::{Priority, StreamId};
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
-    ClientConfig, ConnectError, ConnectionError, Dir, Endpoint, Event, FinishError, IdleTimeout,
-    ReadError, ReadableError, SendDatagramError, ServerConfig, Transmit, TransportConfig,
-    WriteError,
+    ConnectionError, Dir, Endpoint, FinishError, Incoming, ReadError, ReadableError,
+    SendDatagramError, VarInt, WriteError,
 };
-use rustc_hash::{FxBuildHasher, FxHashSet};
 use rustls::pki_types::CertificateDer;
 use std::any::type_name;
 use std::collections::HashSet;
-use std::marker::PhantomData;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::warn;
+use tracing::error;
 
+use quinn_proto::ConnectionEvent as QuinnConnectionEvent;
+use quinn_proto::DatagramEvent as QuinnDatagramEvent;
+use quinn_proto::Event as QuinnEvent;
+use quinn_proto::StreamEvent as QuinnStreamEvent;
 
+mod cid;
 mod config;
 mod connection;
 mod io;
 mod shared;
 mod time;
 
+pub use cid::*;
 pub use config::*;
 
-
-pub type QuinnConnectionId = quinn_proto::ConnectionHandle;
-type QuinnConnection = quinn_proto::Connection;
-type QuinnConnectionEvent = quinn_proto::ConnectionEvent;
-type QuinnStreamEvent = quinn_proto::StreamEvent;
-
-
-/// The `quinn-proto` QUIC backend provider.
+/// The `quinn-proto` QUIC implementation provider.
 ///
 /// [Quinn Project](https://github.com/quinn-rs/quinn)
-pub struct QuinnBackend<CIdGen> {
-    /// All quinn-related fields.
-    quinn: Quinn,
+///
+/// # Privacy Warning
+///
+/// This backend violates one of the [`QuicBackend::migrate_network`] requirements:
+/// > **It is forbidden** to perform an active migration using old connection IDs.
+///
+/// **Active migration** is not strictly implemented in the `quinn-proto` implementation:
+/// if there is no spare server destination ID, `quinn-proto` will ignore that,
+/// leading to an external observer being able to correlate new and old connection IDs, and thus track the connection across migrations:
+/// [quinn-proto/0.11.14](https://docs.rs/quinn-proto/0.11.14/src/quinn_proto/connection/mod.rs.html#3093-3096).
+pub struct QuinnBackend {
+    /// Client/Server configuration.
+    config: InnerConfig,
 
-    /// All connections-related fields.
+    /// `quinn-proto` endpoint.
+    endpoint: Endpoint,
+
+    /// Everything related to connections.
     connections: Connections,
 
-    /// All I/O-related fields.
+    /// Everything related to I/O.
     io: IO,
 
-    /// All time/clock-related fields.
+    /// Everything related to time & scheduling.
     time: Time,
 
     /// Events produced by this backend.
     events: BackendEvents<QuinnConnectionId>,
 
-    /// Socket's bind address.
-    socket_addr: SocketAddr,
-
-    /// Is backend open or not.
+    /// Whether backend is open or not.
     open: bool,
-
-    _phantom: PhantomData<CIdGen>,
 }
 
 
-impl<CIdGen> QuicBackend for QuinnBackend<CIdGen>
-where
-    CIdGen: ConnectionIdGenerator + 'static,
-{
+impl QuicBackend for QuinnBackend {
     type Config = Config;
     type StableConnectionId = QuinnConnectionId;
-    type ConnectionIdGenerator = CIdGen;
     type OutBuf = VecBuf;
 
-    fn new(
-        mut config: Self::Config,
-        connection_id_generator: Self::ConnectionIdGenerator,
-        socket_addr: SocketAddr,
-        socket_features: &HashSet<SoFeat>,
-    ) -> Self {
-        config.validate();
-
-        {
-            let cid_gen = SyncConnectionIdGenerator::new(
-                connection_id_generator,
-                config.connection_id_lifetime,
-            );
-            config
-                .endpoint
-                .cid_generator(move || Box::new(cid_gen.clone()));
-        }
+    fn new(mut config: Config, listen_addr: IpAddr, socket_features: &HashSet<SoFeat>) -> Self {
+        config.fix();
 
         let connections = Connections::new();
         let events = BackendEvents::new();
-        let io = IO::new(&config, socket_features.contains(&SoFeat::Mmsg));
-        let time = Time::new(&config);
-        let quinn = Quinn::new(config, socket_features);
+        let io = IO::new(&config, listen_addr, socket_features);
+        let time = Time::new();
+
+        let endpoint_config = config.endpoint;
+        let config = InnerConfig {
+            client: config.client.map(|it| it.config),
+            server: config.server.map(|it| Arc::new(it.config)),
+        };
+        let endpoint = Endpoint::new(
+            Arc::new(endpoint_config),
+            config.server.clone(),
+            socket_features.contains(&SoFeat::DontFragment),
+            None,
+        );
 
         Self {
-            quinn,
+            config,
+            endpoint,
             connections,
             io,
             time,
             events,
-            socket_addr,
             open: true,
-            _phantom: PhantomData,
         }
     }
 
-    fn tick(&mut self, now: Instant) {
-        self.time.clock = now;
+    fn clock_update(&mut self) {
+        self.time.update_clock();
     }
 
-    fn events(&mut self) -> &mut BackendEvents<Self::StableConnectionId> {
+    fn events(&mut self) -> &mut BackendEvents<QuinnConnectionId> {
         &mut self.events
     }
 
 
-    fn prepare_to_shutdown(&mut self, _deadline: Instant) {
+    fn close_prepare(&mut self, _deadline: Instant) {
         // We don't have anything to do.
     }
 
-    fn ready_to_shutdown(&mut self) -> bool {
-        self.connections.all.is_empty()
+    fn close_ready(&self) -> bool {
+        self.endpoint.open_connections() == 0
     }
 
     fn close(&mut self, err: u64, reason: Bytes) {
@@ -139,9 +134,8 @@ where
 
         self.open = false;
 
-        for (connection_id, connection) in self.connections.all.iter_mut() {
-            connection.close(self.time.clock, u64_into_varint(err), reason.clone());
-            self.connections.modified.insert(*connection_id);
+        for (_, connection) in self.connections.all_iter_mark_active() {
+            connection.close(self.time.now(), u64_into_varint(err), reason.clone());
         }
     }
 
@@ -154,291 +148,141 @@ where
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(client_config) = self.quinn.client_config.clone() else {
+        let Some(client_config) = self.config.client.clone() else {
             return Err(Error::Illegal);
         };
 
-        let (connection_id, connection) = self
-            .quinn
+        let (quinn_connection_key, quinn_connection) = self
             .endpoint
             .connect(
-                self.time.clock,
+                self.time.now(),
                 client_config,
                 peer_addr,
                 server_name.to_string().as_str(),
             )
-            .map_err(|e| match e {
-                ConnectError::EndpointStopping => Error::Closed,
-                other => Error::Other(other.to_string().into()),
-            })?;
+            .map_err(|e| Error::Other(e.to_string().into()))?;
 
-        Self::register_connection(
-            connection_id,
-            connection,
-            &mut self.connections,
-            &mut self.time,
-        );
+        let connection_id = self.register_new_connection(quinn_connection_key, quinn_connection);
         Ok(connection_id)
     }
 
+    #[rustfmt::skip]
     fn connection_close(
         &mut self,
-        connection_id: &Self::StableConnectionId,
+        connection_id: &QuinnConnectionId,
         err: u64,
         reason: Bytes,
     ) -> Result<()> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
             return Err(Error::UnknownConnection);
         };
 
-        connection.close(self.time.clock, u64_into_varint(err), reason);
-        self.connections.modified.insert(*connection_id);
+        connection.close(self.time.now(), u64_into_varint(err), reason.clone());
+
+        if let Some(event) = connection.get_close_event(
+            connection_id.key,
+            err,
+            reason,
+            true,
+            true
+        ) {
+            self.events.push(event);
+        }
 
         Ok(())
     }
 
 
-    fn send_prepare(&mut self, messages: &mut Vec<SendMsg<Self::OutBuf>>) -> Result<()> {
-        messages.append(&mut self.io.pending);
+    fn send(&mut self, out: &mut Vec<SendMsg<VecBuf>>) {
+        self.handle_scheduled_events();
 
-        if !self.io.has_primary_buffer() {
-            return Ok(());
-        }
-
-        while let Some(connection_id) = self.connections.modified.pop() {
+        while let Some((connection_id, connection)) = self.connections.peek_active() {
             if !self.io.has_primary_buffer() {
-                return Ok(());
+                break;
             }
 
-            let Some(connection) = self.connections.all.get_mut(&connection_id) else {
-                continue;
-            };
             if connection.is_drained() {
-                self.connections.all.remove(&connection_id);
+                self.forget_connection(connection_id);
+                self.connections.next_active();
                 continue;
             }
 
-            let buffer = self.io.peek_buffer();
-            let max_datagrams = MAX_PACKET_SIZE / (connection.current_mtu() as usize);
-
-            if let Some(transmit) = connection.poll_transmit(self.time.clock, max_datagrams, buffer)
-            {
-                let buffer = self.io.pop_buffer();
-                messages.push(Self::make_send_msg(transmit, buffer, self.socket_addr));
+            if !self.io.write_pending(connection, out, self.time.now()) {
+                break;
             }
 
-            Self::schedule_connection_timeout(connection_id, connection, &mut self.time);
-            Self::check_max_dgram_size_update(connection_id, connection, &mut self.events, false);
+            self.connections.next_active();
+            self.schedule_quinn_timeout(connection_id, None);
         }
-
-        Ok(())
     }
 
+    fn recv<B: BufMut>(
+        &mut self,
+        in_packets: &mut MultiMsgFlattenIter<B>,
+        out_messages: &mut Vec<SendMsg<Self::OutBuf>>,
+    ) {
+        while let Some(packet) = in_packets.peek() {
+            let Some(mut buffer) = self.io.pop_reserved_buffer() else {
+                break;
+            };
 
-    fn send_done<I: IntoIterator<Item = Self::OutBuf>>(&mut self, buffers: I) {
-        self.io.buffers.extend(buffers.into_iter().map(|mut buf| {
-            buf.clear();
-            buf
-        }));
-    }
-
-    #[allow(clippy::explicit_counter_loop)]
-    fn recv(&mut self, messages: &mut [RecvMsg<ConstBuf<MAX_PACKET_SIZE>>]) -> Result<usize> {
-        use quinn_proto::DatagramEvent;
-
-        if !self.io.has_any_buffer() {
-            return Ok(0);
-        }
-
-        let mut processed = 0;
-        for message in messages.iter_mut() {
-            if !self.io.has_any_buffer() {
-                return Ok(processed);
+            if let Some(event) = self.endpoint.handle(
+                self.time.now(),
+                packet.from,
+                Some(packet.to),
+                packet.ecn.into(),
+                BytesMut::from(packet.as_ref()),
+                &mut buffer,
+            ) {
+                buffer.clear();
+                self.handle_quinn_datagram_event(event, buffer, out_messages);
             }
 
-            processed += 1;
-            let buffer = self.io.peek_buffer();
-
-            let Some(event) = self.quinn.endpoint.handle(
-                self.time.clock,
-                message.from(),
-                Some(message.to()),
-                message.ecn().into(),
-                BytesMut::from(&message.read_slice()[..]),
-                buffer,
-            ) else {
-                continue;
-            };
-
-            match event {
-                DatagramEvent::ConnectionEvent(id, event) => {
-                    Self::handle_connection_event(
-                        id,
-                        event,
-                        &mut self.connections,
-                        &mut self.quinn,
-                        &mut self.time,
-                        &mut self.events,
-                    );
-                }
-
-                DatagramEvent::Response(transmit) => {
-                    Self::queue_send_msg(transmit, self.socket_addr, &mut self.io);
-                }
-
-                DatagramEvent::NewConnection(incoming) => {
-                    let Some(server_config) = self.quinn.server_config.clone() else {
-                        self.quinn.endpoint.ignore(incoming);
-                        continue;
-                    };
-
-                    if !incoming.remote_address_validated() {
-                        match self.quinn.endpoint.retry(incoming, buffer) {
-                            Ok(transmit) => {
-                                Self::queue_send_msg(transmit, self.socket_addr, &mut self.io);
-                                continue;
-                            }
-
-                            Err(it) => {
-                                // This should never happen, because if `incoming.remote_address_validated()` is false,
-                                // then `endpoint.retry()` must always return true.
-
-                                if cfg!(debug_assertions) {
-                                    panic!(
-                                        "unable to craft a 'retry' frame for an incoming connection"
-                                    );
-                                }
-
-                                let incoming = it.into_incoming();
-
-                                warn!(
-                                    "unable to craft a 'retry' frame for an incoming connection \
-                                    [remote_address: {}, original_source_id: {}]: is this a bug?; connection is dropped",
-                                    incoming.remote_address(),
-                                    incoming.orig_dst_cid()
-                                );
-
-                                self.quinn.endpoint.ignore(incoming);
-                                continue;
-                            }
-                        }
-                    }
-
-                    match self.quinn.endpoint.accept(
-                        incoming,
-                        self.time.clock,
-                        buffer,
-                        Some(server_config),
-                    ) {
-                        Ok((connection_id, connection)) => {
-                            Self::register_connection(
-                                connection_id,
-                                connection,
-                                &mut self.connections,
-                                &mut self.time,
-                            );
-
-                            let outgoing_event = ConnectionEvent::Created(connection_id);
-                            self.events.push_connection(outgoing_event);
-                        }
-                        Err(e) => {
-                            if let Some(transmit) = e.response {
-                                Self::queue_send_msg(transmit, self.socket_addr, &mut self.io);
-                            }
-
-                            match e.cause {
-                                ConnectionError::CidsExhausted => {
-                                    warn!(
-                                        "unable to accept new server connection: \
-                                        not enough of connection ID space is available, \
-                                        try using longer connection IDs"
-                                    );
-                                }
-
-                                ConnectionError::VersionMismatch
-                                | ConnectionError::TransportError(_)
-                                | ConnectionError::ConnectionClosed(_)
-                                | ConnectionError::ApplicationClosed(_)
-                                | ConnectionError::Reset
-                                | ConnectionError::TimedOut
-                                | ConnectionError::LocallyClosed => {
-                                    // Noise, do nothing.
-                                }
-                            }
-                        }
-                    };
-                }
-            };
+            in_packets.next();
         }
-
-        Ok(messages.len())
     }
 
 
     async fn sleep(&mut self) {
-        self.time
-            .timer
-            .next(
-                &mut self.time.fired_events,
-                self.time.clock,
-                &mut self.time.timer_next_tick_time,
-            )
-            .await;
-    }
-
-    fn on_alarm(&mut self) -> Result<()> {
-        if !self.open {
-            self.time.fired_events.clear();
-            return Err(Error::Closed);
-        }
-
-        while let Some(event) = self.time.fired_events.pop() {
-            let connection_id = event.0;
-
-            let Some(connection) = self.connections.all.get_mut(&connection_id) else {
-                continue;
-            };
-
-            connection.handle_timeout(self.time.clock);
-            self.connections.modified.insert(connection_id);
-        }
-
-        Ok(())
+        self.time.sleep().await;
     }
 
 
-    fn local_address_changed(&mut self, _address: SocketAddr) -> Result<()> {
+    fn migrate_network(&mut self, new_listen_addr: Option<IpAddr>) -> Result<()> {
         if !self.open {
             return Err(Error::Closed);
         }
+        if let Some(new_listen_addr) = new_listen_addr {
+            if new_listen_addr.is_unspecified() {
+                return Err(Error::Illegal);
+            }
 
-        for (connection_id, connection) in &mut self.connections.all {
+            self.io.update_socket_addr(new_listen_addr);
+        }
+
+        for (connection_id, connection) in &mut self.connections.all_iter_mark_active() {
             connection.local_address_changed();
-            connection.path_changed(self.time.clock);
+            connection.path_changed(self.time.now());
 
-            let max_dgram_size = Self::max_dgram_size(connection);
-            if connection.last_max_dgram_size != max_dgram_size {
-                connection.last_max_dgram_size = max_dgram_size;
-
-                let outgoing_event = DatagramEvent::OutMaxLen(*connection_id, max_dgram_size);
-                self.events.push_datagram(outgoing_event);
+            if let Some(event) = connection.get_dgram_out_size_event(connection_id.key) {
+                self.events.push(event);
             }
         }
 
         Ok(())
     }
 
-    fn peer_cert_chain(
-        &mut self,
-        connection_id: &Self::StableConnectionId,
-    ) -> Result<Vec<Vec<u8>>> {
+    fn peer_cert_chain(&mut self, connection_id: &QuinnConnectionId) -> Result<Vec<Vec<u8>>> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get(connection_id) else {
+        let Some(connection) = self.connections.get(*connection_id) else {
             return Err(Error::UnknownConnection);
         };
         let Some(identity) = connection.crypto_session().peer_identity() else {
@@ -462,183 +306,210 @@ where
     }
 
 
-    fn stream_open(
+    fn stream_recv(
         &mut self,
-        connection_id: &Self::StableConnectionId,
-        bidirectional: bool,
-    ) -> Result<StreamId> {
+        connection_id: &QuinnConnectionId,
+        stream_id: StreamId,
+        out: &mut [u8],
+    ) -> Result<(usize, bool)> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        if stream_id.is_client() && stream_id.is_uni() {
+            return Err(Error::Illegal);
+        }
+        if out.is_empty() {
+            return Err(Error::BufferSize);
+        }
+
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
             return Err(Error::UnknownConnection);
         };
+
+        let mut stream = connection.recv_stream(stream_id.into());
+        let mut chunks = stream.read(true).map_err(|e| match &e {
+            ReadableError::ClosedStream => Error::UnknownStream,
+
+            // This should never happen.
+            ReadableError::IllegalOrderedRead => {
+                error!(
+                    connection_id = %connection_id,
+                    stream_id = %stream_id,
+                    "unable to read from stream: Quinn returned an unexpected error: {e}"
+                );
+                debug_panic!("unable to read from stream, see logs above");
+                Error::Other(e.to_string().into())
+            }
+        })?;
+
+        let mut offset = 0;
+
+        while offset < out.len() {
+            match chunks.next(out.len() - offset) {
+                Ok(Some(chunk)) => {
+                    out[offset..chunk.bytes.len()].copy_from_slice(chunk.bytes.as_ref());
+                    offset += chunk.bytes.len();
+                }
+
+                Ok(None) => {
+                    return Ok((offset, true));
+                }
+                Err(ReadError::Blocked) => {
+                    return Ok((offset, false));
+                }
+                Err(ReadError::Reset(err)) => {
+                    return Err(Error::StreamReset(err.into_inner()));
+                }
+            };
+        }
+
+        Ok((offset, false))
+    }
+
+    fn stream_open_send(
+        &mut self,
+        connection_id: &QuinnConnectionId,
+        bidirectional: bool,
+        bytes: Bytes,
+        fin: bool,
+    ) -> Result<(StreamId, Option<Bytes>)> {
+        if !self.open {
+            return Err(Error::Closed);
+        }
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
+            return Err(Error::UnknownConnection);
+        };
+
+        use quinn_proto::Dir;
 
         let direction = if bidirectional { Dir::Bi } else { Dir::Uni };
         let Some(stream_id) = connection.streams().open(direction).map(|id| id.into()) else {
             return Err(Error::StreamsExhausted);
         };
 
-        Ok(stream_id)
-    }
-
-    fn stream_recv(
-        &mut self,
-        connection_id: &Self::StableConnectionId,
-        stream_id: StreamId,
-        mut threshold: usize,
-        out: &mut Vec<Chunk>,
-    ) -> Result<bool> {
-        if !self.open {
-            return Err(Error::Closed);
-        }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
-            return Err(Error::UnknownConnection);
-        };
-
-        let ordered = !connection.unordered_streams.contains(&stream_id);
-
-        let mut stream = connection.recv_stream(u64_into_varint(stream_id).into());
-        let mut chunks = stream.read(ordered).map_err(|e| match e {
-            ReadableError::ClosedStream => Error::UnknownStream,
-
-            // This should never happen,
-            // as we only allow to make an ordered stream -> unordered,
-            ReadableError::IllegalOrderedRead => Error::Other(
-                format!(
-                    "unable to read from stream. \
-                    [connection_id: {:?}, stream_id: {}, error: {}]",
-                    connection_id, stream_id, e
-                )
-                .into(),
-            ),
-        })?;
-
-        let mut fin = false;
-        while threshold != 0 {
-            match chunks.next(threshold) {
-                Ok(Some(chunk)) => {
-                    threshold = threshold.saturating_sub(chunk.bytes.len());
-
-                    if ordered {
-                        out.push(Chunk::Ordered(chunk.bytes));
-                    } else {
-                        out.push(Chunk::Unordered(chunk.bytes, chunk.offset));
-                    }
-                }
-                Ok(None) => {
-                    fin = true;
-                    break;
-                }
-
-                Err(ReadError::Blocked) => {
-                    break;
-                }
-                Err(ReadError::Reset(err)) => {
-                    drop(chunks);
-                    connection.unordered_streams.remove(&stream_id);
-                    return Err(Error::StreamResetSending(err.into_inner()));
-                }
-            };
-        }
-
-        if fin {
-            drop(chunks);
-            connection.unordered_streams.remove(&stream_id);
-        }
-        if out.is_empty() && !fin {
-            return Err(Error::StreamFinish);
-        }
-
-        Ok(fin)
+        self.stream_send(connection_id, stream_id, bytes, fin)
+            .map(|unsent_bytes| (stream_id, unsent_bytes))
     }
 
     fn stream_send(
         &mut self,
-        connection_id: &Self::StableConnectionId,
+        connection_id: &QuinnConnectionId,
         stream_id: StreamId,
-        batch: &mut Vec<Bytes>,
+        bytes: Bytes,
         fin: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<Bytes>> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        if stream_id.is_server() && stream_id.is_uni() {
+            return Err(Error::Illegal);
+        }
+
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
             return Err(Error::UnknownConnection);
         };
 
-        let mut stream = connection.send_stream(u64_into_varint(stream_id).into());
-        while let Some(mut bytes) = batch.pop() {
-            match stream.write(bytes.as_ref()) {
-                Ok(write) => {
-                    if write == bytes.len() {
-                        continue;
-                    }
+        let mut stream = connection.send_stream(stream_id.into());
+        let mut chunks = [bytes];
+        let mut chunk_completely_written = false;
 
-                    batch.push(bytes.split_to(write));
-                    break;
+        if !chunks[0].is_empty() {
+            match stream.write_chunks(&mut chunks) {
+                Ok(written) => {
+                    debug_assert!(written.chunks <= 1);
+
+                    if written.chunks == 1 {
+                        chunk_completely_written = true;
+                    }
                 }
 
                 Err(WriteError::Blocked) => {
-                    break;
+                    // Do nothing.
+                }
+                Err(WriteError::Stopped(err)) => {
+                    return Err(Error::StreamStop(err.into_inner()));
                 }
                 Err(WriteError::ClosedStream) => {
                     return Err(Error::UnknownStream);
                 }
-                Err(WriteError::Stopped(err)) => {
-                    return Err(Error::StreamStopSending(err.into_inner()));
-                }
             };
+        } else {
+            chunk_completely_written = true;
         }
 
-        if fin && batch.is_empty() {
+        if fin && chunk_completely_written {
             match stream.finish() {
                 Ok(_) => {
                     // Do nothing, success.
                 }
+                Err(FinishError::Stopped(err)) => {
+                    return Err(Error::StreamStop(err.into_inner()));
+                }
                 Err(FinishError::ClosedStream) => {
                     return Err(Error::UnknownStream);
-                }
-                Err(FinishError::Stopped(err)) => {
-                    return Err(Error::StreamStopSending(err.into_inner()));
                 }
             }
         }
 
-        Ok(())
+        if chunk_completely_written {
+            Ok(None)
+        } else {
+            Ok(Some(std::mem::take(&mut chunks[0])))
+        }
     }
 
     fn stream_stop_sending(
         &mut self,
-        connection_id: &Self::StableConnectionId,
+        connection_id: &QuinnConnectionId,
         stream_id: StreamId,
         err: u64,
     ) {
         if !self.open {
             return;
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        if stream_id.is_client() && stream_id.is_uni() {
+            return;
+        }
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
             return;
         };
 
-        let mut stream = connection.recv_stream(u64_into_varint(stream_id).into());
+        let mut stream = connection.recv_stream(stream_id.into());
         let _ = stream.stop(u64_into_varint(err));
     }
 
     fn stream_reset_sending(
         &mut self,
-        connection_id: &Self::StableConnectionId,
+        connection_id: &QuinnConnectionId,
         stream_id: StreamId,
         err: u64,
     ) {
         if !self.open {
             return;
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        if stream_id.is_server() && stream_id.is_uni() {
+            return;
+        }
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
             return;
         };
 
-        let mut stream = connection.send_stream(u64_into_varint(stream_id).into());
+        let mut stream = connection.send_stream(stream_id.into());
         let _ = stream.reset(u64_into_varint(err));
     }
 
@@ -647,204 +518,214 @@ where
         connection_id: &Self::StableConnectionId,
         stream_id: StreamId,
         priority: Priority,
-    ) -> Result<()> {
-        // Only [Priority::urgency] is used, where
-        // [Priority::urgency] `zero` means default priority.
-
+    ) {
         if !self.open {
-            return Err(Error::Closed);
+            return;
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
-            return Err(Error::UnknownConnection);
+        if stream_id.is_server() && stream_id.is_uni() {
+            return;
+        }
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
+            return;
         };
 
-        let mut stream = connection.send_stream(u64_into_varint(stream_id).into());
-        if stream.set_priority(priority.urgency as i32).is_err() {
-            return Err(Error::UnknownStream);
-        }
-
-        Ok(())
-    }
-
-    fn stream_set_unordered(
-        &mut self,
-        connection_id: &Self::StableConnectionId,
-        stream_id: StreamId,
-    ) -> Result<()> {
-        if !self.open {
-            return Err(Error::Closed);
-        }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
-            return Err(Error::UnknownConnection);
-        };
-
-        if connection.unordered_streams.contains(&stream_id) {
-            return Ok(());
-        }
-
-        let mut stream = connection.recv_stream(u64_into_varint(stream_id).into());
-        if let Err(e) = stream.read(true) {
-            match e {
-                ReadableError::ClosedStream => {
-                    return Err(Error::UnknownStream);
-                }
-                ReadableError::IllegalOrderedRead => {
-                    // Do nothing, though this should never happen...
-                }
-            }
-        }
-
-        connection.unordered_streams.insert(stream_id);
-        Ok(())
+        let mut stream = connection.send_stream(stream_id.into());
+        let _ = stream.set_priority(priority.urgency as i32);
     }
 
 
-    fn dgram_recv(
-        &mut self,
-        connection_id: &Self::StableConnectionId,
-        out: &mut Vec<Bytes>,
-        threshold: usize,
-    ) -> Result<usize> {
+    fn dgram_recv(&mut self, connection_id: &QuinnConnectionId, out: &mut [u8]) -> Result<usize> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        let Some(connection) = self.connections.get_mut(*connection_id) else {
             return Err(Error::UnknownConnection);
         };
 
         let mut datagrams = connection.datagrams();
-        let mut received = 0;
+        let Some(datagram) = datagrams.recv() else {
+            return Ok(0);
+        };
 
-        while received < threshold {
-            let Some(bytes) = datagrams.recv() else {
-                break;
-            };
-
-            received += bytes.len();
-            out.push(bytes);
+        let length = datagram.len();
+        if length > out.len() {
+            return Err(Error::BufferSize);
         }
 
-        Ok(received)
+        out[..length].copy_from_slice(datagram.as_ref());
+        Ok(length)
+    }
+
+    fn dgram_recv_zc<F, R>(
+        &mut self,
+        connection_id: &QuinnConnectionId,
+        consumer: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        if !self.open {
+            return Err(Error::Closed);
+        }
+        let Some(connection) = self.connections.get_mut(*connection_id) else {
+            return Err(Error::UnknownConnection);
+        };
+
+        let mut datagrams = connection.datagrams();
+        match datagrams.recv() {
+            Some(datagram) => Ok(Some(consumer(datagram.as_ref()))),
+            None => Ok(None),
+        }
     }
 
     fn dgram_send(
         &mut self,
-        connection_id: &Self::StableConnectionId,
-        batch: &mut Vec<Bytes>,
-    ) -> Result<()> {
+        connection_id: &QuinnConnectionId,
+        bytes: Bytes,
+    ) -> Result<Option<Bytes>> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        let Some(connection) = self
+            .connections
+            .get_mark_active_if(*connection_id, is_connection_open)
+        else {
             return Err(Error::UnknownConnection);
         };
 
-        let drop_unsent = connection.drop_unsent_datagrams;
-        let mut too_large_dgrams = false;
-
-        while let Some(bytes) = batch.pop() {
-            if let Err(e) = connection.datagrams().send(bytes, drop_unsent) {
-                match e {
-                    SendDatagramError::UnsupportedByPeer => {
-                        return Err(Error::DgramDirectionDisabled);
-                    }
-                    SendDatagramError::Disabled => {
-                        return Err(Error::DgramDisabled);
-                    }
-                    SendDatagramError::TooLarge => {
-                        too_large_dgrams = true;
-                        continue;
-                    }
-                    SendDatagramError::Blocked(bytes) => {
-                        batch.push(bytes);
-                        break;
-                    }
+        if let Err(e) = connection.datagrams().send(bytes, false) {
+            return match e {
+                SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled => {
+                    Err(Error::DgramDisabled)
                 }
-            }
+                SendDatagramError::TooLarge => Err(Error::BufferSize),
+                SendDatagramError::Blocked(bytes) => Ok(Some(bytes)),
+            };
         }
 
-        if drop_unsent {
-            batch.clear();
-        }
-        if too_large_dgrams {
-            Self::check_max_dgram_size_update(*connection_id, connection, &mut self.events, true);
-        }
-
-        Ok(())
+        Ok(None)
     }
 
-    fn dgram_set_drop_unsent(&mut self, connection_id: &Self::StableConnectionId) -> Result<()> {
+    fn dgram_send_max_size(&mut self, connection_id: &QuinnConnectionId) -> Result<usize> {
         if !self.open {
             return Err(Error::Closed);
         }
-        let Some(connection) = self.connections.all.get_mut(connection_id) else {
+        let Some(connection) = self
+            .connections
+            .get_mut(*connection_id)
+            .filter(|it| is_connection_open(it))
+        else {
             return Err(Error::UnknownConnection);
         };
 
-        connection.drop_unsent_datagrams = true;
-        Ok(())
+        Ok(connection.datagrams().max_size().unwrap_or(0))
     }
 }
 
-impl<CidGen> QuinnBackend<CidGen> {
-    fn register_connection(
-        connection_id: QuinnConnectionId,
-        connection: QuinnConnection,
-        connections: &mut Connections,
-        time: &mut Time,
-    ) {
-        let mut internal_connection = {
-            let mtu = connection.current_mtu();
+impl QuinnBackend {
+    /// Registers a new, unestablished connection.
+    ///
+    /// Schedules connection events,
+    /// that are available on this moment.
+    ///
+    /// Accepts `establish_timeout_at` to schedule an establishment timeout,
+    /// or `None` to use config's default.
+    ///
+    /// Returns a unique assigned ID for this connection,
+    /// that will never change and should be used to get this connection next time.
+    fn register_new_connection(
+        &mut self,
+        connection_key: ConnectionKey,
+        connection: quinn_proto::Connection,
+    ) -> QuinnConnectionId {
+        let is_server = connection.side().is_server();
+        let connection_id = self.connections.insert_raw(connection_key, connection);
 
-            Connection {
-                inner: connection,
-                timer_key: None,
-                unordered_streams: FxHashSet::with_hasher(FxBuildHasher),
-                drop_unsent_datagrams: false,
-                last_pmtu: mtu,
-                last_max_dgram_size: 0,
-            }
-        };
+        self.schedule_quinn_timeout(connection_id, None);
+        self.events.push(ConnectionEvent::New {
+            connection_id,
+            is_server,
+        });
 
-        Self::schedule_connection_timeout(connection_id, &mut internal_connection, time);
-        connections.all.insert(connection_id, internal_connection);
-        connections.modified.insert(connection_id);
+        connection_id
     }
 
-    fn make_send_msg(
-        transmit: Transmit,
-        buffer: VecBuf,
-        socket_addr: SocketAddr,
-    ) -> SendMsg<VecBuf> {
-        debug_assert_eq!(buffer.len(), transmit.size);
-
-        SendMsg::new(
-            buffer,
-            transmit.src_ip.unwrap_or(socket_addr.ip()),
-            transmit.destination,
-            transmit.ecn.into(),
-            transmit.segment_size.unwrap_or(0),
-        )
-    }
-
-    fn queue_send_msg(transmit: Transmit, socket_addr: SocketAddr, io: &mut IO) {
-        let buffer = io.pop_buffer();
-        let message = Self::make_send_msg(transmit, buffer, socket_addr);
-        io.pending.push(message);
-    }
-
-
-    fn handle_connection_event(
-        connection_id: QuinnConnectionId,
-        connection_event: QuinnConnectionEvent,
-        connections: &mut Connections,
-        quinn: &mut Quinn,
-        time: &mut Time,
-        out_events: &mut BackendEvents<QuinnConnectionId>,
-    ) {
-        let Some(connection) = connections.all.get_mut(&connection_id) else {
+    /// Forgets closed connection, clean ups its resources.
+    fn forget_connection(&mut self, connection_id: QuinnConnectionId) {
+        let Some(mut connection) = self.connections.remove(connection_id) else {
             return;
         };
+
+        if let Some(event) = connection.get_halt_event(
+            connection_id.key,
+            HaltKind::Error(Bytes::from_static(
+                b"close event should've been already produced",
+            )),
+        ) {
+            debug_panic!("no backend ConnectionEvent::Close/Halt was sent");
+            self.events.push(event);
+        }
+
+        self.time.cancel_all(&mut connection);
+    }
+
+
+    /*
+     * Handle an event.
+     */
+
+    /// Handles fired, previously scheduled events.
+    fn handle_scheduled_events(&mut self) {
+        while let Some(mut bucket) = self.time.fired_events().pop() {
+            while let Some(event) = bucket.pop() {
+                let Some(event) = event else {
+                    continue;
+                };
+
+                if let Some(connection) = self.connections.get_mark_active(event.0) {
+                    connection.handle_timeout(self.time.now())
+                }
+            }
+        }
+    }
+
+
+    /// Handles a [QuinnDatagramEvent] event.
+    ///
+    /// The provided `buffer` can be used to write a response datagram.
+    fn handle_quinn_datagram_event(
+        &mut self,
+        event: QuinnDatagramEvent,
+        buffer: VecBuf,
+        out: &mut Vec<SendMsg<VecBuf>>,
+    ) {
+        match event {
+            QuinnDatagramEvent::ConnectionEvent(id, event) => {
+                self.handle_quinn_connection_event(id, event);
+            }
+            QuinnDatagramEvent::Response(transmit) => {
+                self.io.write_response(transmit, buffer, out);
+            }
+            QuinnDatagramEvent::NewConnection(incoming) => {
+                self.handle_quinn_new_connection_event(incoming, buffer, out);
+            }
+        };
+    }
+
+    /// Handles a [QuinnConnectionEvent] event.
+    fn handle_quinn_connection_event(
+        &mut self,
+        connection_key: ConnectionKey,
+        connection_event: QuinnConnectionEvent,
+    ) {
+        let Some(connection) = self.connections.get_mark_active_raw(connection_key) else {
+            return;
+        };
+
+        let connection_id = connection.id(connection_key);
 
         {
             let mut next_connection_event = Some(connection_event);
@@ -852,241 +733,296 @@ impl<CidGen> QuinnBackend<CidGen> {
                 connection.handle_event(connection_event);
 
                 while let Some(endpoint_event) = connection.poll_endpoint_events() {
-                    if let Some(connection_event) =
-                        quinn.endpoint.handle_event(connection_id, endpoint_event)
+                    if let Some(connection_event) = self
+                        .endpoint
+                        .handle_event(connection_id.key, endpoint_event)
                     {
                         next_connection_event = Some(connection_event);
-                        break;
                     }
                 }
             }
         }
 
-        while let Some(event) = connection.poll() {
+
+        loop {
+            // Already marked as active, so no need to mark it again.
+            let Some(connection) = self.connections.get_mut(connection_id) else {
+                return;
+            };
+            let Some(event) = connection.poll() else {
+                break;
+            };
+
             match event {
-                Event::Connected => {
-                    let outgoing_event = ConnectionEvent::Active(connection_id);
-                    out_events.push_connection(outgoing_event);
+                QuinnEvent::Connected => {
+                    self.events
+                        .push(ConnectionEvent::Established(connection_id));
                 }
-                Event::HandshakeDataReady => {
-                    let outgoing_event = ConnectionEvent::HandshakeDataReady(connection_id);
-                    out_events.push_connection(outgoing_event);
-                }
-                Event::ConnectionLost { reason } => {
-                    let outgoing_event = match reason {
-                        ConnectionError::VersionMismatch => {
-                            Some(ConnectionEvent::ClosedVersionMismatch(connection_id))
-                        }
-                        ConnectionError::TransportError(error) => Some(ConnectionEvent::Closed {
-                            connection_id,
-                            code: error.code.into(),
-                            reason: error.reason.into(),
-                            is_transport: true,
-                            is_local: true,
-                        }),
-                        ConnectionError::ConnectionClosed(close) => Some(ConnectionEvent::Closed {
-                            connection_id,
-                            code: close.error_code.into(),
-                            reason: close.reason.clone(),
-                            is_transport: true,
-                            is_local: false,
-                        }),
-                        ConnectionError::ApplicationClosed(close) => {
-                            Some(ConnectionEvent::Closed {
-                                connection_id,
-                                code: close.error_code.into(),
-                                reason: close.reason.clone(),
-                                is_transport: false,
-                                is_local: false,
-                            })
-                        }
-                        ConnectionError::TimedOut => {
-                            Some(ConnectionEvent::ClosedTimeout(connection_id))
-                        }
-                        ConnectionError::Reset => Some(ConnectionEvent::ClosedUnknown {
-                            connection_id,
-                            reason: "connection reset".into(),
-                        }),
-                        ConnectionError::CidsExhausted => Some(ConnectionEvent::ClosedUnknown {
-                            connection_id,
-                            reason: "not enough CID space".into(),
-                        }),
-                        ConnectionError::LocallyClosed => None,
-                    };
-
-                    if let Some(event) = outgoing_event {
-                        out_events.push_connection(event);
-                    }
-                    if connection.is_drained() {
-                        connections.modified.swap_remove(&connection_id);
-                        connections.all.remove(&connection_id);
-                        return;
-                    }
+                QuinnEvent::ConnectionLost { reason } => {
+                    self.handle_quinn_connection_lost_event(connection_id, reason);
                 }
 
-                Event::Stream(stream_event) => {
-                    Self::handle_stream_event(connection_id, stream_event, connection, out_events);
+                QuinnEvent::Stream(stream_event) => {
+                    self.handle_quinn_stream_event(connection_id, stream_event);
+                }
+                QuinnEvent::DatagramReceived => {
+                    self.events.push(DatagramEvent::InAvailable(connection_id));
+                }
+                QuinnEvent::DatagramsUnblocked => {
+                    self.events.push(DatagramEvent::OutAvailable(connection_id));
                 }
 
-                Event::DatagramReceived => {
-                    out_events.push_datagram(DatagramEvent::InActive(connection_id));
-                }
-                Event::DatagramsUnblocked => {
-                    out_events.push_datagram(DatagramEvent::OutActive(connection_id));
-                }
+                QuinnEvent::HandshakeDataReady => {}
             }
         }
 
-        if !connection.is_drained() {
-            connections.modified.insert(connection_id);
-            Self::schedule_connection_timeout(connection_id, connection, time);
-            Self::check_max_dgram_size_update(connection_id, connection, out_events, false);
+
+        // Already marked as active, so no need to mark again.
+        let Some(connection) = self.connections.get_mut(connection_id) else {
+            return;
+        };
+
+        match connection.is_drained() {
+            true => {
+                self.forget_connection(connection_id);
+            }
+            false => {
+                if let Some(event) = connection.get_dgram_out_size_event(connection_id.key) {
+                    self.events.push(event);
+                }
+
+                self.schedule_quinn_timeout(connection_id, None);
+            }
         }
     }
 
-    fn handle_stream_event(
+    /// Handles a [Incoming] new connection event.
+    ///
+    /// The provided `buffer` can be used to write a response datagram, e.g., a retry packet.
+    fn handle_quinn_new_connection_event(
+        &mut self,
+        incoming: Incoming,
+        mut buffer: VecBuf,
+        out: &mut Vec<SendMsg<VecBuf>>,
+    ) {
+        let Some(server_config) = self.config.server.clone() else {
+            self.endpoint.ignore(incoming);
+            return;
+        };
+
+        if !incoming.remote_address_validated() {
+            match self.endpoint.retry(incoming, buffer.as_mut()) {
+                Ok(response) => {
+                    self.io.write_response(response, buffer, out);
+                }
+
+                Err(e) => {
+                    // This should never happen, because if `incoming.remote_address_validated()` is false,
+                    // then `endpoint.retry()` must always return Ok().
+
+                    let error = e.to_string();
+                    let incoming = e.into_incoming();
+
+                    error!(
+                        peer_addr = %incoming.remote_address(),
+                        original_dcid = %incoming.orig_dst_cid(),
+                        "unable to send a 'retry' packet for an incoming connection
+                        Quinn returned an unexpected error: {error}",
+                    );
+                    debug_panic!(
+                        "cannot send retry packet for an incoming connection, see log above"
+                    );
+
+                    self.endpoint.ignore(incoming);
+                }
+            }
+
+            return;
+        }
+
+        match self.endpoint.accept(
+            incoming,
+            self.time.now(),
+            buffer.as_mut(),
+            Some(server_config),
+        ) {
+            Ok((connection_key, connection)) => {
+                self.register_new_connection(connection_key, connection);
+            }
+            Err(e) => {
+                if let Some(response) = e.response {
+                    self.io.write_response(response, buffer, out);
+                }
+
+                match e.cause {
+                    ConnectionError::CidsExhausted => {
+                        error!(
+                            "unable to accept new server connection: \
+                            not enough of connection ID space is available, \
+                            try using longer connection IDs"
+                        );
+                    }
+
+                    ConnectionError::VersionMismatch
+                    | ConnectionError::TransportError(_)
+                    | ConnectionError::ConnectionClosed(_)
+                    | ConnectionError::ApplicationClosed(_)
+                    | ConnectionError::Reset
+                    | ConnectionError::TimedOut
+                    | ConnectionError::LocallyClosed => {
+                        // Noise, do nothing.
+                    }
+                }
+            }
+        };
+    }
+
+    /// Handles a Quinn connection lost event.
+    fn handle_quinn_connection_lost_event(
+        &mut self,
+        connection_id: QuinnConnectionId,
+        error: quinn_proto::ConnectionError,
+    ) {
+        let Some(connection) = self.connections.get_mark_active(connection_id) else {
+            return;
+        };
+
+        let backend_event = match error {
+            ConnectionError::VersionMismatch => {
+                connection.get_halt_event(connection_id.key, HaltKind::UnknownVersion)
+            }
+            ConnectionError::TransportError(close) => connection.get_close_event(
+                connection_id.key,
+                close.code.into(),
+                close.reason.into(),
+                false,
+                true,
+            ),
+            ConnectionError::ConnectionClosed(close) => connection.get_close_event(
+                connection_id.key,
+                close.error_code.into(),
+                close.reason,
+                false,
+                false,
+            ),
+            ConnectionError::ApplicationClosed(close) => connection.get_close_event(
+                connection_id.key,
+                close.error_code.into(),
+                close.reason,
+                true,
+                false,
+            ),
+            ConnectionError::TimedOut => {
+                connection.get_halt_event(connection_id.key, HaltKind::Timeout)
+            }
+            ConnectionError::Reset => {
+                connection.get_halt_event(connection_id.key, HaltKind::StatelessReset)
+            }
+            ConnectionError::CidsExhausted => {
+                error!(
+                    "connection is dropped: \
+                    not enough of connection ID space is available, \
+                    try using longer connection IDs"
+                );
+                connection.get_halt_event(
+                    connection_id.key,
+                    HaltKind::Error(Bytes::from_static(b"not enough CID space")),
+                )
+            }
+            ConnectionError::LocallyClosed => {
+                // The event should have already been sent on `connection_close()`.
+                None
+            }
+        };
+
+        if let Some(backend_event) = backend_event {
+            self.events.push(backend_event);
+        }
+        if connection.is_drained() {
+            self.forget_connection(connection_id);
+        }
+    }
+
+    /// Handles a [QuinnStreamEvent] event.
+    fn handle_quinn_stream_event(
+        &mut self,
         connection_id: QuinnConnectionId,
         stream_event: QuinnStreamEvent,
-        connection: &mut Connection,
-        out_events: &mut BackendEvents<QuinnConnectionId>,
     ) {
-        let outgoing_event = match stream_event {
+        let Some(connection) = self.connections.get_mark_active(connection_id) else {
+            return;
+        };
+
+        let backend_event = match stream_event {
             QuinnStreamEvent::Opened { dir } => {
                 let Some(stream_id) = connection.streams().accept(dir).map(StreamId::from) else {
                     return;
                 };
 
-                StreamEvent::Open {
+                Event::Stream(StreamEvent::Available(connection_id, stream_id))
+            }
+            QuinnStreamEvent::Available { dir } => {
+                Event::Connection(ConnectionEvent::StreamsAvailable {
                     connection_id,
-                    stream_id,
-                    bidirectional: matches!(dir, Dir::Bi),
-                }
+                    is_bidirectional: matches!(dir, Dir::Bi),
+                })
             }
-            QuinnStreamEvent::Available { dir } => StreamEvent::Available {
+
+            QuinnStreamEvent::Readable { id }
+            | QuinnStreamEvent::Writable { id }
+            | QuinnStreamEvent::Finished { id } => {
+                Event::Stream(StreamEvent::Available(connection_id, id.into()))
+            }
+            QuinnStreamEvent::Stopped { id, error_code } => Event::Stream(StreamEvent::Reset(
                 connection_id,
-                bidirectional: matches!(dir, Dir::Bi),
-            },
-
-            QuinnStreamEvent::Readable { id } => StreamEvent::InActive(connection_id, id.into()),
-            QuinnStreamEvent::Writable { id } => StreamEvent::OutActive(connection_id, id.into()),
-            QuinnStreamEvent::Stopped { id, error_code } => {
-                StreamEvent::InReset(connection_id, id.into(), error_code.into())
-            }
-
-            QuinnStreamEvent::Finished { .. } => {
-                return;
-            }
+                id.into(),
+                error_code.into_inner(),
+            )),
         };
 
-        out_events.push_stream(outgoing_event);
+        self.events.push(backend_event);
     }
 
 
-    fn schedule_connection_timeout(
+    /// Schedules an Quinn timeout event.
+    ///
+    /// If `timeout_at` is `None`, the default [quinn_proto::Connection::poll_timeout] will be used.
+    ///
+    /// [quinn_proto::Connection::handle_timeout] has to be invoked if the event fires.
+    fn schedule_quinn_timeout(
+        &mut self,
         connection_id: QuinnConnectionId,
-        connection: &mut Connection,
-        time: &mut Time,
+        timeout_at: Option<Instant>,
     ) {
-        if let Some(previous_key) = connection.timer_key {
-            time.timer.cancel(previous_key);
-        }
-
-        let Some(timeout) = connection.poll_timeout() else {
+        let Some(connection) = self.connections.get_mut(connection_id) else {
+            return;
+        };
+        let Some(timeout_at) = timeout_at.or_else(|| connection.poll_timeout()) else {
             return;
         };
 
-        // `self.clock` may be in the past, but will never be in the future.
-        //
-        // The clock skew duration (actual_time - self.clock)
-        // is an additional time we **may** wait until this `TimeoutEvent` fires.
-        // But the event won't fire before the desired `timeout`.
-        //
-        // In most cases `self.clock` should be almost identical to `Instant::now()`,
-        // therefore the lag should not exceed a few ms.
-        let key = time
-            .timer
-            .schedule_at(TimeoutEvent(connection_id), time.clock, timeout);
-        connection.timer_key = Some(key);
-    }
-
-    fn check_max_dgram_size_update(
-        connection_id: QuinnConnectionId,
-        connection: &mut Connection,
-        out_events: &mut BackendEvents<QuinnConnectionId>,
-        force: bool,
-    ) {
-        let current_mtu = connection.current_mtu();
-        if current_mtu == connection.last_pmtu && !force {
-            return;
-        }
-
-        connection.last_pmtu = current_mtu;
-        let max_dgram_size = Self::max_dgram_size(connection);
-
-        if max_dgram_size == connection.last_max_dgram_size && !force {
-            return;
-        }
-
-        let event = DatagramEvent::OutMaxLen(connection_id, max_dgram_size);
-        connection.last_max_dgram_size = max_dgram_size;
-        out_events.push_datagram(event);
-    }
-
-    fn max_dgram_size(connection: &mut Connection) -> u16 {
-        let as_usize = connection.datagrams().max_size().unwrap_or(0);
-        u16::try_from(as_usize).unwrap_or(u16::MAX)
-    }
-}
-
-struct Quinn {
-    /// `quinn-proto` API.
-    endpoint: Endpoint,
-
-    /// Server configuration, or `None` to reject all server connection attempts.
-    server_config: Option<Arc<ServerConfig>>,
-
-    /// Client configuration, or `None` to reject all client connection attempts.
-    client_config: Option<ClientConfig>,
-}
-
-impl Quinn {
-    pub fn new(mut config: Config, socket_features: &HashSet<SoFeat>) -> Self {
-        let setup_transport = |mut transport: TransportConfig| -> Arc<TransportConfig> {
-            if socket_features.contains(&SoFeat::GenericSegOffload) {
-                transport.enable_segmentation_offload(true);
-            }
-
-            transport.max_idle_timeout(Some(
-                IdleTimeout::try_from(config.max_idle_timeout)
-                    .expect("provided `conn_max_timeout` is too long"),
-            ));
-
-            Arc::new(transport)
-        };
-
-        if let Some(client) = &mut config.client {
-            let transport = setup_transport(config.client_transport.unwrap_or_default());
-            client.transport_config(transport);
-        }
-        if let Some(server) = &mut config.server {
-            let transport = setup_transport(config.server_transport.unwrap_or_default());
-            server.transport_config(transport);
-        }
-
-        let endpoint_config = Arc::new(config.endpoint);
-        let server_config = config.server.map(Arc::new);
-        let client_config = config.client;
-        let endpoint = Endpoint::new(
-            endpoint_config,
-            None,
-            socket_features.contains(&SoFeat::DontFragment),
-            None,
+        let key = self.time.reschedule(
+            TimerEvent(connection_id),
+            timeout_at,
+            connection.pop_timer_key(),
         );
-
-        Self {
-            endpoint,
-            client_config,
-            server_config,
-        }
+        connection.set_timer_key(Some(key));
     }
+}
+
+
+struct InnerConfig {
+    client: Option<quinn_proto::ClientConfig>,
+    server: Option<Arc<quinn_proto::ServerConfig>>,
+}
+
+
+fn is_connection_open(connection: &Connection) -> bool {
+    !connection.is_closed() && !connection.is_drained()
+}
+
+fn u64_into_varint(value: u64) -> VarInt {
+    VarInt::from_u64(value).unwrap_or_else(|e| {
+        panic!("unable to convert `u64` ({value}) into quinn_proto::VarInt: {e}");
+    })
 }

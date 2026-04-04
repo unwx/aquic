@@ -1,51 +1,59 @@
+#![deny(rustdoc::broken_intra_doc_links)]
+
 use crate::backend::QuicBackend;
 use crate::exec::{SendOnMt, SyncOnMt};
 use crate::net::{SoFeat, Socket};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::io;
-use std::net::SocketAddr;
-
+use std::net::{IpAddr, SocketAddr};
 
 pub mod backend;
 pub mod dgram;
 pub mod net;
 pub mod stream;
 pub mod sync;
+pub mod util;
 
 mod core;
 mod exec;
 mod tracing;
 
-/// Custom application error.
+/// Custom application stream-level error code,
+/// that is used for `RESET_STREAM` and `STOP_SENDING` frames.
 ///
-/// Application protocol error codes are used for
-/// the `RESET_STREAM` frame,
-/// the `STOP_SENDING` frame, and
-/// the `CONNECTION_CLOSE` frame.
-///
-/// Make sure its `u64` representation is in range of `[0..2^62]`,
-/// as higher values might lead to panics ([quinn_proto::VarInt::MAX]).
+/// `u64` value of the code must not exceed `2^62 - 1` (inclusive),
 ///
 /// More: [20.2. Application Protocol Error Codes](https://datatracker.ietf.org/doc/html/rfc9000#name-application-protocol-error-)
 #[rustfmt::skip]
-pub trait Error:
+pub trait StreamCode:
+    std::error::Error +
+    Send + Sync + 'static +
+    Copy + Eq + Hash +
+    From<u64> + Into<u64>
+{}
+
+/// Custom application connection-level error code,
+/// that is used for a `CONNECTION_CLOSE` frame.
+///
+/// `u64` value of the code must not exceed `2^62 - 1` (inclusive),
+///
+/// More: [20.2. Application Protocol Error Codes](https://datatracker.ietf.org/doc/html/rfc9000#name-application-protocol-error-)
+#[rustfmt::skip]
+pub trait ConnectionCode:
     std::error::Error +
     Send + Sync + 'static +
     Copy + Eq + Hash +
     From<u64> + Into<u64>
 {
-    /// Additional diagnostic information for the **connection** closure.
+    /// Additional diagnostic information for the connection closure.
     /// This can be zero length if the sender chooses not to give details beyond the Error Code value.
     ///
     /// This **should** be a UTF-8 encoded string,
     /// though the frame does not carry information,
     /// such as language tags,
     /// that would aid comprehension by any entity other than the one that created the text.
-    ///
-    /// Note: This reason is only transmitted in `CONNECTION_CLOSE` frames,
-    /// and also may be truncated in some circumstances.
     ///
     /// More: [19.19. CONNECTION_CLOSE Frames, Reason Phrase](https://datatracker.ietf.org/doc/html/rfc9000#name-connection_close-frames)
     fn reason(self) -> Bytes;
@@ -61,8 +69,13 @@ pub trait Spec: SendOnMt + SyncOnMt + 'static {
     /// Datagram extension communication primitive: an item to be decoded and encoded, sent and received.
     type DgramItem: Estimate + SendOnMt + Unpin + 'static;
 
-    /// Custom application error.
-    type Error: Error;
+    /// Stream error code.
+    type StreamCode: StreamCode;
+
+    /// Connection error code.
+    type ConnectionCode: ConnectionCode;
+
+    // TODO(feat): encoder/decoder error handling.
 
 
     /// Stream encoder.
@@ -89,22 +102,6 @@ pub trait Spec: SendOnMt + SyncOnMt + 'static {
     type StreamDecoderError: std::error::Error + Clone + Send + Sync + 'static;
 
 
-    /// Returns an application error on internal error, such as:
-    /// - [`stream::Sender`](sync::stream::Sender) was dropped because of panic.
-    ///
-    /// - [`backend::QuicEndpoint`] provider has a bug, or this library has a bug
-    ///   leading to unrecoverable connection state.
-    ///
-    /// This error is used to notify the peer about the incident, when possible.
-    fn on_hangup() -> Self::Error;
-
-    /// Converts [`stream::Encoder`] error into application error.
-    fn on_stream_encoder_error(error: &Self::StreamEncoderError) -> Self::Error;
-
-    /// Converts [`stream::Decoder`] error into application error.
-    fn on_stream_decoder_error(error: &Self::StreamDecoderError) -> Self::Error;
-
-
     /// Creates a new [`stream::Encoder`] instance.
     fn new_stream_encoder(&self) -> Self::StreamEncoder;
 
@@ -112,55 +109,11 @@ pub trait Spec: SendOnMt + SyncOnMt + 'static {
     fn new_stream_decoder(&self) -> Self::StreamDecoder;
 
     /// Creates a new [`dgram::Encoder`] instance.
-    fn new_dgram_encoder(&self) -> Self::DgramEncoder;
+    fn new_datagram_encoder(&self) -> Self::DgramEncoder;
 
     /// Creates a new [`dgram::Decoder`] instance.
-    fn new_dgram_decoder(&self) -> Self::DgramDecoder;
+    fn new_datagram_decoder(&self) -> Self::DgramDecoder;
 
-
-    /// Returns a total number of encoded bytes,
-    /// that is enough to flush the encoded output to the network.
-    ///
-    /// May be `zero` for an immediate effect.
-    ///
-    /// **Notes**:
-    /// - it has effect only if there are pending items to be encoded:
-    ///   it won't block & wait for new items.
-    /// - it is recommended to set `QuicBackend` stream buffer size larger than `stream_encoder_max_batch_size`
-    ///   to avoid partial writes bottleneck.
-    /// - setting a large value might not be efficient, as ideally batch size should not exceed peer's flow control limit.
-    fn stream_encoder_max_batch_size(&self) -> usize;
-
-    /// Returns a maximum total number of bytes,
-    /// that is allowed to pass in a single [`decode()`][stream::Decoder::decode] call.
-    ///
-    /// **Note**: it is recommended to set [`stream_channel_bound`][Spec::stream_channel_bound] accordingly,
-    /// as each decoded item goes into the channel afterwards.
-    fn stream_decoder_max_batch_size(&self) -> usize;
-
-    /// Returns a total number of encoded bytes,
-    /// that is enough to flush the encoded output to the network.
-    ///
-    /// May be `zero` for an immediate effect.
-    ///
-    /// **Notes**:
-    /// - it has effect only if there are pending items to be encoded:
-    ///   it won't block & wait for new items.
-    /// - it is recommended to set `QuicBackend` datagram buffer size larger than `dgram_encoder_max_batch_size`
-    ///   to avoid partial writes bottleneck (or outgoing packet loss).
-    /// - setting a large value might not be efficient, as peer might drop packets exceeding his buffer capacity.
-    fn dgram_encoder_max_batch_size(&self) -> usize;
-
-    /// Returns a maximum desired total number of bytes,
-    /// that should to pass in a single [`decode()`][dgram::Decoder::decode] call.
-    ///
-    /// May be `zero`, to allow only a single datagram.
-    ///
-    /// **Notes**:
-    /// - it is recommended to set [`dgram_channel_bound`][Spec::dgram_channel_bound] accordingly,
-    ///   as each decoded item goes into the channel afterwards, and **will be dropped** if channel is full.
-    /// - real batch size may exceed the specified desired value, up to a single extra datagram.
-    fn dgram_decoder_max_batch_size(&self) -> usize;
 
     /// The maximum capacity of the stream channel.
     ///
@@ -172,7 +125,7 @@ pub trait Spec: SendOnMt + SyncOnMt + 'static {
     ///
     /// **Note**: each item inside the datagram channel might occupy available space differently,
     /// depending on item's [`Estimate`] implementation.
-    fn dgram_channel_bound(&self) -> usize;
+    fn datagram_channel_bound(&self) -> usize;
 }
 
 
@@ -192,7 +145,7 @@ pub trait Engine: SendOnMt + SyncOnMt + 'static {
     /// Creates a new [`QuicBackend`] instance.
     fn new_quic_backend(
         &self,
-        socket_addr: SocketAddr,
+        listen_addr: IpAddr,
         socket_features: &HashSet<SoFeat>,
     ) -> Self::QuicBackend;
 }
@@ -255,19 +208,11 @@ pub trait Estimate {
     fn estimate(&self) -> usize;
 }
 
-macro_rules! impl_estimate {
-    ($($t:ty),+ $(,)?) => {
-        $(
-            impl Estimate for $t {
-                fn estimate(&self) -> usize {
-                    self.len()
-                }
-            }
-        )+
-    };
+impl<T: AsRef<[u8]>> Estimate for T {
+    fn estimate(&self) -> usize {
+        self.as_ref().len()
+    }
 }
-
-impl_estimate!(Bytes, BytesMut, Vec<u8>, [u8], &[u8]);
 
 
 /// Conditional code:

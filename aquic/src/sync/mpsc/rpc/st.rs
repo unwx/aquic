@@ -2,54 +2,34 @@ use crate::sync::mpsc;
 use crate::sync::mpsc::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
 use crate::sync::mpsc::unbounded;
 use crate::sync::mpsc::unbounded::UnboundedSender;
-use slab::Slab;
+use slotmap::{SlotMap, new_key_type};
 use std::cell::RefCell;
 use std::fmt::{Debug, Formatter};
-use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-pub(crate) type Call<T, R> = RemoteCall<T, Callback<R>>;
 
+/// A response/callback state.
+///
+/// State may only be transitioned by `Callback`,
+/// while `ResponseFuture` only reads it.
 enum State<R> {
     Pending(Option<Waker>),
     Ready(R),
     HangUp,
 }
 
-
-struct Storage<R> {
-    pub slab: Slab<(State<R>, u32)>,
-    pub seq: u32,
+new_key_type! {
+    struct StateKey;
 }
 
-impl<R> Storage<R> {
-    pub fn next_version(&mut self) -> u32 {
-        let version = self.seq;
-        self.seq += 1;
-        version
-    }
-}
 
-impl<R> Deref for Storage<R> {
-    type Target = Slab<(State<R>, u32)>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.slab
-    }
-}
-
-impl<R> DerefMut for Storage<R> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.slab
-    }
-}
-
+pub(crate) type Call<T, R> = RemoteCall<T, Callback<R>>;
 
 pub(crate) struct Remote<T, R> {
     sender: unbounded::Sender<Call<T, R>>,
-    storage: Rc<RefCell<Storage<R>>>,
+    storage: Rc<RefCell<SlotMap<StateKey, State<R>>>>,
 }
 
 impl<T, R> RemoteClient<T, R, Callback<R>> for Remote<T, R>
@@ -60,43 +40,32 @@ where
     fn new(sender: mpsc::unbounded::Sender<Call<T, R>>) -> Self {
         Self {
             sender,
-            storage: Rc::new(RefCell::new(Storage {
-                slab: Slab::with_capacity(2),
-                seq: 0,
-            })),
+            storage: Rc::new(RefCell::new(SlotMap::with_key())),
         }
     }
 
     async fn send(&self, args: T) -> Result<R, SendError> {
-        let version;
-        let key;
+        let mut storage = self.storage.borrow_mut();
+        let key = storage.insert(State::Pending(None));
 
+        if self
+            .sender
+            .send(Call {
+                args,
+                callback: Some(Callback {
+                    storage: self.storage.clone(),
+                    key,
+                }),
+            })
+            .is_err()
         {
-            let mut storage = self.storage.borrow_mut();
-            version = storage.next_version();
-            key = storage.insert((State::Pending(None), version));
-
-            if self
-                .sender
-                .send(Call {
-                    args,
-                    callback: Some(Callback {
-                        storage: self.storage.clone(),
-                        key,
-                        version,
-                    }),
-                })
-                .is_err()
-            {
-                storage.remove(key);
-                return Err(SendError::Closed);
-            }
+            storage.remove(key);
+            return Err(SendError::Closed);
         }
 
         ResponseFuture {
             storage: self.storage.clone(),
             key,
-            version,
         }
         .await
     }
@@ -128,42 +97,26 @@ impl<T, R> Clone for Remote<T, R> {
 
 
 pub(crate) struct Callback<R> {
-    storage: Rc<RefCell<Storage<R>>>,
-    key: usize,
-    version: u32,
+    storage: Rc<RefCell<SlotMap<StateKey, State<R>>>>,
+    key: StateKey,
 }
 
 impl<R> RemoteCallback<R> for Callback<R> {
-    //noinspection DuplicatedCode
     fn on_result(self, result: R) {
         let mut storage = self.storage.borrow_mut();
 
-        let Some((state, version)) = storage.get_mut(self.key) else {
+        let Some(state) = storage.get_mut(self.key) else {
             return;
         };
-        if self.version != *version {
-            return;
+
+        if let State::Pending(waker) = state {
+            let waker = waker.take();
+            *state = State::Ready(result);
+
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
-
-        match state {
-            State::Pending(it) => {
-                let waker = it.clone();
-                *state = State::Ready(result);
-
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }
-            State::Ready(_) | State::HangUp => {
-                if cfg!(debug_assertions) {
-                    panic!(
-                        "bug: unable to make a result callback for [key: {}, version: {}]: \
-                        result is already present",
-                        self.key, self.version
-                    );
-                }
-            }
-        };
     }
 }
 
@@ -172,60 +125,48 @@ impl<R> Drop for Callback<R> {
         let Ok(mut storage) = self.storage.try_borrow_mut() else {
             return;
         };
-        let Some((state, version)) = storage.get_mut(self.key) else {
+        let Some(state) = storage.get_mut(self.key) else {
             return;
         };
-        if self.version != *version {
-            return;
-        }
 
-        match state {
-            State::Pending(waker) => {
-                let waker = waker.clone();
-                *state = State::HangUp;
+        if let State::Pending(waker) = state {
+            let waker = waker.take();
+            *state = State::HangUp;
 
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
+            if let Some(waker) = waker {
+                waker.wake();
             }
-            State::Ready(_) | State::HangUp => {}
         }
     }
 }
 
 
 pub(crate) struct ResponseFuture<R> {
-    storage: Rc<RefCell<Storage<R>>>,
-    key: usize,
-    version: u32,
+    storage: Rc<RefCell<SlotMap<StateKey, State<R>>>>,
+    key: StateKey,
 }
 
 impl<R> Future for ResponseFuture<R> {
     type Output = Result<R, SendError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut slab = self.storage.borrow_mut();
+        let mut storage = self.storage.borrow_mut();
 
-        let Some((state, version)) = slab.get_mut(self.key) else {
+        let Some(state) = storage.get_mut(self.key) else {
             return Poll::Ready(Err(SendError::NoResponse));
         };
-        if self.version != *version {
-            return Poll::Ready(Err(SendError::NoResponse));
-        }
 
         match state {
-            State::Pending(_) => {
-                *state = State::Pending(Some(cx.waker().clone()));
+            State::Pending(waker) => {
+                *waker = Some(cx.waker().clone());
                 Poll::Pending
             }
             State::Ready(_) => {
-                if let State::Ready(val) = slab.remove(self.key).0 {
-                    return Poll::Ready(Ok(val));
+                if let Some(State::Ready(val)) = storage.remove(self.key) {
+                    Poll::Ready(Ok(val))
+                } else {
+                    Poll::Ready(Err(SendError::NoResponse))
                 }
-
-                panic!(
-                    "bug: race condition in single-threaded RPC channel: State is no more Ready"
-                );
             }
             State::HangUp => Poll::Ready(Err(SendError::NoResponse)),
         }
@@ -234,15 +175,8 @@ impl<R> Future for ResponseFuture<R> {
 
 impl<R> Drop for ResponseFuture<R> {
     fn drop(&mut self) {
-        let Ok(mut slab) = self.storage.try_borrow_mut() else {
-            return;
-        };
-        let Some((_, version)) = slab.get_mut(self.key) else {
-            return;
-        };
-
-        if self.version == *version {
-            slab.remove(self.key);
+        if let Ok(mut storage) = self.storage.try_borrow_mut() {
+            storage.remove(self.key);
         }
     }
 }

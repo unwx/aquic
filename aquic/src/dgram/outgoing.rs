@@ -1,46 +1,40 @@
+use crate::backend::{self, StableConnectionId};
+use crate::core::OutDgramBackend;
 use crate::log;
-use crate::{debug_panic, dgram::Encoder, tracing::DgramSpan};
-use std::{any::type_name, borrow::Cow};
-
-use bytes::Bytes;
-use futures::{FutureExt, select_biased};
-use tracing::{Instrument, Level, Span};
-
 use crate::{
     Spec,
-    backend::dgram::OutDgramBackend,
     dgram::Error,
-    exec::{Runtime, SendOnMt},
+    exec::Runtime,
     sync::{
         SmartRc, dgram,
         mpmc::oneshot::{self, OneshotReceiver, OneshotSender},
     },
 };
+use crate::{debug_panic, dgram::Encoder, tracing::DgramSpan};
+use futures::{FutureExt, future, select_biased};
+use std::{any::type_name, borrow::Cow};
+use tracing::{Instrument, Level, Span};
 
 
 /// An outgoing direction of QUIC datagrams flow,
 /// acts like a bridge between protocol backend and application for a single datagram direction.
 ///
-/// `network_peer <-> quic_backend <-> Outgoing<S> <-> local_application`.
+/// `Network Peer << QUIC Backend << Outgoing<S, CId> << Application`.
 ///
-/// Its role is to receive incoming messages from app,
-/// encode them, and send it to peer.
+/// Its role is to:
+/// 1) Receive incoming items from `Application`.
+/// 2) Encode the items.
+/// 3) Send datagrams to `QUIC Backend`.
 pub(crate) struct Outgoing<S, CId>
 where
     S: Spec,
-    CId: SendOnMt + Unpin + 'static,
+    CId: StableConnectionId,
 {
-    /// A reference to protocol specification.
-    spec: SmartRc<S>,
-
     /// An API to communicate with QUIC implementation.
-    backend: OutDgramBackend<CId>,
+    backend: OutDgramBackend<S, CId>,
 
     /// Encoder for encoding messages into datagrams.
-    encoder: S::DgramEncoder,
-
-    /// Batch of datagrams.
-    encoder_batch: Option<Vec<Bytes>>,
+    encoder: Option<S::DgramEncoder>,
 
     /// Channel for receiving messages from app.
     item_receiver: dgram::Receiver<S>,
@@ -55,23 +49,19 @@ where
 impl<S, CId> Outgoing<S, CId>
 where
     S: Spec,
-    CId: Clone + SendOnMt + Unpin + 'static,
+    CId: StableConnectionId,
 {
     pub fn new(
         spec: SmartRc<S>,
-        backend: OutDgramBackend<CId>,
+        backend: OutDgramBackend<S, CId>,
         item_receiver: dgram::Receiver<S>,
     ) -> Self {
         let (cancel_sender, cancel_receiver) = oneshot::channel();
-
-        let encoder = spec.new_dgram_encoder();
-        let encoder_batch = Some(Vec::with_capacity(4));
+        let encoder = spec.new_datagram_encoder();
 
         Self {
-            spec,
             backend,
-            encoder,
-            encoder_batch,
+            encoder: Some(encoder),
             item_receiver,
             cancel_sender,
             cancel_receiver,
@@ -89,216 +79,177 @@ where
     /// **Note**: only a [Error::Connection] is allowed to be sent via this sender.
     pub fn write(mut self, span: DgramSpan) -> oneshot::Sender<Error> {
         let cancel_sender = self.cancel_sender.clone();
-
-        self.spawn_listen_for_app_error();
-        self.spawn_io_loop(span);
-
-        cancel_sender
-    }
-
-
-    /// Spawn a [Self::io_loop] with an additional listener for cancel signals.
-    fn spawn_io_loop(mut self, span: DgramSpan) {
         let cancel_receiver = self.cancel_receiver.clone();
+        let app_error_receiver = self.item_receiver.error_receiver();
+
+        let app_error_future = || async move {
+            let app_err = app_error_receiver.recv().await.unwrap_or_else(|| {
+                Error::HangUp(
+                    format!(
+                        "'{}' items '{}' error channel is unavailable",
+                        type_name::<Self>(),
+                        type_name::<S::DgramItem>()
+                    )
+                    .into(),
+                )
+            });
+
+            match &app_err {
+                Error::End | Error::HangUp(_) => app_err,
+
+                // We produce this error, ignore.
+                Error::Connection => future::pending().await,
+            }
+        };
 
         let future = async move {
             select_biased! {
+                e = self.io_loop().fuse() => {
+                    self.close(e.map(|_| Error::End).unwrap_or_else(|e| e));
+                }
+
                 e = cancel_receiver.recv().fuse() => {
                     self.close(e.unwrap_or_else(
-                        || Error::HangUp(format!("'{}.cancel_receiver' is unavailable", type_name::<Self>()).into())
+                        || Error::HangUp(format!(
+                            "'{}' cancellation-signal channel is unavailable",
+                            type_name::<Self>()
+                        ).into())
                     ));
                 }
-                r = self.io_loop().fuse() => {
-                    if let Err(e) = r {
-                        self.close(e);
-                    }
-                }
+
+                app_err = app_error_future().fuse() => {
+                    self.close(app_err);
+                },
             }
         };
 
         Runtime::spawn_void(async move {
             future.instrument(span.into()).await;
-        })
-    }
-
-    /// Application (the one who sends items)
-    /// might drop the sender.
-    ///
-    /// Spawn a separate listener to be aware when it is no more interested in datagrams.
-    fn spawn_listen_for_app_error(&mut self) {
-        let cancel_sender = self.cancel_sender.clone();
-        let cancel_receiver = self.cancel_receiver.clone();
-        let app_error_receiver = self.item_receiver.error_receiver();
-
-        Runtime::spawn_void(async move {
-            select_biased! {
-                _ = cancel_receiver.recv().fuse() => {
-                    // Do nothing.
-                },
-                app_err = app_error_receiver.recv().fuse() => {
-                    let app_err = app_err.unwrap_or_else(
-                        || Error::HangUp(format!("'{}.item_receiver.error_receiver' is unavailable", type_name::<Self>()).into())
-                    );
-
-                    match &app_err {
-                        Error::End | Error::HangUp(_) => {
-                            let _ = cancel_sender.send(app_err);
-                        }
-                        Error::Connection => {
-                            // Do nothing.
-                        }
-                    }
-                },
-            }
         });
+
+        cancel_sender
     }
 
-    /// Runs the primary I/O loop.
+
     async fn io_loop(&mut self) -> Result<(), Error> {
         loop {
             self.recv_from_app().await?;
-            self.write_to_backend().await?;
+            self.send_to_backend().await?;
         }
     }
 
-
-    /// Receives items from application,
-    /// and encodes them into [Self::encoder_batch].
     async fn recv_from_app(&mut self) -> Result<(), Error> {
-        let Some(batch) = self.encoder_batch.as_mut() else {
-            return Err(Self::dpanic_or_hangup(
-                format!(
-                    "'{}.encoder_batch' is absent at 'recv_from_app()' point",
-                    type_name::<Self>()
-                )
-                .into(),
-            ));
+        if self.encoder.is_none() {
+            return Ok(());
+        }
+        if !self.recv_item(true).await? {
+            return Ok(());
         };
 
-        if !batch.is_empty() {
-            debug_panic!(
-                "'{}.encoder_batch' was not empty at 'recv_from_app()' point",
-                type_name::<Self>()
-            );
-            batch.clear();
-        }
-
+        if let Some(encoder) = self.encoder.as_ref()
+            && encoder.should_flush()
         {
-            let item = Self::recv_item(&mut self.item_receiver, true)
-                .await?
-                .expect("there must be a value when 'blocking' is 'true'");
-
-            self.encoder.encode(item, batch);
+            return Ok(());
         }
 
-        let mut total_bytes = batch.iter().map(|it| it.len()).sum::<usize>();
-        let mut previous_batch_len = batch.len();
-        let threshold = self.spec.dgram_encoder_max_batch_size();
-
-        while total_bytes < threshold {
-            match Self::recv_item(&mut self.item_receiver, false).await? {
-                Some(item) => {
-                    self.encoder.encode(item, batch);
-                }
-                None => {
-                    break;
-                }
-            }
-
-            if batch.len() > previous_batch_len {
-                total_bytes += batch[previous_batch_len..]
-                    .iter()
-                    .map(|it| it.len())
-                    .sum::<usize>();
-                previous_batch_len = batch.len();
+        while self.recv_item(false).await? {
+            if let Some(encoder) = self.encoder.as_ref()
+                && encoder.should_flush()
+            {
+                break;
             }
         }
 
         Ok(())
     }
 
-    async fn recv_item(
-        receiver: &mut dgram::Receiver<S>,
-        blocking: bool,
-    ) -> Result<Option<S::DgramItem>, Error> {
-        let result = if blocking {
-            receiver.recv().await.map(Some)
-        } else {
-            receiver.try_recv()
+    async fn recv_item(&mut self, blocking: bool) -> Result<bool, Error> {
+        let Some(encoder) = self.encoder.as_mut() else {
+            return Ok(false);
         };
 
-        let item = match result {
-            Ok(it) => it,
-            Err(e) => {
-                return match &e {
-                    Error::End => Err(e),
-                    Error::HangUp(e) => Err(Error::HangUp(
-                        format!(
-                            "'{}.item_receiver' is unavailable: {}",
-                            type_name::<Self>(),
-                            e
-                        )
-                        .into(),
-                    )),
-                    Error::Connection => {
-                        return Err(Self::dpanic_or_hangup(
-                            format!(
-                                "'{}.item_receiver' returned unexpected error: {}",
-                                type_name::<Self>(),
-                                e
-                            )
-                            .into(),
-                        ));
-                    }
-                };
+        let result = {
+            if blocking {
+                self.item_receiver.recv().await.map(Some)
+            } else {
+                self.item_receiver.try_recv()
             }
         };
 
-        Ok(item)
-    }
-
-    /// Writes encoded datagrams to QUIC backend.
-    async fn write_to_backend(&mut self) -> Result<(), Error> {
-        let Some(batch) = self.encoder_batch.take() else {
-            return Err(Self::dpanic_or_hangup(
+        let item = result.map_err(|e| match &e {
+            Error::End => e,
+            Error::HangUp(e) => Error::HangUp(
                 format!(
-                    "'{}.encoder_batch' is absent at 'write_to_backend()' point",
-                    type_name::<Self>()
+                    "'{}' items '{}' channel is unavailable: {}",
+                    type_name::<Self>(),
+                    type_name::<S::DgramItem>(),
+                    e
                 )
                 .into(),
-            ));
+            ),
+            other => Self::dpanic_or_hangup(
+                format!(
+                    "'{}' items '{}' channel returned an unexpected error: {}",
+                    type_name::<Self>(),
+                    type_name::<S::DgramItem>(),
+                    other
+                )
+                .into(),
+            ),
+        })?;
+
+        if let Some(item) = item {
+            encoder.encode(item);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn send_to_backend(&mut self) -> Result<(), Error> {
+        let Some(encoder) = self.encoder.take() else {
+            return Ok(());
         };
 
-        let mut batch = match self.backend.send(batch).await.map_err(|e| {
+        let call_result = self.backend.send(encoder).await;
+        let backend_result = call_result.map_err(|e| {
             Error::HangUp(
                 format!(
-                    "'{}.backend' API is unavailable: {}",
+                    "'{}' QUIC backend RPC channel is unavailable: {}",
                     type_name::<Self>(),
                     e
                 )
                 .into(),
             )
-        })? {
-            Ok(it) => it,
-            Err(e) => {
-                return Err(Error::HangUp(
+        })?;
+
+        match backend_result {
+            Ok(enc) => {
+                self.encoder = Some(enc);
+                Ok(())
+            }
+            Err(e) => match e {
+                backend::Error::Closed | backend::Error::UnknownConnection => {
+                    Err(Error::Connection)
+                }
+                other => Err(Error::HangUp(
                     format!(
-                        "'{}.backend' API responded with '{}'",
+                        "'{}' QUIC backend responded with an unexpected error: {}",
                         type_name::<Self>(),
-                        e
+                        other
                     )
                     .into(),
-                ));
-            }
-        };
-
-        batch.clear();
-        self.encoder_batch = Some(batch);
-        Ok(())
+                )),
+            },
+        }
     }
 
 
     fn close(&mut self, error: Error) {
+        if self.cancel_sender.send(error.clone()).is_err() {
+            return;
+        };
+
         let log_level = match &error {
             Error::End | Error::Connection => Level::DEBUG,
             Error::HangUp(_) => Level::WARN,

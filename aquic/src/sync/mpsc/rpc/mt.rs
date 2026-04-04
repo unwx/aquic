@@ -1,29 +1,62 @@
+// TODO(test): untested unsafe code.
+
+use crate::debug_panic;
 use crate::sync::mpsc::rpc::{RemoteCall, RemoteCallback, RemoteClient, SendError};
 use crate::sync::mpsc::unbounded;
 use crate::sync::mpsc::unbounded::UnboundedSender;
+use futures::task::AtomicWaker;
+use std::cell::UnsafeCell;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use std::task::{Context, Poll};
+
+
+type Slab<R> = sharded_slab::Slab<Slot<R>>;
+
+struct Slot<R> {
+    state: AtomicU8,
+    waker: AtomicWaker,
+    result: UnsafeCell<Option<R>>,
+}
+
+// SAFETY: We guarantee strict memory access using `Slot.state`.
+unsafe impl<R: Send> Send for Slot<R> {}
+unsafe impl<R: Send> Sync for Slot<R> {}
+
+
+/// A response/callback state.
+///
+/// State may only be transitioned by `Callback`,
+/// while `ResponseFuture` only reads it.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone)]
+enum State {
+    Pending = 0,
+    Ready = 1,
+    HangUp = 2,
+}
+
+impl From<u8> for State {
+    fn from(value: u8) -> Self {
+        match value {
+            x if x == State::Pending as u8 => Self::Pending,
+            x if x == State::Ready as u8 => Self::Ready,
+            x if x == State::HangUp as u8 => Self::HangUp,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl From<State> for u8 {
+    fn from(value: State) -> Self {
+        value as u8
+    }
+}
+
 
 pub(crate) type Call<T, R> = RemoteCall<T, Callback<R>>;
-
-type Slab<R> = sharded_slab::Slab<Mutex<Option<State<R>>>, SlabConfig>;
-
-
-struct SlabConfig;
-
-impl sharded_slab::Config for SlabConfig {
-    const INITIAL_PAGE_SIZE: usize = 2;
-}
-
-
-enum State<R> {
-    Pending(Option<Waker>),
-    Ready(R),
-    HangUp,
-}
-
 
 pub(crate) struct Remote<T, R>
 where
@@ -31,9 +64,6 @@ where
     R: Send + Unpin + 'static,
 {
     sender: unbounded::Sender<Call<T, R>>,
-
-    // According to `shared_slab` doc, each returned key on `insert` has a generation included,
-    // therefore we don't need to track generations ourselves.
     storage: Arc<Slab<R>>,
 }
 
@@ -45,15 +75,25 @@ where
     fn new(sender: unbounded::Sender<Call<T, R>>) -> Self {
         Self {
             sender,
-            storage: Arc::new(sharded_slab::Slab::new_with_config::<SlabConfig>()),
+            storage: Arc::new(Slab::new()),
         }
     }
 
     async fn send(&self, args: T) -> Result<R, SendError> {
-        let key = self
-            .storage
-            .insert(Mutex::new(Some(State::Pending(None))))
-            .expect("unable to insert an RPC call state: sharded-slab's shard is full");
+        let key = {
+            let slot = Slot {
+                state: AtomicU8::new(State::Pending.into()),
+                waker: AtomicWaker::new(),
+                result: UnsafeCell::new(None),
+            };
+
+            let Some(key) = self.storage.insert(slot) else {
+                debug_panic!("unable to insert an RPC call state: sharded-slab's shard is full");
+                return Err(SendError::NoResponse);
+            };
+
+            key
+        };
 
         if self
             .sender
@@ -123,30 +163,21 @@ impl<R> RemoteCallback<R> for Callback<R> {
             return;
         };
 
-        let mut guard = entry.lock().unwrap();
-        let Some(state) = guard.as_mut() else {
-            return;
-        };
+        // SAFETY:
+        // - There is no race condition on this method, as we have exclusive access to `self`.
+        // - The `ResponseFuture` won't read the result until we set the `state` to `Ready`.
+        // - The state is set with `Release` ordering, result must become visible afterwards.
+        unsafe {
+            *entry.result.get() = Some(result);
+        }
 
-        match state {
-            State::Pending(waker) => {
-                let waker = waker.clone();
-                *state = State::Ready(result);
+        // SAFETY (why not `Pending` -> `Ready` CAS):
+        // - `self` is consumed, meaning `on_result` can only be called once.
+        // - `Drop` cannot run concurrently.
+        // - We exclusively own the right to transition out of the `Pending` state.
+        entry.state.store(State::Ready.into(), Release);
 
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }
-            State::Ready(_) | State::HangUp => {
-                if cfg!(debug_assertions) {
-                    panic!(
-                        "bug: unable to make a result callback for [key: {}]: \
-                        result is already present",
-                        self.key
-                    );
-                }
-            }
-        };
+        entry.waker.wake();
     }
 }
 
@@ -156,23 +187,17 @@ impl<R> Drop for Callback<R> {
             return;
         };
 
-        let Ok(mut guard) = entry.lock() else {
-            return;
-        };
-        let Some(state) = guard.as_mut() else {
-            return;
-        };
-
-        match state {
-            State::Pending(waker) => {
-                let waker = waker.clone();
-                *state = State::HangUp;
-
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }
-            State::Ready(_) | State::HangUp => {}
+        if entry
+            .state
+            .compare_exchange(
+                State::Pending.into(),
+                State::HangUp.into(),
+                Release,
+                Relaxed,
+            )
+            .is_ok()
+        {
+            entry.waker.wake();
         }
     }
 }
@@ -191,29 +216,39 @@ impl<R> Future for ResponseFuture<R> {
             return Poll::Ready(Err(SendError::NoResponse));
         };
 
-        let mut guard = entry.lock().unwrap();
-        let Some(state) = guard.take() else {
-            return Poll::Ready(Err(SendError::NoResponse));
-        };
+        let mut state = State::from(entry.state.load(Acquire));
+
+        if matches!(state, State::Pending) {
+            entry.waker.register(cx.waker());
+
+            // Double-check the `state` after registering the waker,
+            // to prevent race conditions where the callback writes & wakes between the first check and registration.
+            state = State::from(entry.state.load(Acquire));
+        }
 
         match state {
-            State::Pending(_) => {
-                *guard = Some(State::Pending(Some(cx.waker().clone())));
-                Poll::Pending
+            State::Pending => Poll::Pending,
+            State::HangUp => Poll::Ready(Err(SendError::NoResponse)),
+            State::Ready => {
+                // SAFETY:
+                // - State is `Ready`, therefore result is guaranteed to be set.
+                // - We use `Acquire/Release` memory ordering.
+                // - `poll()` accepts a mutable reference to Self, meaning that `poll()` is sequential.
+                let result = unsafe { (*entry.result.get()).take() };
+                Poll::Ready(result.ok_or(SendError::NoResponse))
             }
-            State::HangUp => {
-                *guard = Some(State::HangUp);
-                Poll::Ready(Err(SendError::NoResponse))
-            }
-            State::Ready(result) => Poll::Ready(Ok(result)),
         }
     }
 }
 
 impl<R> Drop for ResponseFuture<R> {
     fn drop(&mut self) {
-        if self.storage.contains(self.key) {
-            self.storage.remove(self.key);
-        }
+        // SAFETY: See `sharded_slab::Entry` doc.
+        // >
+        // While the guard exists, it indicates to the slab that the item the guard
+        // references is currently being accessed. If the item is removed from the slab
+        // while a guard exists, the removal will be deferred until all guards are
+        // dropped.
+        self.storage.remove(self.key);
     }
 }

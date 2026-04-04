@@ -77,7 +77,7 @@ pub struct Sender<S: Spec> {
     /// Broadcast the closure event of this stream direction.
     error_sender: oneshot::Sender<Error<S>>,
 
-    /// Listen for an external closure event (e.g., peer sends [Error::StopSending]).
+    /// Listen for an external closure event (e.g., peer sends [Error::Stop]).
     error_receiver: oneshot::Receiver<Error<S>>,
 
     /// Listen for a warning, that connection is going to be closed at informed point of time.
@@ -173,11 +173,11 @@ impl<S: Spec> Sender<S> {
     }
 
 
-    /// Terminates direction with [Error::ResetSending].
+    /// Terminates direction with [Error::Reset].
     ///
     /// No-op if it's already closed.
-    pub fn terminate(&mut self, error: S::Error) {
-        self.close(Error::ResetSending(error));
+    pub fn terminate(&mut self, error: S::StreamCode) {
+        self.close(Error::Reset(error));
     }
 
     /// Terminates direction with [Error::Decoder].
@@ -301,7 +301,7 @@ pub struct Receiver<S: Spec> {
     /// Broadcast the closure event of this stream direction.
     error_sender: oneshot::Sender<Error<S>>,
 
-    /// Listen for an external closure event (e.g., peer sends [Error::ResetSending]).
+    /// Listen for an external closure event (e.g., peer sends [Error::Reset]).
     error_receiver: oneshot::Receiver<Error<S>>,
 
     /// Listen for a warning, that connection is going to be closed at informed point of time.
@@ -314,7 +314,7 @@ pub struct Receiver<S: Spec> {
 impl<S: Spec> Receiver<S> {
     /// Receives the next chunk of data.
     ///
-    /// **Note**: if [`Receiver`] receives error, such as [`Error::ResetSending`],
+    /// **Note**: if [`Receiver`] receives error, such as [`Error::Reset`],
     /// all the messages will be ignored.
     ///
     /// # Returns
@@ -407,11 +407,11 @@ impl<S: Spec> Receiver<S> {
         }
     }
 
-    /// Terminates direction with [Error::StopSending].
+    /// Terminates direction with [Error::Stop].
     ///
     /// No-op if it's already closed.
-    pub fn terminate(&mut self, error: S::Error) {
-        self.close(Error::StopSending(error));
+    pub fn terminate(&mut self, error: S::StreamCode) {
+        self.close(Error::Stop(error));
     }
 
     /// Terminates direction with [Error::Encoder].

@@ -1,7 +1,11 @@
-mod common;
+use crate::conditional;
+use std::borrow::{Borrow, Cow};
+use std::fmt;
+use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 
+mod common;
 pub use common::*;
-use smallvec::SmallVec;
 
 conditional! {
     feature = "server-util",
@@ -11,56 +15,148 @@ conditional! {
 }
 
 
-use crate::conditional;
-use std::borrow::Cow;
-use std::fmt;
-use std::fmt::{Display, Formatter};
-use std::hash::Hash;
-
-/// Max allowed connection ID length (RFC 9000).
+/// Maximum connection ID length (RFC 9000).
 pub const MAX_CID_LEN: usize = 20;
 
 
 /// A Connection ID.
 ///
-/// This struct holds the raw bytes of a connection ID.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ConnectionId(SmallVec<[u8; MAX_CID_LEN]>);
+/// This struct holds raw bytes of a connection ID.
+#[derive(Debug, Clone)]
+pub struct ConnectionId {
+    array: [u8; MAX_CID_LEN],
+    len: usize,
+}
 
 impl ConnectionId {
-    /// Create a clone of Connection ID from slice.
-    pub fn from_slice(slice: &[u8]) -> Self {
-        Self(SmallVec::from_slice(slice))
+    /// Creates a Connection ID from `slice`.
+    ///
+    /// Returns `None` if the `slice` length is greater than [MAX_CID_LEN].
+    #[inline]
+    pub fn try_from_slice(slice: &[u8]) -> Option<Self> {
+        if slice.len() > MAX_CID_LEN {
+            return None;
+        }
+
+        let mut array = [0u8; MAX_CID_LEN];
+        array[..slice.len()].copy_from_slice(slice);
+
+        Some(Self {
+            array,
+            len: slice.len(),
+        })
+    }
+
+    /// Creates a Connection ID from iterator.
+    ///
+    /// Returns `None` if iterator length is greater than [MAX_CID_LEN].
+    #[inline]
+    pub fn try_from_iter<I: Iterator<Item = u8>>(mut iter: I) -> Option<Self> {
+        let mut array = [0u8; MAX_CID_LEN];
+
+        let mut mark = 0;
+        while mark < MAX_CID_LEN {
+            match iter.next() {
+                Some(byte) => {
+                    array[mark] = byte;
+                    mark += 1;
+                }
+                None => {
+                    return Some(Self { array, len: mark });
+                }
+            }
+        }
+
+        None
     }
 
     /// Returns connection ID as an immutable slice.
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        self.0.as_slice()
+        &self.array[..self.len()]
     }
 
     /// Returns connection ID as a mutable slice.
+    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.0.as_mut_slice()
+        let length = self.len();
+        &mut self.array[..length]
     }
 
-    /// Returns connection ID length in bytes.
+    /// Returns connection ID length.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.len
     }
 
     /// Returns `true` if connection ID is empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
+    }
+}
+
+impl From<[u8; MAX_CID_LEN]> for ConnectionId {
+    fn from(value: [u8; MAX_CID_LEN]) -> Self {
+        Self {
+            len: value.len(),
+            array: value,
+        }
+    }
+}
+
+impl AsRef<[u8]> for ConnectionId {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsMut<[u8]> for ConnectionId {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+impl Borrow<[u8]> for ConnectionId {
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for ConnectionId {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+
+        self.array[..self.len] == other.array[..other.len]
+    }
+}
+
+impl Eq for ConnectionId {}
+
+impl Hash for ConnectionId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.array[..self.len].hash(state);
     }
 }
 
 impl Display for ConnectionId {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for byte in self.0.as_slice() {
+        for byte in self.as_slice() {
             write!(f, "{byte:02x}")?;
         }
 
         Ok(())
+    }
+}
+
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self {
+            array: [0u8; MAX_CID_LEN],
+            len: 0,
+        }
     }
 }
 
@@ -85,61 +181,58 @@ impl Display for IdError {
 impl std::error::Error for IdError {}
 
 
-/// Metadata, that a specific Connection ID holds.
+/// Metadata that a connection ID holds.
 pub trait ConnectionIdMeta {
-    /// Returns a CPU Core ID if this Connection ID is a Server ID, and it contains it.
+    /// Returns a CPU Core ID, if present.
     ///
-    /// Core ID is **required** for server-side routing in thread-per-core async runtimes like monoio,
-    /// where multiple sockets (socket per core) binds on the same port.
+    /// Core ID is **required** for server-side routing in thread-per-core async runtimes like
+    /// [monoio](https://github.com/bytedance/monoio),
+    /// where multiple sockets (socket per core) bind on the same port.
     ///
-    /// Without it, it's impossible to determine which core should process the packet.
+    /// Without the Core ID it's impossible to determine which socket, CPU core should process the packet.
     ///
-    /// On single-thread/work-stealing runtimes it is not necessary.
-    fn core_id(&self) -> Option<u16>;
-}
-
-/// Noop implementation of [ConnIdMeta].
-#[derive(Debug, Copy, Clone)]
-pub struct NoopIdMeta;
-
-impl ConnectionIdMeta for NoopIdMeta {
+    /// It is not neccessary for client applications, or single-thread/work-stealing async runtimes.
     fn core_id(&self) -> Option<u16> {
         None
     }
 }
 
+impl ConnectionIdMeta for () {}
 
-/// A [ConnectionId] generator.
+
+/// A local source connection IDs generator.
 pub trait ConnectionIdGenerator: Send {
     // Some QUIC implementations (like quinn-proto) require ConnIdGenerators to be Send + Sync.
     // Therefore, `Send` requirement is mandatory...
 
     type Meta: ConnectionIdMeta;
 
-    /// Generates a new CID.
+    /// Generates a new source connection ID.
     ///
     /// Connection IDs **must not** contain any information that can be used by
     /// an external observer to correlate them with other connection IDs for the same
-    /// connection. They **must** have high entropy.
-    fn generate(&mut self) -> ConnectionId;
-
-    /// Returns the length of a CID for connections created by this generator.
+    /// connection.
     ///
-    /// Expected to be constant.
+    /// They **must** have high entropy.
+    fn generate(&self) -> ConnectionId;
+
+    /// Returns the length of generated connection IDs.
+    ///
+    /// Must be constant, may be zero.
     fn cid_len(&self) -> usize;
 
-    /// Quickly determine whether `cid` could have been generated by this generator.
+    /// Quickly determines whether `cid` could have been generated by this generator.
     ///
-    /// False positives are permitted, but increase the cost of handling invalid packets.
+    /// False positives are permitted, but they might increase the cost of handling invalid packets.
     ///
-    /// False negatives **are NOT permitted**.
+    /// **Must not** produce false negatives.
     fn validate(&self, cid: &ConnectionId) -> bool;
 
     /// Decrypts a connection ID.
     ///
-    /// Noop if it's not encrypted.
+    /// Noop if it was not encrypted.
     fn decrypt(&self, cid: &mut ConnectionId) -> Result<(), IdError>;
 
-    /// Get metadata from a connection ID.
+    /// Returns connection ID's metadata.
     fn parse(&self, cid: &ConnectionId) -> Result<Self::Meta, IdError>;
 }

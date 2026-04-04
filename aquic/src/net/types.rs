@@ -1,15 +1,16 @@
+use crate::net::{Buf, BufMut};
+use domain::base::name::UncertainName;
 use std::{
     fmt::{Display, Formatter},
     io::{IoSlice, IoSliceMut},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    ops::{Deref, DerefMut},
     str::FromStr,
     time::Instant,
 };
 
-use domain::base::name::UncertainName;
-
-/// Maximum UDP packet size + 1, to make it power of two.
-pub const MAX_PACKET_SIZE: usize = 65536;
+/// Maximum UDP packet size.
+pub const MAX_PACKET_SIZE: usize = u16::MAX as usize;
 
 /// A Socket Feature.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -28,7 +29,6 @@ pub enum SoFeat {
     /// Generic Receive Offload.
     ///
     /// If enabled, the socket **should** receive multiple datagrams worth of data as a single large buffer.
-    /// [RecvMsg::segment_size] will be `non-zero` in such scenario.
     ///
     /// **Note**: a single GRO datagram **must not** include different source addresses,
     /// but **may** contain QUIC packets from different connections (with different Connection ID).
@@ -37,15 +37,13 @@ pub enum SoFeat {
     /// Generic Segmentation Offload.
     ///
     /// If enabled, the socket **should** send multiple datagrams worth of data as a single large buffer.
-    /// [SendMsg::segment_size] will be `non-zero` in such scenario.
     GenericSegOffload,
 }
 
 
-/// A single UDP datagram to be received.
+/// A single UDP message to be received.
 ///
-/// **Note**: **may** contain QUIC packets from different connections (with different Connection ID)
-/// **only if** `segment_size` is `Some`.
+/// May contain a large GRO packet.
 pub struct RecvMsg<B> {
     buf: B,
     read: usize,
@@ -54,7 +52,7 @@ pub struct RecvMsg<B> {
     to: IpAddr,
 
     ecn: Ecn,
-    segment_size: usize,
+    segment_count: usize,
     timestamp: Option<Instant>,
 }
 
@@ -63,10 +61,13 @@ impl<B: BufMut> RecvMsg<B> {
     ///
     /// # Panics
     ///
-    /// If provided buffer is empty.
+    /// If the provided buffer has no capacity for an incoming packet.
     #[inline]
     pub fn new(buf: B) -> Self {
-        assert!(buf.capacity() > 0, "provided slice capacity must be > 0");
+        assert!(
+            buf.capacity() > 0,
+            "provided 'buf' must have capacity to contain an incoming packet"
+        );
 
         Self {
             buf,
@@ -74,24 +75,25 @@ impl<B: BufMut> RecvMsg<B> {
             from: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)),
             to: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             ecn: Ecn::NEct,
-            segment_size: 0,
+            segment_count: 0,
             timestamp: None,
         }
     }
 
-    /// Update the message with received fields.
+    /// Updates the message with received fields.
     ///
     /// * `read`: how many bytes were written into the slice.
     /// * `from`: source address.
     /// * `to`: destination address.
-    /// * `ecn`: ECN.
-    /// * `segment_size`: `non-zero` if the packet is segmented with GRO.
-    /// * `timestamp`: when a kernel received packet, if present.
+    /// * `ecn`: Explicit Congestion Notification.
+    /// * `segment_count`: number of GRO segments,
+    ///   `> 1` the msg holds multiple datagrams worth of data as a single large buffer.
+    /// * `timestamp`: when the kernel received the packet.
     ///
     /// # Panics
     ///
-    /// If `from` or `to` address is unspecified.
-    /// Please ignore such packets.
+    /// - If `from` or `to` address is unspecified.
+    /// - If `segment_count > 1 && read % segment_count != 0`.
     #[inline]
     pub fn recv(
         &mut self,
@@ -99,7 +101,7 @@ impl<B: BufMut> RecvMsg<B> {
         from: SocketAddr,
         to: IpAddr,
         ecn: Ecn,
-        segment_size: usize,
+        segment_count: usize,
         timestamp: Option<Instant>,
     ) {
         {
@@ -110,16 +112,23 @@ impl<B: BufMut> RecvMsg<B> {
 
             assert!(
                 !unspecified,
-                "packet source address is unspecified and might be malicious: {}",
+                "packet source address is unspecified: {}",
                 from
             );
         }
 
         assert!(
             !to.is_unspecified(),
-            "packet destination address is unspecified and might be malicious: {}",
+            "packet destination address is unspecified: {}",
             to
         );
+
+        if segment_count > 1 {
+            assert!(
+                read.is_multiple_of(segment_count),
+                "'read' length ({read}) must be a multiple of segment count ({segment_count})",
+            )
+        }
 
         if cfg!(debug_assertions) {
             match (from, to) {
@@ -138,62 +147,80 @@ impl<B: BufMut> RecvMsg<B> {
         self.from = from;
         self.to = to;
         self.ecn = ecn;
-        self.segment_size = segment_size;
+        self.segment_count = segment_count;
         self.timestamp = timestamp;
     }
 
-    /// Returns `true` if this message was filled with packet's data.
+    /// Returns `true` if this message contains useful payload.
     #[inline]
-    pub fn has_data(&self) -> bool {
+    pub fn has_packet(&self) -> bool {
         self.read != 0
     }
 
-    /// Returns a slice that is intended for writing a data received from peer.
+    /// Returns a slice that is intended for writing data received from peer.
     #[inline]
     pub fn write_slice(&mut self) -> IoSliceMut<'_> {
-        debug_assert!(!self.has_data());
-        self.buf.as_write_io_slice()
+        debug_assert!(!self.has_packet());
+        self.buf.as_io_slice()
     }
 
     /// Returns a slice that is intended for reading data received from peer.
     pub fn read_slice(&mut self) -> &mut [u8] {
-        debug_assert!(self.has_data());
-        self.buf.as_read_slice(self.read)
+        debug_assert!(self.has_packet());
+        &mut self.buf.as_slice()[..self.read]
     }
 
-    /// Returns `source` address.
+    /// Returns `from` source address.
     #[inline]
     pub fn from(&self) -> SocketAddr {
-        debug_assert!(self.has_data());
+        debug_assert!(self.has_packet());
         self.from
     }
 
-    /// Returns `to` address.
+    /// Returns `to` destination address.
     #[inline]
     pub fn to(&self) -> IpAddr {
-        debug_assert!(self.has_data());
+        debug_assert!(self.has_packet());
         self.to
     }
 
-    /// Returns packet ECN.
+    /// Returns packet Explicit Congestion Notification.
     #[inline]
     pub fn ecn(&self) -> Ecn {
-        debug_assert!(self.has_data());
+        debug_assert!(self.has_packet());
         self.ecn
     }
 
-    /// Returns GRO segment size, or `zero` if the packet was not segmented.
+    /// Returns GRO segment size,
+    /// or full packet's length if [`segment_count()`][Self::segment_count] is `<= 1`.
     #[inline]
     pub fn segment_size(&self) -> usize {
-        debug_assert!(self.has_data());
-        self.segment_size
+        debug_assert!(self.has_packet());
+
+        if self.segment_count == 0 {
+            return self.read;
+        }
+
+        self.read / self.segment_count
     }
 
-    /// Returns a time when a kernel received the packet, or `default`.
+    /// Returns number of GRO segments this single packet holds.
+    pub fn segment_count(&self) -> usize {
+        debug_assert!(self.has_packet());
+        self.segment_count
+    }
+
+    /// Returns number of bytes read from network.
+    pub fn len(&self) -> usize {
+        debug_assert!(self.has_packet());
+        self.read
+    }
+
+    /// Returns a time when the kernel received the packet.
     #[inline]
-    pub fn timestamp(&self, default: Instant) -> Instant {
-        debug_assert!(self.has_data());
-        self.timestamp.unwrap_or(default)
+    pub fn timestamp(&self) -> Option<Instant> {
+        debug_assert!(self.has_packet());
+        self.timestamp
     }
 
     /// Transforms into the original buffer.
@@ -206,19 +233,21 @@ impl<B: BufMut> RecvMsg<B> {
 
 /// A single UDP datagram to be sent.
 ///
-/// **Note**:
-/// Receivers **may** route based on the information in the first packet contained in a UDP datagram.
+/// **Notes**:
+/// - Receivers **may** route based on the information in the first packet contained in a UDP datagram.
+///   Therefore, Senders **must not** coalesce QUIC packets with different connection IDs into a single UDP datagram.
 ///
-/// Therefore, Senders **must not** coalesce QUIC packets with different connection IDs into a single UDP datagram.
+///   More: [12.2. Coalescing Packets](https://datatracker.ietf.org/doc/html/rfc9000#name-coalescing-packets)
 ///
-/// More: [12.2. Coalescing Packets](https://datatracker.ietf.org/doc/html/rfc9000#name-coalescing-packets)
+/// - Senders must not combine packets with different ECN into a single GSO message:
+///   multiple messages, each with unique ECN must be formed.
 #[derive(Copy, Clone)]
 pub struct SendMsg<B> {
     buf: B,
     from: IpAddr,
     to: SocketAddr,
     ecn: Ecn,
-    segment_size: usize,
+    segment_count: usize,
 }
 
 impl<B: Buf> SendMsg<B> {
@@ -227,16 +256,26 @@ impl<B: Buf> SendMsg<B> {
     /// * `buf`: buffer with the data to be sent.
     /// * `from`: source address.
     /// * `to`: destination address.
-    /// * `ecn`: ECN.
-    /// * `segment_size`: `non-zero` if packet is segmented for GSO.
+    /// * `ecn`: Explicit Congestion Notification.
+    /// * `segment_count`: number of GSO segments (`> 1` if segmented for GSO).
     ///
     /// # Panics
     ///
     /// - If provided `buf` is empty.
     /// - If `to` address is unspecified.
+    /// - If `segment_count > 1 && buf.len() % segment_count != 0`.
     #[inline]
-    pub fn new(buf: B, from: IpAddr, to: SocketAddr, ecn: Ecn, segment_size: usize) -> Self {
-        assert!(buf.len() != 0, "provided buf must not be empty");
+    pub fn new(buf: B, from: IpAddr, to: SocketAddr, ecn: Ecn, segment_count: usize) -> Self {
+        assert!(buf.len() != 0, "provided 'buf' must not be empty");
+
+        if segment_count > 1 {
+            assert!(
+                buf.len().is_multiple_of(segment_count),
+                "buffer length ({}) must be a multiple of segment count ({})",
+                buf.len(),
+                segment_count
+            )
+        }
 
         {
             let unspecified = match to {
@@ -269,44 +308,148 @@ impl<B: Buf> SendMsg<B> {
             from,
             to,
             ecn,
-            segment_size,
+            segment_count,
         }
     }
 
-    /// Slice that contains data to be sent.
+    /// Returns a slice that contains data to be sent.
     #[inline]
     pub fn io_slice(&self) -> IoSlice<'_> {
-        self.buf.as_read_io_slice()
+        self.buf.as_io_slice()
     }
 
-    /// Source address.
+    /// Returns a source address.
     #[inline]
     pub fn from(&self) -> IpAddr {
         self.from
     }
 
-    /// Destination address.
+    /// Returns a destination address.
     #[inline]
     pub fn to(&self) -> SocketAddr {
         self.to
     }
 
-    /// Explicit Congestion Notification.
+    /// Returns Explicit Congestion Notification value.
     #[inline]
     pub fn ecn(&self) -> Ecn {
         self.ecn
     }
 
-    /// `non-zero` segment size, if the slice is segmented.
+    /// Returns number of GSO segments (`> 1` if segmented for GSO).
     #[inline]
-    pub fn segment_size(&self) -> usize {
-        self.segment_size
+    pub fn segment_count(&self) -> usize {
+        self.segment_count
     }
 
     /// Converts `SendMsg` into the original buffer it was created with.
     #[inline]
     pub fn into_buf(self) -> B {
         self.buf
+    }
+}
+
+
+/// An iterator over `&mut [RecvMsg<B>]`,
+/// providing to consumer singular packets (or segments)
+/// instead of an entire message, that may hold multiple packets inside in case of GRO.
+pub struct MultiMsgFlattenIter<'a, B> {
+    msgs: &'a mut [RecvMsg<B>],
+    msg_index: usize,
+    msg_offset: usize,
+}
+
+impl<'a, B: BufMut> MultiMsgFlattenIter<'a, B> {
+    /// Creates a new iterator on the provided slice.
+    pub fn new(msgs: &'a mut [RecvMsg<B>]) -> Self {
+        Self {
+            msgs,
+            msg_index: 0,
+            msg_offset: 0,
+        }
+    }
+
+    /// Returns a single UDP packet (or GRO segment),
+    /// or `None` if no more packets available.
+    pub fn peek(&mut self) -> Option<Packet<'_>> {
+        while self.msg_index < self.msgs.len() {
+            {
+                if self.msg_offset >= self.msgs[self.msg_index].read {
+                    self.msg_index += 1;
+                    self.msg_offset = 0;
+                    continue;
+                }
+            }
+
+            let msg = &mut self.msgs[self.msg_index];
+            debug_assert_eq!(msg.read % msg.segment_size(), 0);
+            debug_assert_eq!(msg.read % self.msg_offset, 0);
+
+            return Some(Packet {
+                from: msg.from,
+                to: msg.to,
+                ecn: msg.ecn,
+                timestamp: msg.timestamp,
+                payload: {
+                    let range = self.msg_offset..(self.msg_offset + msg.segment_size());
+                    &mut msg.buf.as_slice()[range]
+                },
+            });
+        }
+
+        None
+    }
+
+    /// Tells the iterator to move on to the next packet.
+    pub fn next(&mut self) {
+        let Some(msg) = self.msgs.get(self.msg_index) else {
+            return;
+        };
+
+        self.msg_offset += msg.segment_size();
+        if self.msg_offset >= msg.read {
+            self.msg_index += 1;
+            self.msg_offset = 0;
+        }
+
+        debug_assert_eq!(msg.read % msg.segment_size(), 0);
+        debug_assert_eq!(msg.read % self.msg_offset, 0);
+    }
+}
+
+/// A single, individual packet UDP packet.
+///
+/// May never contain GRO segments inside,
+/// but may be one of these segments.
+#[derive(Debug)]
+pub struct Packet<'a> {
+    /// Source address, always defined.
+    pub from: SocketAddr,
+
+    /// Destination address, always defined.
+    pub to: IpAddr,
+
+    /// Packet's Explicit Congestion Notification.
+    pub ecn: Ecn,
+
+    /// Packet's timestamp set by the kernel.
+    pub timestamp: Option<Instant>,
+
+    /// Underlying data.
+    pub payload: &'a mut [u8],
+}
+
+impl<'a> Deref for Packet<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.payload
+    }
+}
+
+impl<'a> DerefMut for Packet<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.payload
     }
 }
 
@@ -394,45 +537,5 @@ impl Display for ServerName {
             Self::Domain(it) => write!(f, "{}", it),
             Self::Ip(it) => write!(f, "{}", it),
         }
-    }
-}
-
-
-/// A read-only buffer.
-pub trait Buf {
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Returns `[..len()]` slice for reading.
-    fn as_read_slice(&self) -> &[u8];
-
-    /// Returns `[..len()]` I/O slice for reading.
-    fn as_read_io_slice(&self) -> IoSlice<'_> {
-        IoSlice::new(self.as_read_slice())
-    }
-}
-
-/// A mutable buffer.
-pub trait BufMut {
-    fn capacity(&self) -> usize;
-
-    /// Returns `[..capacity()]` slice for writing.
-    fn as_write_slice(&mut self) -> &mut [u8];
-
-    /// Returns `[..len()]` slice for reading.
-    ///
-    /// # Panics
-    ///
-    /// If `len` is greater than [BufMut::capacity].
-    fn as_read_slice(&mut self, len: usize) -> &mut [u8] {
-        &mut self.as_write_slice()[..len]
-    }
-
-    /// Returns `[..capacity()]` slice for writing.
-    fn as_write_io_slice(&mut self) -> IoSliceMut<'_> {
-        IoSliceMut::new(self.as_write_slice())
     }
 }

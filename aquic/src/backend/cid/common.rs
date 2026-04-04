@@ -1,28 +1,38 @@
-use crate::backend::cid::{ConnectionId, ConnectionIdGenerator, IdError, NoopIdMeta};
-use rand::{RngCore, rng};
-use smallvec::SmallVec;
+use crate::backend::cid::{ConnectionId, ConnectionIdGenerator, IdError, MAX_CID_LEN};
+use rand::{Rng, rng};
 
-/// A [ConnIdGenerator] implementation that
-/// simply generates random [ConnectionId] without any additional information.
-pub struct RandConnIdGenerator {
+/// A simple [ConnectionIdGenerator] implementation,
+/// generates purely random connection IDs.
+pub struct RandomIdGenerator {
     length: usize,
 }
 
-impl RandConnIdGenerator {
-    /// Create a new instance with a specified Connection ID length in bytes.
+impl RandomIdGenerator {
+    /// Creates a new instance with a specified Connection ID length,
+    /// which may be zero.
+    ///
+    /// # Panics
+    ///
+    /// If `length` is greater than [MAX_CID_LEN].
     pub fn new(length: usize) -> Self {
+        assert!(
+            length <= MAX_CID_LEN,
+            "'length'({length}) must be <= {MAX_CID_LEN}"
+        );
+
         Self { length }
     }
 }
 
-impl ConnectionIdGenerator for RandConnIdGenerator {
-    type Meta = NoopIdMeta;
+impl ConnectionIdGenerator for RandomIdGenerator {
+    type Meta = ();
 
-    fn generate(&mut self) -> ConnectionId {
-        let mut buffer = SmallVec::from_elem(0, self.length);
-        rng().fill_bytes(&mut buffer.as_mut_slice()[..self.length]);
+    fn generate(&self) -> ConnectionId {
+        let mut cid = [0u8; MAX_CID_LEN];
+        rng().fill_bytes(&mut cid[..self.length]);
 
-        ConnectionId(buffer)
+        ConnectionId::try_from_slice(&cid[..self.length])
+            .expect("'cid' length is guaranteed to be <= MAX_CID_LEN")
     }
 
     fn cid_len(&self) -> usize {
@@ -38,6 +48,6 @@ impl ConnectionIdGenerator for RandConnIdGenerator {
     }
 
     fn parse(&self, _cid: &ConnectionId) -> Result<Self::Meta, IdError> {
-        Ok(NoopIdMeta)
+        Ok(())
     }
 }

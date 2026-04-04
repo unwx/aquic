@@ -8,6 +8,7 @@ use std::{
     collections::BinaryHeap,
     ops::{Deref, DerefMut},
     ptr::NonNull,
+    rc::Rc,
 };
 
 /// Lazy, `!Send`, heap allocated Bip Buffer implementation.
@@ -27,6 +28,47 @@ use std::{
 /// This lazy implementation will create region B only if it is unable to fulfill `commit` request using region A only.
 #[derive(Debug)]
 pub struct BipBuffer {
+    inner: Rc<BipBufferInner>,
+}
+
+/// Mutable [BipBuffer] reserved contiguous chunk of bytes, can be dereferenced as `&[u8]` or `&mut [u8]`.
+///
+/// Dropping it will automatically cancel the reservation.
+///
+/// See also: [BipSliceMut::commit].
+#[derive(Debug)]
+pub struct BipSliceMut<'a> {
+    reservation: Reservation,
+    source: &'a BipBuffer,
+}
+
+/// Shared [BipBuffer] contiguous chunk of bytes, can be dereferenced as `&[u8]`.
+///
+/// Each `BipSlice` has its own ID, that increments in order these slices were committed.
+/// This slice implements [Eq] and [Ord] comparing this ID only.
+///
+/// **Note**: for performance reasons, it is **highly recommended** to drop these slices in a sorted order,
+/// as `BipBuffer` expects all decommits to be done in the same order they were committed.
+/// There is no reason to use this buffer otherwise.
+#[derive(Debug)]
+pub struct BipSlice<'a> {
+    commit: Commit,
+    source: &'a BipBuffer,
+    responsible_for_memory: bool,
+}
+
+/// A [BipSlice] with a detached lifetime.
+///
+/// Has the same properties as the [BipSlice].
+#[derive(Debug)]
+pub struct BipView {
+    commit: Commit,
+    source: Rc<BipBufferInner>,
+}
+
+
+#[derive(Debug)]
+struct BipBufferInner {
     /// A non-null pointer to contiguous bytes allocation.
     ///
     /// **Note**: allocation is created with [Vec::into_boxed_slice], that is `Box<[u8]>`.
@@ -63,32 +105,6 @@ pub struct BipBuffer {
     decommit_tombstones: RefCell<BinaryHeap<Reverse<Commit>>>,
 }
 
-/// Mutable [BipBuffer] reserved contiguous chunk of bytes, can be dereferenced as `&[u8]` or `&mut [u8]`.
-///
-/// Dropping it will automatically cancel the reservation.
-///
-/// See also: [BipSliceMut::commit].
-#[derive(Debug)]
-pub struct BipSliceMut<'a> {
-    reservation: Reservation,
-    source: &'a BipBuffer,
-}
-
-/// Shared [BipBuffer] contiguous chunk of bytes, can be dereferenced as `&[u8]`.
-///
-/// Each `BipSlice` has its own ID, that increments in order these slices were committed.
-/// This slice implements [Eq] and [Ord] comparing this ID only.
-///
-/// **Note**: for performance reasons, it is **highly recommended** to drop different slices in a sorted order,
-/// as `BipBuffer` expects all decommits to be done in the same order they were committed.
-/// There is no reason to use this buffer otherwise.
-#[derive(Debug)]
-pub struct BipSlice<'a> {
-    commit: Commit,
-    source: &'a BipBuffer,
-}
-
-
 #[derive(Debug, Copy, Clone)]
 struct Reservation {
     /// Start index (inclusive) of the reserve (`BipBuffer.buffer`).
@@ -120,15 +136,79 @@ enum Region {
 }
 
 
+/*
+ * BipBuffer impl
+ */
+
 impl BipBuffer {
     /// Creates a new heap allocated bip-buffer.
     ///
     /// `length` is constant, buffer will never resize.
     pub fn new(length: usize) -> Self {
+        Self {
+            inner: Rc::new(BipBufferInner::new(length)),
+        }
+    }
+
+    /// Returns the buffer's length.
+    ///
+    /// It is equal to length this buffer was created with, and will never change.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns number of bytes available for the next [`reserve()`][Self::reserve] call.
+    pub fn available(&self) -> usize {
+        self.inner.available()
+    }
+
+    /// Reserves a specified number of bytes for writing.
+    ///
+    /// Returns `None` if there is no space [`available()`](Self::available).
+    /// Note, it might return `None` even if `strict` is `false`,
+    /// when buffer doesn't have a single byte available.
+    ///
+    /// If `strict` is true, the returned buffer will always have the requested size (no less, no more).
+    /// Otherwise, the returned buffer may have less size than requested.
+    ///
+    /// # Panics
+    ///
+    /// If this method was called before, but the returned [BipSliceMut] was not dropped:
+    /// you cannot have multiple `&mut` references pointing to the same memory.
+    ///
+    /// **Note**: you still can have multiple committed (read-only shared) areas, that is [BipSlice],
+    /// as they point into different, committed chunks.
+    pub fn reserve(&self, request: usize, strict: bool) -> Option<BipSliceMut<'_>> {
+        self.inner
+            .reserve(request, strict)
+            .map(|reservation| BipSliceMut {
+                reservation,
+                source: self,
+            })
+    }
+
+
+    fn commit(&self, reservation: Reservation, commit_len: usize) -> Option<BipSlice<'_>> {
+        let commit = self.inner.commit(reservation, commit_len)?;
+
+        Some(BipSlice {
+            commit,
+            source: self,
+            responsible_for_memory: true,
+        })
+    }
+
+    fn decommit(&self, value: Commit) {
+        self.inner.decommit(value);
+    }
+}
+
+impl BipBufferInner {
+    pub fn new(length: usize) -> Self {
         let mut buffer_box = vec![0u8; length].into_boxed_slice();
         let thin_ptr = buffer_box.as_mut_ptr(); // *mut u8
         let buffer = NonNull::new(thin_ptr).unwrap();
-        Box::into_raw(buffer_box);
+        let _ = Box::into_raw(buffer_box);
 
         Self {
             buffer,
@@ -149,14 +229,10 @@ impl BipBuffer {
     }
 
 
-    /// Returns the buffer's length.
-    ///
-    /// It is equal to length this buffer was created with, and will never change.
     pub fn len(&self) -> usize {
         self.length
     }
 
-    /// Returns number of bytes available for the next [`reserve()`][Self::reserve] call.
     pub fn available(&self) -> usize {
         // - : Free Space
         // * : Region A
@@ -180,21 +256,8 @@ impl BipBuffer {
         usize::max(self.a_start.get(), self.length - self.a_end.get())
     }
 
-    /// Reserves a specified number of bytes for writing.
-    ///
-    /// Returns `None` if there is no space [`available()`](Self::available).
-    ///
-    /// If `strict` is true, the returned buffer will always have the requested size (no less, no more).
-    /// Otherwise, the returned buffer may have less size than requested.
-    ///
-    /// # Panics
-    ///
-    /// If this method was called before, but the returned [BipSliceMut] was not dropped:
-    /// you cannot have multiple `&mut` references pointing to the same memory.
-    ///
-    /// **Note**: you still can have multiple committed (read-only shared) areas, that is [BipSlice],
-    /// as they point into different, committed chunks.
-    pub fn reserve(&self, request: usize, strict: bool) -> Option<BipSliceMut<'_>> {
+
+    pub fn reserve(&self, request: usize, strict: bool) -> Option<Reservation> {
         if self.reserved.get() {
             panic!("drop previous reservation first, before trying to reserve a new one");
         }
@@ -245,27 +308,17 @@ impl BipBuffer {
         let reserve_end = reserve_start + reserve_len;
         self.reserved.set(true);
 
-        Some(BipSliceMut {
-            reservation: Reservation {
-                start: reserve_start,
-                end: reserve_end,
-                region: reserve_region,
-            },
-            source: self,
+        Some(Reservation {
+            start: reserve_start,
+            end: reserve_end,
+            region: reserve_region,
         })
     }
 
 
-    fn commit(&self, reservation: Reservation, commit_len: usize) -> Option<BipSlice<'_>> {
-        if commit_len == 0 {
-            return None;
-        }
+    fn commit(&self, reservation: Reservation, commit_len: usize) -> Option<Commit> {
         if commit_len > reservation.len() {
-            panic!(
-                "unable to commit more memory ({}) than it was initially reserved ({})",
-                commit_len,
-                reservation.len()
-            );
+            return None;
         }
 
         let id = Self::get_and_inc(&self.commit_id_sequence);
@@ -282,17 +335,17 @@ impl BipBuffer {
             }
         }
 
-        Some(BipSlice {
-            commit: Commit {
-                id,
-                start: commit_start,
-                end: commit_end,
-            },
-            source: self,
+        Some(Commit {
+            id,
+            start: commit_start,
+            end: commit_end,
         })
     }
 
     fn decommit(&self, value: Commit) {
+        if value.len() == 0 {
+            return;
+        }
         if value.id != self.decommit_next_id.get() {
             self.decommit_tombstones.borrow_mut().push(Reverse(value));
             return;
@@ -370,7 +423,7 @@ impl BipBuffer {
     }
 }
 
-impl Drop for BipBuffer {
+impl Drop for BipBufferInner {
     fn drop(&mut self) {
         let thin_ptr = self.buffer.as_ptr();
 
@@ -379,7 +432,11 @@ impl Drop for BipBuffer {
 
         // SAFERY: slice_ptr is valid, and we own this memory.
         // Other parts, like `BipSlice` or `BipSliceMut` do not deallocate this memory.
-        unsafe { Box::from_raw(slice_ptr) };
+        //
+        // BipBufferInner is dropped only if no one references it.
+        unsafe {
+            let _ = Box::from_raw(slice_ptr);
+        };
     }
 }
 
@@ -389,16 +446,44 @@ impl Drop for BipBuffer {
  */
 
 impl<'a> BipSliceMut<'a> {
-    /// Requests a part (or complete) reserved area to be committed and ready to read,
-    /// after a successful write operation for a `len` bytes.
+    /// Requests a part (or complete) reserved area to be committed and ready to read.
     ///
-    /// Returns a shared, read-only slice, or `None` if `len` is zero.
+    /// Returns a shared, read-only slice.
+    ///
+    /// This method may be called again,
+    /// and each call consumes the `len` bytes from the reservation.
     ///
     /// # Panics
     ///
-    /// If `len` is greater than initially reserved chunk size.
-    pub fn commit(self, len: usize) -> Option<BipSlice<'a>> {
-        self.source.commit(self.reservation, len)
+    /// If `len` is greater than available reserved memory.
+    pub fn commit(&mut self, len: usize) -> BipSlice<'a> {
+        self.try_commit(len).unwrap_or_else(|| {
+            panic!(
+                "commit() request is greater than reserved area: requested {}, but only {} bytes are reserved",
+                len,
+                self.reservation.len()
+            )
+        })
+    }
+
+    /// Requests a part (or complete) reserved area to be committed and ready to read.
+    ///
+    /// Returns a shared, read-only view.
+    /// Or `None` if commit request is longer than reserved area.
+    ///
+    /// This method may be called again,
+    /// and each call consumes the `len` bytes from the reservation.
+    pub fn try_commit(&mut self, len: usize) -> Option<BipSlice<'a>> {
+        let slice = self.source.commit(self.reservation, len)?;
+
+        self.reservation = Reservation {
+            // If `reservation.start + len` > `reservation.end`, commit() method above should return None.
+            start: usize::min(self.reservation.start + len, self.reservation.end),
+            end: self.reservation.end,
+            region: self.reservation.region,
+        };
+
+        Some(slice)
     }
 }
 
@@ -407,8 +492,13 @@ impl<'a> Deref for BipSliceMut<'a> {
 
     fn deref(&self) -> &Self::Target {
         // SAFETY: [BipBuffer] guarantees an exclusive access to area in [reservation.start..reservation.end] range.
-        let thin_ptr =
-            unsafe { self.source.buffer.as_ptr().add(self.reservation.start) } as *const _;
+        let thin_ptr = unsafe {
+            self.source
+                .inner
+                .buffer
+                .as_ptr()
+                .add(self.reservation.start)
+        } as *const _;
 
         // SAFETY: thin_ptr is valid, and [BipBuffer] guarantees its exclusive access.
         unsafe { slice::from_raw_parts(thin_ptr, self.reservation.len()) }
@@ -418,7 +508,13 @@ impl<'a> Deref for BipSliceMut<'a> {
 impl<'a> DerefMut for BipSliceMut<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: [BipBuffer] guarantees an exclusive access to area in [reservation.start..reservation.end] range.
-        let thin_ptr = unsafe { self.source.buffer.as_ptr().add(self.reservation.start) };
+        let thin_ptr = unsafe {
+            self.source
+                .inner
+                .buffer
+                .as_ptr()
+                .add(self.reservation.start)
+        };
 
         // SAFETY: thin_ptr is valid, and [BipBuffer] guarantees its exclusive access.
         unsafe { slice::from_raw_parts_mut(thin_ptr, self.reservation.len()) }
@@ -430,14 +526,14 @@ impl<'a> BufMut for BipSliceMut<'a> {
         self.reservation.len()
     }
 
-    fn as_write_slice(&mut self) -> &mut [u8] {
+    fn as_slice(&mut self) -> &mut [u8] {
         self.deref_mut()
     }
 }
 
 impl<'a> Drop for BipSliceMut<'a> {
     fn drop(&mut self) {
-        self.source.reserved.set(false);
+        self.source.inner.reserved.set(false);
     }
 }
 
@@ -447,6 +543,17 @@ impl<'a> Drop for BipSliceMut<'a> {
  */
 
 impl<'a> BipSlice<'a> {
+    /// Detaches from origin,
+    /// basically replacing a `&'a BipBuffer` with `Rc<BipBuffer>`.
+    pub fn detach(mut self) -> BipView {
+        self.responsible_for_memory = false;
+
+        BipView {
+            commit: self.commit,
+            source: self.source.inner.clone(),
+        }
+    }
+
     /// Release the committed area to be accessible for write operations.
     ///
     /// It is highly recommended to decommit in sorted order, to avoid performance penalties.
@@ -464,7 +571,8 @@ impl<'a> Deref for BipSlice<'a> {
         // SAFETY: [BipBuffer] guarantees an exclusive access to area in [self.start..self.end] range.
         //
         // We use this area only for read-only purposes.
-        let thin_ptr = unsafe { self.source.buffer.as_ptr().add(self.commit.start) } as *const _;
+        let thin_ptr =
+            unsafe { self.source.inner.buffer.as_ptr().add(self.commit.start) } as *const _;
 
         // SAFETY: thin_ptr is valid, and [BipBuffer] guarantees its exclusive access.
         unsafe { slice::from_raw_parts(thin_ptr, self.commit.len()) }
@@ -476,21 +584,14 @@ impl<'a> Buf for BipSlice<'a> {
         self.commit.len()
     }
 
-    fn as_read_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         self.deref()
     }
 }
 
-impl<'a> Drop for BipSlice<'a> {
-    fn drop(&mut self) {
-        self.source.decommit(self.commit);
-    }
-}
-
-
 impl<'a> PartialEq for BipSlice<'a> {
     fn eq(&self, other: &Self) -> bool {
-        self.commit.id == other.commit.id
+        self.commit == other.commit
     }
 }
 
@@ -498,13 +599,89 @@ impl<'a> Eq for BipSlice<'a> {}
 
 impl<'a> PartialOrd for BipSlice<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.commit.id.partial_cmp(&other.commit.id)
+        Some(self.cmp(other))
     }
 }
 
 impl<'a> Ord for BipSlice<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.commit.id.cmp(&other.commit.id)
+        self.commit.cmp(&other.commit)
+    }
+}
+
+impl<'a> Drop for BipSlice<'a> {
+    fn drop(&mut self) {
+        if self.responsible_for_memory {
+            self.source.decommit(self.commit);
+        }
+    }
+}
+
+
+/*
+ * BipView impl
+ */
+
+impl BipView {
+    /// Release the committed area to be accessible for write operations.
+    ///
+    /// It is highly recommended to decommit in sorted order, to avoid performance penalties.
+    ///
+    /// It is not mandatory to call this method, `drop()` will do just the same.
+    pub fn decommit(self) {
+        // Drop.
+    }
+}
+
+impl Deref for BipView {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY:
+        // - [BipBuffer] guarantees an exclusive access to area in [self.start..self.end] range.
+        // - [BipSlice] transfered an ownership to us, without deallocating it.
+        //
+        // We use this area only for read-only purposes.
+        let thin_ptr = unsafe { self.source.buffer.as_ptr().add(self.commit.start) } as *const _;
+
+        // SAFETY: thin_ptr is valid, and [BipBuffer] guarantees its exclusive access.
+        unsafe { slice::from_raw_parts(thin_ptr, self.commit.len()) }
+    }
+}
+
+impl Buf for BipView {
+    fn len(&self) -> usize {
+        self.commit.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.deref()
+    }
+}
+
+impl PartialEq for BipView {
+    fn eq(&self, other: &Self) -> bool {
+        self.commit == other.commit
+    }
+}
+
+impl Eq for BipView {}
+
+impl PartialOrd for BipView {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BipView {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.commit.cmp(&other.commit)
+    }
+}
+
+impl Drop for BipView {
+    fn drop(&mut self) {
+        self.source.decommit(self.commit);
     }
 }
 
@@ -540,7 +717,7 @@ impl Eq for Commit {}
 
 impl PartialOrd for Commit {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.id.partial_cmp(&other.id)
+        Some(self.cmp(other))
     }
 }
 

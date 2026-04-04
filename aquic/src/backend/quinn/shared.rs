@@ -1,13 +1,5 @@
-use crate::{
-    backend::cid::{ConnectionId, ConnectionIdGenerator},
-    net::Ecn,
-};
-use quinn_proto::{EcnCodepoint, InvalidCid, VarInt};
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-
+use crate::{net::Ecn, stream::StreamId};
+use quinn_proto::{EcnCodepoint, VarInt};
 
 impl From<Ecn> for Option<EcnCodepoint> {
     fn from(value: Ecn) -> Self {
@@ -33,75 +25,24 @@ impl From<Option<EcnCodepoint>> for Ecn {
     }
 }
 
-pub(crate) fn u64_into_varint(value: u64) -> VarInt {
-    VarInt::from_u64(value).unwrap_or_else(|e| {
-        panic!("unable to convert `u64` ({value}) into quinn_proto::VarInt: {e}");
-    })
-}
-
-
-// `quinn_proto::ConnectionIdGenerator` has a `Sync` requirement.
-//
-// It is expected to have zero contention,
-// but I also don't want to risk and implement unsafe `Sync` for it,
-// because things change from time to time.
-pub(super) struct SyncConnectionIdGenerator<T> {
-    inner: Arc<Mutex<T>>,
-    length: usize,
-    lifetime: Option<Duration>,
-}
-
-impl<T: ConnectionIdGenerator> SyncConnectionIdGenerator<T> {
-    pub fn new(inner: T, lifetime: Option<Duration>) -> Self {
-        let length = inner.cid_len();
-
-        Self {
-            inner: Arc::new(Mutex::new(inner)),
-            length,
-            lifetime,
-        }
+impl From<quinn_proto::StreamId> for StreamId {
+    fn from(value: quinn_proto::StreamId) -> Self {
+        StreamId::new(u64::from(value)).unwrap_or_else(|e| {
+            panic!("unable to convert `quinn_proto::StreamId` ({value}) into aquic::stream::StreamId: {e}");
+        })
     }
 }
 
-impl<T: ConnectionIdGenerator> quinn_proto::ConnectionIdGenerator for SyncConnectionIdGenerator<T> {
-    fn generate_cid(&mut self) -> quinn_proto::ConnectionId {
-        let cid = self.inner.lock().unwrap().generate();
-        quinn_proto::ConnectionId::new(cid.as_slice())
-    }
-
-    fn validate(&self, cid: &quinn_proto::ConnectionId) -> Result<(), InvalidCid> {
-        let mut cid = ConnectionId::from_slice(cid.as_ref());
-        let inner = self.inner.lock().unwrap();
-
-        if inner.validate(&cid) {
-            return Ok(());
-        }
-        if inner.decrypt(&mut cid).is_err() {
-            return Err(InvalidCid);
-        };
-
-        if inner.validate(&cid) {
-            Ok(())
-        } else {
-            Err(InvalidCid)
-        }
-    }
-
-    fn cid_len(&self) -> usize {
-        self.length
-    }
-
-    fn cid_lifetime(&self) -> Option<Duration> {
-        self.lifetime
+impl From<StreamId> for quinn_proto::VarInt {
+    fn from(value: StreamId) -> Self {
+        quinn_proto::VarInt::from_u64(value.raw()).unwrap_or_else(|e| {
+            panic!("unable to convert `aquic::stream::StreamId` ({value}) into quinn_proto::VarInt: {e}");
+        })
     }
 }
 
-impl<T> Clone for SyncConnectionIdGenerator<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            length: self.length,
-            lifetime: self.lifetime,
-        }
+impl From<StreamId> for quinn_proto::StreamId {
+    fn from(value: StreamId) -> Self {
+        quinn_proto::StreamId::from(VarInt::from(value))
     }
 }

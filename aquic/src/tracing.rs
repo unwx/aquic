@@ -172,7 +172,7 @@ impl StreamSpan {
         StreamSpan(debug_span!(
             parent: &parent.0,
             "quic_stream",
-            stream_id = id,
+            stream_id = %id,
             direction = %direction,
             initiator = %initiator,
             close_code = field::Empty,

@@ -1,49 +1,95 @@
+use crate::{
+    backend::quinn::{Connection, connection::QuinnConnectionId},
+    util::{TimerKey, TimerTick, WheelTimer},
+};
 use std::time::{Duration, Instant};
 
-use crate::backend::{
-    quinn::{Config, QuinnConnectionId},
-    util::TimerWheel,
-};
-
 pub(super) struct Time {
-    /// Scheduled events.
-    pub timer: TimerWheel<TimeoutEvent>,
+    /// Timer to schedule and poll events.
+    timer: WheelTimer<Option<TimerEvent>>,
 
-    /// Fired events.
-    pub fired_events: Vec<TimeoutEvent>,
+    /// Fired events that are ready to be handled.
+    fired_events: Vec<TimerTick<Option<TimerEvent>>>,
 
-    /// When the next `timer` tick should happen.
-    pub timer_next_tick_time: Instant,
-
-    /// Internal clock, shows current time.
-    pub clock: Instant,
+    /// Current monotonical time.
+    clock: Instant,
 }
 
 impl Time {
-    pub fn new(config: &Config) -> Self {
-        debug_assert!(
-            config.max_timeout_miss.as_millis() > 0,
-            "provided config is invalid: 'max_timeout_miss.as_millis()' is zero"
-        );
-
+    pub fn new() -> Self {
         let clock = Instant::now();
 
-        let timer = if config.max_idle_timeout.as_millis() != 0 {
-            TimerWheel::new(config.max_timeout_miss, config.max_idle_timeout)
-        } else {
-            TimerWheel::with_capacity(Duration::from_hours(1), Duration::from_hours(1), 0, 0)
-        };
+        let fired_events = Vec::new();
+        let timer = WheelTimer::new(Duration::from_millis(1), Duration::from_millis(64), clock);
 
         Self {
             timer,
-            fired_events: Vec::new(),
-            timer_next_tick_time: clock,
+            fired_events,
             clock,
         }
+    }
+
+
+    /// Schedules an event to fire at the specified time.
+    #[inline]
+    pub fn schedule(&mut self, event: TimerEvent, at: Instant) -> TimerKey {
+        self.timer.schedule(Some(event), at, self.clock)
+    }
+
+    /// Cancels a previously scheduled event and replaces it with a new one.
+    pub fn reschedule(
+        &mut self,
+        event: TimerEvent,
+        at: Instant,
+        mut previous_key: Option<TimerKey>,
+    ) -> TimerKey {
+        if let Some(key) = previous_key.take() {
+            self.timer.cancel(key);
+        }
+
+        self.schedule(event, at)
+    }
+
+    /// Cancels all events related to this connection.
+    pub fn cancel_all(&mut self, connection: &mut Connection) {
+        if let Some(key) = connection.pop_timer_key() {
+            self.timer.cancel(key);
+        }
+    }
+
+
+    /// Sleeps until there is a scheduled event to handle.
+    ///
+    /// # Cancel Safety
+    ///
+    /// Cancel safe, no side effects.
+    pub async fn sleep(&mut self) {
+        self.timer.next(&mut self.fired_events, self.clock).await;
+    }
+
+    /// Returns all fired events, that are ready to be handled.
+    pub fn fired_events(&mut self) -> &mut Vec<TimerTick<Option<TimerEvent>>> {
+        &mut self.fired_events
+    }
+
+
+    /// Updates internal clocks.
+    pub fn update_clock(&mut self) {
+        self.clock = Instant::now();
+    }
+
+    /// Returns current monotonical time.
+    pub fn now(&self) -> Instant {
+        self.clock
     }
 }
 
 
-/// QUIC connection timed out.
+/*
+ * Quinn proto doesn't support ability to send transport errors,
+ * therefore we cannot provide `EstablishTimeout` timer,
+ * as we cannot refuse the connection manually after it was accepted by `quinn_proto::Endpoint`.
+ */
+
 #[derive(Debug, Copy, Clone)]
-pub(super) struct TimeoutEvent(pub QuinnConnectionId);
+pub(super) struct TimerEvent(pub QuinnConnectionId);

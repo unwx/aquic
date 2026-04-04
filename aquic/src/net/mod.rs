@@ -3,50 +3,41 @@ use std::future::Future;
 use std::io::Result;
 use std::net::SocketAddr;
 
+mod buf;
+pub use buf::*;
 
 mod types;
 pub use types::*;
 
 
 /// A socket to be used for QUIC connections.
-///
-/// In theory application may provide a socket implementation that works not on UDP, but on something else.
-/// Though I believe it may not worth it...
-///
-/// In ideal scenario, QUIC backend and Socket will support GSO/GRO and sendmmsg/recvmmsg combined.
-/// Therefore we might send many different packets for different connections in a single syscall, like:
-/// - 1 GSO packet for CID `A`,
-/// - 3 packets that are not padded to the previous packet GSO size for CID `A`,
-/// - 2 packets for CID `B`.
-///
-/// Ideally, the total payload of these packets should not exceed the socket's buffer.
 pub trait Socket: Sized {
     /// Creates and binds a new socket to the specified address.
     ///
     /// Implementation **shoud** attempt to:
-    /// - Reuse port (for example, `SO_REUSEPORT` on Linux) to permits multiple sockets to be bound to an identical socket address.
+    /// - Reuse port (for example, `SO_REUSEPORT` on Linux) to permit multiple sockets to be bound to an identical socket address.
     /// - Enable GRO (for example, `UDP_GRO` on Linux) to make the socket receive multiple datagrams worth of data as a single large buffer.
     /// - Set Don't Fragment (for example, `IP_DONTFRAG` with `IP_PMTUDISC_DO` on Linux) to make socket return an error if packet size exceeds MTU.
     fn bind(addr: SocketAddr) -> impl Future<Output = Result<Self>> + SendOnMt;
 
     /// Returns an address this socket is bound to.
     ///
-    /// **May** be unspecified.
-    fn source_addr(&self) -> SocketAddr;
+    /// IP **may** be unspecified, but port must always be specified.
+    fn listen_addr(&self) -> SocketAddr;
 
     /// Sends a batch of messages.
     ///
     /// Returns the number of messages successfully flushed to the network.
     ///
-    /// In case of partial write, the caller should wait until [`ready_to_send`](Socket::ready_to_send) returns.
-    fn send<B: Buf>(&self, msgs: &[SendMsg<B>]) -> impl Future<Output = Result<usize>> + SendOnMt;
+    /// In case of partial write, the caller should wait until [`send_unblocked`](Socket::send_unblocked) returns.
+    fn send<B: Buf>(&self, msgs: &[SendMsg<B>]) -> Result<usize>;
 
-    // Waits until the socket become ready to send packets again.
-    fn ready_to_send(&self) -> impl Future<Output = ()> + SendOnMt;
+    /// Waits until the socket become ready to send packets again.
+    fn send_unblocked(&self) -> impl Future<Output = ()>;
 
     /// Receives a batch of messages.
     ///
-    /// The `msgs` slice will be filled with incoming packets.
+    /// The `&mut msgs` slice will be filled with incoming packets.
     /// Returns the number of messages successfully read.
     fn recv<B: BufMut>(
         &self,
