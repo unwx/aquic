@@ -66,6 +66,29 @@ pub struct ClientConfig {
     ///
     /// Default is `30` seconds.
     pub establish_timeout: Option<Duration>,
+
+    /// Maximum number of entries in the session cache.
+    ///
+    /// Session cache is used to store QUIC sessions to open 0-RTT connections.
+    ///
+    /// Default is `256`.
+    pub session_cache_max_capacity: usize,
+
+    /// Time to live for entries in the session cache.
+    ///
+    /// The difference between `time_to_live` and `time_to_idle`
+    /// is that the former is the maximum lifetime of an entry since its creation,
+    /// while the latter is the maximum lifetime of an entry since its last access.
+    ///
+    /// Default is `24h`.
+    pub session_cache_time_to_live: Option<Duration>,
+
+    /// Time to idle for entries in the session cache.
+    ///
+    /// See [`session_cache_time_to_live`][Self::session_cache_time_to_live].
+    ///
+    /// Default is `3h`.
+    pub session_cache_time_to_idle: Option<Duration>,
 }
 
 
@@ -114,6 +137,9 @@ impl ClientConfig {
         Self {
             quiche: config,
             establish_timeout: Some(Duration::from_secs(30)),
+            session_cache_max_capacity: 256,
+            session_cache_time_to_live: Some(Duration::from_hours(24)),
+            session_cache_time_to_idle: Some(Duration::from_hours(3)),
         }
     }
 }

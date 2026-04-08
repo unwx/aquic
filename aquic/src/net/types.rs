@@ -509,7 +509,7 @@ impl std::error::Error for ServerNameError {}
 /// let other_name = ServerName::try_from("192.168.1.100").unwrap();
 /// println!("{}", name);
 /// ```
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServerName {
     Domain(UncertainName<Vec<u8>>),
     Ip(IpAddr),

@@ -6,6 +6,7 @@ use crate::{
         quiche::{
             connection::{Connection, ConnectionKey, Connections, QuicheConnectionId},
             io::{ForceWrite, IO},
+            session::{QuicSession, SessionCache},
             time::{Time, TimerEvent, TimerKind},
         },
     },
@@ -37,6 +38,7 @@ use tracing::error;
 mod config;
 mod connection;
 mod io;
+mod session;
 mod time;
 
 pub use config::Config;
@@ -63,6 +65,9 @@ pub struct QuicheBackend<CIdG: ConnectionIdGenerator, SCfg: ServerTypes = ()> {
 
     /// Everything related to time & scheduling.
     time: Time,
+
+    /// Client sessions cache, used for 0-RTT connection resumption.
+    session_cache: SessionCache,
 
     /// Events produced by this backend.
     events: BackendEvents<QuicheConnectionId>,
@@ -104,10 +109,20 @@ where
             }
         }
 
+        let session_cache = match config.client.as_ref() {
+            Some(config) => SessionCache::new(
+                config.session_cache_max_capacity,
+                config.session_cache_time_to_live,
+                config.session_cache_time_to_idle,
+            ),
+            None => SessionCache::new(0, None, None),
+        };
+
         Self {
             connections: Connections::new(),
             io: IO::new(config.out_buffer_size),
             time: Time::new(),
+            session_cache,
             events: BackendEvents::new(),
             listen_addr,
             config,
@@ -157,7 +172,7 @@ where
             return Err(Error::Illegal);
         };
 
-        let connection = {
+        let mut connection = {
             let server_name = server_name.to_string();
             let scid = self.config.connection_id_generator.generate();
 
@@ -176,6 +191,17 @@ where
             .map(|it| Connection::new(it, true))
             .map_err(|e| Error::Other(e.to_string().into()))?
         };
+
+        if let Some(session) = self.session_cache.get(server_name) {
+            if let Err(e) = connection.set_session(session.tls_ticket.as_ref()) {
+                error!(
+                    scid = ?connection.source_id(),
+                    dcid = ?connection.destination_id(),
+                    "unable to reuse {server_name} TLS session for a new connection: {e}"
+                );
+                debug_panic!("unable to reuse TLS session for a new connection, see logs above");
+            }
+        }
 
         let connection_id = self.register_new_connection(connection, peer_addr);
         Ok(connection_id)
@@ -715,6 +741,37 @@ where
         if connection.is_established() {
             if let Some(key) = connection.pop_timer_key(TimerKind::EstablishTimeout) {
                 self.time.cancel(key);
+            }
+
+            'session: {
+                if connection.is_server() {
+                    break 'session;
+                }
+                let Some(session) = connection.session() else {
+                    break 'session;
+                };
+                let Some(server_name) = connection.server_name() else {
+                    break 'session;
+                };
+
+                match ServerName::try_from(server_name) {
+                    Ok(name) => {
+                        self.session_cache.insert(
+                            name,
+                            QuicSession::new(Vec::from(session).into_boxed_slice()),
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            connection_id = %connection.id(connection_key),
+                            "unable to store client connection TLS session into the session cache: \
+                            unable to parse server_name ({server_name}) into aquic::net::ServerName: {e}"
+                        );
+                        debug_panic!(
+                            "unable to store client connection TLS session into the session cache, see logs above"
+                        );
+                    }
+                }
             }
 
             self.allocate_scids(connection_key);

@@ -1,9 +1,9 @@
 use crate::stream::{Error, Payload, Priority};
-use crate::sync::TryRecvError;
 use crate::sync::mpmc::oneshot::{self, OneshotReceiver, OneshotSender};
 use crate::sync::mpmc::watch::{self, WatchReceiver, WatchSender};
 use crate::sync::mpsc::weighted;
 use crate::sync::mpsc::weighted::{WeightedReceiver, WeightedSender};
+use crate::sync::{SmartRc, TryRecvError};
 use crate::{Estimate, Spec};
 use futures::{FutureExt, select_biased};
 use std::any::type_name;
@@ -22,25 +22,29 @@ use std::time::Instant;
 /// It also may be `zero`, to hold no more than `1` item (unless its weight is `zero` too).
 pub(crate) fn channel<S: Spec>(
     bound: usize,
-    shutdown_warn_receiver: oneshot::Receiver<Instant>,
+    conn_establish_receiver: oneshot::Receiver<()>,
+    conn_shutdown_warn_receiver: oneshot::Receiver<Instant>,
 ) -> (Sender<S>, Receiver<S>) {
     let (item_sender, item_receiver) = weighted::channel(bound);
     let (error_sender, error_receiver) = oneshot::channel();
     let (priority_sender, priority_receiver) = watch::channel();
 
+    let shared = SmartRc::new(Shared {
+        error_sender,
+        error_receiver,
+        conn_establish_receiver,
+        conn_shutdown_warn_receiver,
+    });
+
     let stream_sender = Sender {
         item_sender,
-        error_sender: error_sender.clone(),
-        error_receiver: error_receiver.clone(),
-        shutdown_warn_receiver: shutdown_warn_receiver.clone(),
         priority_sender,
+        shared: shared.clone(),
     };
     let stream_receiver = Receiver {
         item_receiver,
-        error_sender,
-        error_receiver,
-        shutdown_warn_receiver,
         priority_receiver,
+        shared,
     };
 
     (stream_sender, stream_receiver)
@@ -74,17 +78,11 @@ pub struct Sender<S: Spec> {
     /// Send actual data chunks.
     item_sender: weighted::Sender<Payload<S::StreamItem>>,
 
-    /// Broadcast the closure event of this stream direction.
-    error_sender: oneshot::Sender<Error<S>>,
-
-    /// Listen for an external closure event (e.g., peer sends [Error::Stop]).
-    error_receiver: oneshot::Receiver<Error<S>>,
-
-    /// Listen for a warning, that connection is going to be closed at informed point of time.
-    shutdown_warn_receiver: oneshot::Receiver<Instant>,
-
     /// Send stream priority updates.
     priority_sender: watch::Sender<Priority>,
+
+    /// Shared channels.
+    shared: SmartRc<Shared<S>>,
 }
 
 impl<S: Spec> Sender<S> {
@@ -134,7 +132,7 @@ impl<S: Spec> Sender<S> {
     /// **Notes**:
     /// - Item's weight may be `0`.
     /// - If `bound` is `0`, the channel will block if there is more than `1` item in the internal queue,
-    /// **unless** its weight is `0`.
+    ///   **unless** its weight is `0`.
     ///
     /// # Returns
     ///
@@ -149,7 +147,7 @@ impl<S: Spec> Sender<S> {
         let weight = item.estimate();
 
         select_biased! {
-            err = self.error_receiver.recv().fuse() => {
+            err = self.shared.error_receiver.recv().fuse() => {
                 let err = err.unwrap_or_else(|| Self::err_rx_fallback_error());
                 Err(self.close(err))
             },
@@ -204,7 +202,7 @@ impl<S: Spec> Sender<S> {
 
     /// Returns error if direction is closed.
     pub fn error(&self) -> Option<Error<S>> {
-        match self.error_receiver.try_recv() {
+        match self.shared.error_receiver.try_recv() {
             Ok(err) => Some(err),
             Err(TryRecvError::Closed) => Some(Self::err_rx_fallback_error()),
             Err(TryRecvError::Empty) => None,
@@ -216,18 +214,18 @@ impl<S: Spec> Sender<S> {
     /// This allows external observers to wait for the
     /// stream direction to complete without holding a mutable reference to the sender.
     pub fn error_receiver(&self) -> oneshot::Receiver<Error<S>> {
-        self.error_receiver.clone()
+        self.shared.error_receiver.clone()
     }
 
-    /// Returns a shutdown warning receiver.
+    /// Returns a connection shutdown warning receiver.
     ///
     /// It's a receiver, used to listen for a warning,
     /// that connection is going to be closed at informed point of time.
     ///
     /// This allows external observers to wait for
     /// this signal and act accordingly to gracefully shutdown the stream, if possible.
-    pub fn shutdown_warn_receiver(&self) -> oneshot::Receiver<Instant> {
-        self.shutdown_warn_receiver.clone()
+    pub fn conn_shutdown_warn_receiver(&self) -> oneshot::Receiver<Instant> {
+        self.shared.conn_shutdown_warn_receiver.clone()
     }
 
 
@@ -244,7 +242,7 @@ impl<S: Spec> Sender<S> {
     ///
     /// If the channel is still open, returns a clone of the provided `error`.
     fn close(&mut self, error: Error<S>) -> Error<S> {
-        match self.error_sender.send(error.clone()) {
+        match self.shared.error_sender.send(error.clone()) {
             Ok(_) => error,
             Err(oneshot::SendError::Closed) => Self::err_rx_fallback_error(),
             Err(oneshot::SendError::Full(actual_error)) => actual_error,
@@ -298,17 +296,11 @@ pub struct Receiver<S: Spec> {
     /// Receive actual data chunks.
     item_receiver: weighted::Receiver<Payload<S::StreamItem>>,
 
-    /// Broadcast the closure event of this stream direction.
-    error_sender: oneshot::Sender<Error<S>>,
-
-    /// Listen for an external closure event (e.g., peer sends [Error::Reset]).
-    error_receiver: oneshot::Receiver<Error<S>>,
-
-    /// Listen for a warning, that connection is going to be closed at informed point of time.
-    shutdown_warn_receiver: oneshot::Receiver<Instant>,
-
     /// Listen for stream priority updates.
     priority_receiver: watch::Receiver<Priority>,
+
+    /// Shared channels.
+    shared: SmartRc<Shared<S>>,
 }
 
 impl<S: Spec> Receiver<S> {
@@ -334,7 +326,7 @@ impl<S: Spec> Receiver<S> {
         }
 
         let event = {
-            let mut recv_error_fut = pin!(self.error_receiver.recv());
+            let mut recv_error_fut = pin!(self.shared.error_receiver.recv());
             let recv_error_fut = poll_fn(|cx| match recv_error_fut.as_mut().poll(cx) {
                 // Ignore `Finish` errors.
                 //
@@ -378,7 +370,7 @@ impl<S: Spec> Receiver<S> {
     ///
     /// More: [`recv()`][Receiver::recv].
     pub fn try_recv(&mut self) -> Result<Option<Payload<S::StreamItem>>, Error<S>> {
-        match self.error_receiver.try_recv() {
+        match self.shared.error_receiver.try_recv() {
             Ok(e) => {
                 return Err(self.close(e));
             }
@@ -436,6 +428,17 @@ impl<S: Spec> Receiver<S> {
     }
 
 
+    /// Returns `true` if connection is established, `false` otherwise.
+    /// It is used to detect untrusted 0-RTT data, which is sent before connection is established.
+    ///
+    /// See also: [`conn_establish_receiver()`][Self::conn_establish_receiver].
+    pub fn is_conn_established(&mut self) -> bool {
+        match self.shared.conn_establish_receiver.try_recv() {
+            Ok(_) => true,
+            Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => false,
+        }
+    }
+
     /// Returns error if direction is closed.
     ///
     /// **Note**: there might be still data available in [Self::recv]
@@ -443,7 +446,7 @@ impl<S: Spec> Receiver<S> {
     ///
     /// Call [Self::try_recv] if there is a need to know whether everything is consumed.
     pub fn error(&self) -> Option<Error<S>> {
-        match self.error_receiver.try_recv() {
+        match self.shared.error_receiver.try_recv() {
             Ok(err) => Some(err),
             Err(TryRecvError::Closed) => Some(Self::err_rx_fallback_error()),
             Err(TryRecvError::Empty) => None,
@@ -455,18 +458,26 @@ impl<S: Spec> Receiver<S> {
     /// This allows external observers to wait for the
     /// stream direction to complete without holding a mutable reference to the sender.
     pub fn error_receiver(&self) -> oneshot::Receiver<Error<S>> {
-        self.error_receiver.clone()
+        self.shared.error_receiver.clone()
     }
 
-    /// Returns a shutdown warning receiver.
+    /// Returns a connection shutdown warning receiver.
     ///
     /// It's a receiver, used to listen for a warning,
     /// that connection is going to be closed at informed point of time.
     ///
     /// This allows external observers to wait for
     /// this signal and act accordingly to gracefully shutdown the stream, if possible.
-    pub fn shutdown_warn_receiver(&self) -> oneshot::Receiver<Instant> {
-        self.shutdown_warn_receiver.clone()
+    pub fn conn_shutdown_warn_receiver(&self) -> oneshot::Receiver<Instant> {
+        self.shared.conn_shutdown_warn_receiver.clone()
+    }
+
+    /// Returns a connection established receiver.
+    ///
+    /// It's a receiver, used to listen for a signal, that connection is established.
+    /// It is used to detect untrusted 0-RTT data.
+    pub fn conn_establish_receiver(&self) -> oneshot::Receiver<()> {
+        self.shared.conn_establish_receiver.clone()
     }
 
 
@@ -483,7 +494,7 @@ impl<S: Spec> Receiver<S> {
     ///
     /// If the channel is still open, returns a clone of the provided `error`.
     fn close(&mut self, error: Error<S>) -> Error<S> {
-        match self.error_sender.send(error.clone()) {
+        match self.shared.error_sender.send(error.clone()) {
             Ok(_) => error,
             Err(oneshot::SendError::Closed) => Self::err_rx_fallback_error(),
             Err(oneshot::SendError::Full(actual_error)) => actual_error,
@@ -515,4 +526,21 @@ impl<S: Spec> Drop for Receiver<S> {
 
         self.close(error);
     }
+}
+
+
+struct Shared<S: Spec> {
+    /// Broadcast the closure event of this stream direction.
+    error_sender: oneshot::Sender<Error<S>>,
+
+    /// Listen for an external closure event (e.g., peer sends [Error::Stop]/[Error::Reset]).
+    error_receiver: oneshot::Receiver<Error<S>>,
+
+    /// Listen for a signal, that connection is established.
+    ///
+    /// It is used to distinguish untrusted 0-RTT data from the data sent after connection is established.
+    conn_establish_receiver: oneshot::Receiver<()>,
+
+    /// Listen for a warning, that connection is going to be closed at informed point of time.
+    conn_shutdown_warn_receiver: oneshot::Receiver<Instant>,
 }
