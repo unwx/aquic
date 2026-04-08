@@ -21,11 +21,11 @@ impl TokenGenerator for PanicTokenGenerator {
         panic!("{}", self.0);
     }
 
-    fn generate_reset_token(&mut self, _: &[u8]) -> u128 {
+    fn generate_reset_token(&mut self, _: &[u8]) -> [u8; 16] {
         panic!("{}", self.0);
     }
 
-    fn verify_initial_token(
+    fn verify_token(
         &mut self,
         _: IpAddr,
         _: &[u8],
@@ -33,10 +33,6 @@ impl TokenGenerator for PanicTokenGenerator {
         _: &[u8],
         _: SystemTime,
     ) -> Result<Token, TokenError> {
-        panic!("{}", self.0);
-    }
-
-    fn verify_reset_token(&mut self, _: &[u8], _: u128) -> Result<(), TokenError> {
         panic!("{}", self.0);
     }
 }

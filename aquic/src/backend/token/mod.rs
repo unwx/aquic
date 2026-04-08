@@ -11,6 +11,7 @@ pub use padded::*;
 
 mod noop;
 pub use noop::*;
+use rand::{Rng, RngExt, rng};
 
 
 /// A QUIC tokens generator, that is able to generate and verify:
@@ -45,13 +46,13 @@ pub trait TokenGenerator {
     /// Generates a [Stateless Reset](https://datatracker.ietf.org/doc/html/rfc9000#stateless-reset).
     ///
     /// Generated token must follow the [RFC 9000](https://datatracker.ietf.org/doc/html/rfc9000) requirements.
-    fn generate_reset_token(&mut self, server_scid: &[u8]) -> u128;
+    fn generate_reset_token(&mut self, server_scid: &[u8]) -> [u8; 16];
 
 
     /// Verifies a token that was attached to an `Initial` packet.
     ///
     /// It may be one of the `Retry` or `Identity` tokens.
-    fn verify_initial_token(
+    fn verify_token(
         &mut self,
         peer_addr: IpAddr,
         peer_scid: &[u8],
@@ -59,9 +60,6 @@ pub trait TokenGenerator {
         token: &[u8],
         now: SystemTime,
     ) -> Result<Token, TokenError>;
-
-    /// Verifies the provided reset `token` against `server_scid`.
-    fn verify_reset_token(&mut self, server_scid: &[u8], token: u128) -> Result<(), TokenError>;
 }
 
 
@@ -141,4 +139,68 @@ impl Token {
             Token::Retry { expires_at, .. } | Token::Identity { expires_at } => *expires_at,
         }
     }
+}
+
+
+/// Creates a `Stateless Reset` packet.
+///
+/// Returns the length of the written packet in bytes, or `None` if the
+/// triggering packet is too small or the output buffer is insufficient.
+///
+/// [RFC 9000](https://datatracker.ietf.org/doc/html/rfc9000#section-10.3).
+pub fn write_stateless_reset_packet(
+    peer_packet_len: usize,
+    max_packet_len: usize,
+    reset_token: &[u8; 16],
+    out: &mut [u8],
+) -> Option<usize> {
+    // https://datatracker.ietf.org/doc/html/rfc9000#section-10.3-14
+    if peer_packet_len < 21 {
+        return None;
+    }
+
+    let packet_length;
+    let unpredictable_length;
+
+    {
+        // 1: Fixed Bits.
+        // 16: Stateless Reset Token.
+        // 1: https://datatracker.ietf.org/doc/html/rfc9000#section-10.3.3-2
+        //    > An endpoint MUST ensure that every Stateless Reset that it sends is smaller than the packet that triggered it.
+        #[rustfmt::skip]
+        let unpredictable_range = 4..=usize::min(
+            peer_packet_len - (1 + 16 + 1),
+            max_packet_len - (1 + 16)
+        );
+
+        if unpredictable_range.is_empty() {
+            return None;
+        }
+
+        unpredictable_length = rng().random_range(unpredictable_range);
+        packet_length = 1 + unpredictable_length + 16;
+    }
+
+    if out.len() < packet_length {
+        return None;
+    }
+
+    // Fixed Bits + Unpredictable Bits.
+    out[0] = {
+        let random_byte: u8 = rng().random();
+        let masked_byte = random_byte & 0b0011_1111;
+        masked_byte | 0b0100_0000
+    };
+
+    let mut offset = 1;
+
+    // More Unpredictable Bits.
+    rng().fill_bytes(&mut out[offset..(offset + unpredictable_length)]);
+    offset += unpredictable_length;
+
+    // Stateless Reset Token.
+    out[offset..(offset + reset_token.len())].copy_from_slice(reset_token);
+    offset += reset_token.len();
+
+    Some(offset)
 }

@@ -271,18 +271,17 @@ where
         &self.plaintext_buffer
     }
 
-    fn generate_reset_token(&mut self, server_scid: &[u8]) -> u128 {
+    fn generate_reset_token(&mut self, server_scid: &[u8]) -> [u8; 16] {
         self.plaintext_buffer.clear();
 
         // HMAC size is guaranteed to be > 16.
         // See `new()`.
         self.hmac.compute(server_scid, &mut self.plaintext_buffer);
-        let array: [u8; 16] = self.plaintext_buffer[0..16].try_into().unwrap();
-        u128::from_be_bytes(array)
+        self.plaintext_buffer[0..16].try_into().unwrap()
     }
 
 
-    fn verify_initial_token(
+    fn verify_token(
         &mut self,
         peer_addr: IpAddr,
         peer_scid: &[u8],
@@ -316,16 +315,6 @@ where
         self.plaintext_buffer.extend_from_slice(token);
 
         self.verify_retry_token(peer_addr, peer_scid, peer_dcid, now)
-    }
-
-    fn verify_reset_token(&mut self, server_scid: &[u8], token: u128) -> Result<(), TokenError> {
-        match self
-            .hmac
-            .verify_fn(server_scid, &token.to_be_bytes(), |hmac| &hmac[0..16])
-        {
-            true => Ok(()),
-            false => Err(TokenError::Invalid),
-        }
     }
 }
 

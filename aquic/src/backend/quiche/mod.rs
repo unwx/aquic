@@ -290,6 +290,18 @@ where
                 }
             };
 
+            if matches!(header.ty, quiche::Type::Initial) {
+                if self.open
+                    && !self.handle_initial_packet_as_server(&mut header, &mut packet, out_messages)
+                {
+                    // We need retry this packet when buffer becomes available.
+                    break;
+                }
+
+                in_packets.next();
+                continue;
+            }
+
             // If there is a registered quiche connection, it will handle this packet.
             //
             // For client connections, we immediately register them.
@@ -301,13 +313,7 @@ where
                 continue;
             }
 
-            if matches!(header.ty, quiche::Type::Initial) && self.open {
-                if !self.handle_initial_packet_as_server(&mut header, &mut packet, out_messages) {
-                    // We need retry this packet when buffer becomes available.
-                    break;
-                }
-            }
-
+            self.handle_packet_with_stateless_reset(&header, &packet, out_messages);
             in_packets.next();
         }
     }
@@ -1055,7 +1061,7 @@ where
 
         let token = match header.token.as_ref() {
             Some(token) => {
-                match config.token_generator.verify_initial_token(
+                match config.token_generator.verify_token(
                     packet.from.ip(),
                     header.scid.as_ref(),
                     header.dcid.as_ref(),
@@ -1189,6 +1195,27 @@ where
 
         self.register_new_connection(Connection::new(connection, token.is_some()), packet.from);
         true
+    }
+
+    /// Handles a `packet` as lost.
+    ///
+    /// This is a last resort for packets that we can't accept or delegate to a connection,
+    /// so we send a stateless reset if possible.
+    fn handle_packet_with_stateless_reset(
+        &mut self,
+        header: &quiche::Header,
+        packet: &Packet,
+        out: &mut Vec<SendMsg<BipView>>,
+    ) {
+        let Some(config) = self.config.server.as_mut() else {
+            return;
+        };
+
+        let reset_token = config
+            .token_generator
+            .generate_reset_token(header.dcid.as_ref());
+
+        self.io.write_stateless_reset(packet, &reset_token, out);
     }
 
 
@@ -1440,7 +1467,8 @@ where
             let scid_ref = quiche::ConnectionId::from_ref(scid.as_slice());
             let reset_token = config.token_generator.generate_reset_token(scid.as_ref());
 
-            if let Err(e) = connection.new_scid(&scid_ref, reset_token, false) {
+            if let Err(e) = connection.new_scid(&scid_ref, u128::from_be_bytes(reset_token), false)
+            {
                 error!(
                     connection_id = %connection.id(connection_key),
                     "unable to allocate a new source connection ID: \

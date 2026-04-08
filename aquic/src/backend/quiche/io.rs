@@ -1,5 +1,5 @@
 use crate::{
-    backend::quiche::Connection,
+    backend::{quiche::Connection, write_stateless_reset_packet},
     net::{Ecn, Packet, SendMsg},
     util::{BipBuffer, BipSliceMut, BipView},
 };
@@ -238,6 +238,33 @@ impl IO {
         );
 
         Self::to_force_write_result(packet, reserve, result, out)
+    }
+
+    /// Writes a Stateless Reset packet into `&mut out`,
+    /// if `packet` length is sufficient for it, and if the buffer has enough space for it.
+    pub fn write_stateless_reset(
+        &mut self,
+        packet: &Packet,
+        reset_token: &[u8; 16],
+        out: &mut Vec<SendMsg<BipView>>,
+    ) {
+        let Some(mut reserve) = self.buffer.reserve(40, true) else {
+            return;
+        };
+
+        let Some(length) =
+            write_stateless_reset_packet(packet.len(), reserve.len(), reset_token, &mut reserve)
+        else {
+            return;
+        };
+
+        out.push(SendMsg::new(
+            reserve.commit(length).detach(),
+            packet.to,
+            packet.from,
+            Ecn::NEct,
+            0,
+        ));
     }
 
     fn to_force_write_result(
