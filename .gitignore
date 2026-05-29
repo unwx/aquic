@@ -2,4 +2,5 @@ Cargo.lock
 
 dev/
 .idea/
+.zed/
 target/
