@@ -1,5 +1,5 @@
+use crate::SendOnMt;
 use crate::conditional;
-use crate::exec::SendOnMt;
 use crate::sync::{SendError, TryRecvError, TrySendError};
 
 /// A sending part of weighted `mpmc` channel.
@@ -58,7 +58,7 @@ pub(crate) trait WeightedReceiver<T: SendOnMt + Unpin + 'static> {
 
 
 conditional! {
-    multithread,
+    any(feature = "async-send"),
 
     mod mt;
 
@@ -81,7 +81,7 @@ conditional! {
 }
 
 conditional! {
-    not(multithread),
+    not(any(feature = "async-send")),
 
     mod st;
 

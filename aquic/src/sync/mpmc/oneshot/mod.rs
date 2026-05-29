@@ -1,5 +1,5 @@
+use crate::SendOnMt;
 use crate::conditional;
-use crate::exec::SendOnMt;
 use crate::sync::TryRecvError;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
@@ -69,7 +69,7 @@ pub trait OneshotReceiver<T>: Clone {
 
 
 conditional! {
-    multithread,
+    any(feature = "async-send"),
 
     mod mt;
 
@@ -90,7 +90,7 @@ conditional! {
 }
 
 conditional! {
-    not(multithread),
+    not(any(feature = "async-send")),
 
     mod st;
 

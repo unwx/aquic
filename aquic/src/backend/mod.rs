@@ -1,5 +1,6 @@
 use crate::conditional;
 use crate::net::{Buf, BufMut, MultiMsgFlattenIter, SendMsg, ServerName, SoFeat};
+use crate::runtime::AsyncRuntime;
 use crate::stream::{Priority, StreamId};
 use aquic_macros::doc_support;
 use bytes::Bytes;
@@ -200,7 +201,7 @@ pub trait QuicBackend: Sized {
     /// # Cancel Safety
     ///
     /// This method is cancel safe, with no side-effects on future drop.
-    fn sleep(&mut self) -> impl Future<Output = ()>;
+    fn sleep<AR: AsyncRuntime>(&mut self) -> impl Future<Output = ()>;
 
 
     /// Notifies that **client** application switched the network.

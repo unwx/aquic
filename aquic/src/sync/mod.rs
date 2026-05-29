@@ -71,7 +71,7 @@ impl std::error::Error for TryRecvError {}
 
 
 conditional! {
-    multithread,
+    any(feature = "async-send"),
 
     use std::sync::Arc;
 
@@ -80,7 +80,7 @@ conditional! {
 }
 
 conditional! {
-    not(multithread),
+    not(any(feature = "async-send")),
 
     use std::rc::Rc;
 

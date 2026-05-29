@@ -28,7 +28,7 @@ The TODO list before the first release:
 - [x] Add [quiche](https://github.com/cloudflare/quiche) QUIC implementation support.
 - [x] Add QUIC [datagrams](https://datatracker.ietf.org/doc/html/rfc9221) support: codecs, async datagrams processors (`dgram` mod).
 - [x] Add 0-RTT support.
-- [ ] Add [smol](https://github.com/smol-rs/smol) async runtime support; 
+- [x] Add [smol](https://github.com/smol-rs/smol) async runtime support; 
       allow users to implement `spawn()`, `sleep()` methods
       for `Send` and `!Send` runtimes.
 - [ ] Add Linux/Windows optimized `net::Socket` implementation, with `std` as a fallback.

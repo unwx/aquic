@@ -1,5 +1,6 @@
 use crate::{
     backend::quinn::{Connection, connection::QuinnConnectionId},
+    runtime::AsyncRuntime,
     util::{TimerKey, TimerTick, WheelTimer},
 };
 use std::time::{Duration, Instant};
@@ -63,8 +64,10 @@ impl Time {
     /// # Cancel Safety
     ///
     /// Cancel safe, no side effects.
-    pub async fn sleep(&mut self) {
-        self.timer.next(&mut self.fired_events, self.clock).await;
+    pub async fn sleep<AR: AsyncRuntime>(&mut self) {
+        self.timer
+            .next::<AR>(&mut self.fired_events, self.clock)
+            .await;
     }
 
     /// Returns all fired events, that are ready to be handled.

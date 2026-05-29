@@ -1,5 +1,5 @@
+use crate::SendOnMt;
 use crate::conditional;
-use crate::exec::SendOnMt;
 use crate::sync::{SendError, TryRecvError};
 
 /// A sending part of unbounded `mpmc` channel.
@@ -36,7 +36,7 @@ pub(crate) trait UnboundedReceiver<T> {
 
 
 conditional! {
-    multithread,
+    any(feature = "async-send"),
 
     mod mt;
 
@@ -54,7 +54,7 @@ conditional! {
 }
 
 conditional! {
-    not(multithread),
+    not(any(feature = "async-send")),
 
     mod st;
 

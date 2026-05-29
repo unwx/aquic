@@ -1,7 +1,7 @@
+use crate::AsyncRuntime;
 use crate::backend::StableConnectionId;
 use crate::core::InStreamBackend;
 use crate::debug_panic;
-use crate::exec::Runtime;
 use crate::log;
 use crate::stream::{Decoder, Error, Payload};
 use crate::sync::SmartRc;
@@ -88,7 +88,7 @@ where
     /// **Note**: only few variants of [Error] are allowed to be sent via this sender:
     /// - [Error::Reset],
     /// - [Error::Connection].
-    pub(crate) fn read(mut self, span: StreamSpan) -> oneshot::Sender<Error<S>> {
+    pub(crate) fn read<AR: AsyncRuntime>(mut self, span: StreamSpan) -> oneshot::Sender<Error<S>> {
         let cancel_sender = self.cancel_sender.clone();
         let cancel_receiver = self.cancel_receiver.clone();
         let app_error_receiver = self.item_sender.error_receiver();
@@ -138,7 +138,7 @@ where
             }
         };
 
-        Runtime::spawn_void(async move {
+        AR::spawn_void(async move {
             future.instrument(span.into()).await;
         });
 

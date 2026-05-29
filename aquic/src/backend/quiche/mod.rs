@@ -11,6 +11,7 @@ use crate::{
         },
     },
     net::{BufMut, SendMsg, ServerName, SoFeat},
+    runtime::AsyncRuntime,
     stream::{Priority, StreamId},
     util::BipView,
 };
@@ -319,8 +320,8 @@ where
     }
 
 
-    async fn sleep(&mut self) {
-        self.time.sleep().await;
+    async fn sleep<AR: AsyncRuntime>(&mut self) {
+        self.time.sleep::<AR>().await;
     }
 
 

@@ -1,7 +1,7 @@
 use crate::conditional;
 
 conditional! {
-    not(multithread),
+    not(any(feature = "async-send")),
 
     pub(crate) mod event;
 }

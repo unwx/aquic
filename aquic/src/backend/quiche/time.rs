@@ -1,5 +1,6 @@
 use crate::{
     backend::quiche::{Connection, ConnectionKey},
+    runtime::AsyncRuntime,
     util::{TimerKey, TimerTick, WheelTimer},
 };
 use std::time::{Duration, Instant, SystemTime};
@@ -84,9 +85,9 @@ impl Time {
     /// # Cancel Safety
     ///
     /// Cancel safe, no side effects.
-    pub async fn sleep(&mut self) {
+    pub async fn sleep<AR: AsyncRuntime>(&mut self) {
         self.timer
-            .next(&mut self.fired_events, self.clock_mono)
+            .next::<AR>(&mut self.fired_events, self.clock_mono)
             .await;
     }
 

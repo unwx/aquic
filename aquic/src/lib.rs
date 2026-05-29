@@ -1,7 +1,6 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 use crate::backend::QuicBackend;
-use crate::exec::{SendOnMt, SyncOnMt};
 use crate::net::{SoFeat, Socket};
 use bytes::Bytes;
 use std::collections::HashSet;
@@ -17,8 +16,10 @@ pub mod sync;
 pub mod util;
 
 mod core;
-mod exec;
+mod runtime;
 mod tracing;
+
+use runtime::*;
 
 /// Custom application stream-level error code,
 /// that is used for `RESET_STREAM` and `STOP_SENDING` frames.

@@ -1,5 +1,5 @@
 use crate::{
-    exec::Runtime,
+    runtime::AsyncRuntime,
     util::timer::level::{Level, LevelKey},
 };
 use std::{
@@ -100,7 +100,7 @@ impl<T> WheelTimer<T> {
     /// # Cancel Safety
     ///
     /// Cancel safe, no side effects.
-    pub async fn next(&mut self, out: &mut Vec<TimerTick<T>>, now: Instant) {
+    pub async fn next<AR: AsyncRuntime>(&mut self, out: &mut Vec<TimerTick<T>>, now: Instant) {
         let out_start_len = out.len();
 
         {
@@ -118,7 +118,7 @@ impl<T> WheelTimer<T> {
             let alarm = self.current_clock + self.start_hz;
 
             while self.current_clock < alarm {
-                Runtime::sleep_until(alarm).await;
+                AR::sleep_until(alarm).await;
                 self.current_clock = Instant::min(alarm, Instant::now());
             }
 

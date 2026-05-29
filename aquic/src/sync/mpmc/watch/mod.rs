@@ -1,6 +1,5 @@
 use crate::{
-    conditional,
-    exec::SendOnMt,
+    SendOnMt, conditional,
     sync::{SendError, TryRecvError},
 };
 
@@ -40,7 +39,7 @@ pub trait WatchReceiver<T>: Clone {
 
 
 conditional! {
-    multithread,
+    any(feature = "async-send"),
 
     mod mt;
 
@@ -60,7 +59,7 @@ conditional! {
 }
 
 conditional! {
-    not(multithread),
+    not(any(feature = "async-send")),
 
     mod st;
 

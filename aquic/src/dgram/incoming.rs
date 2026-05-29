@@ -1,9 +1,9 @@
+use crate::AsyncRuntime;
 use crate::backend::StableConnectionId;
 use crate::core::InDgramBackend;
 use crate::{
     Spec,
     dgram::Error,
-    exec::Runtime,
     sync::{
         SmartRc, dgram,
         mpmc::oneshot::{self, OneshotReceiver, OneshotSender},
@@ -85,7 +85,7 @@ where
     /// Returns a cancellation sender.
     ///
     /// **Note**: only a [Error::Connection] is allowed to be sent via this sender.
-    pub fn read(mut self, span: DgramSpan) -> oneshot::Sender<Error> {
+    pub fn read<AR: AsyncRuntime>(mut self, span: DgramSpan) -> oneshot::Sender<Error> {
         let cancel_sender = self.cancel_sender.clone();
         let cancel_receiver = self.cancel_receiver.clone();
         let app_error_receiver = self.item_sender.error_receiver();
@@ -131,7 +131,7 @@ where
             }
         };
 
-        Runtime::spawn_void(async move {
+        AR::spawn_void(async move {
             future.instrument(span.into()).await;
         });
 

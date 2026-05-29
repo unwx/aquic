@@ -8,19 +8,14 @@ edition = "2024"
 quiche = ["dep:quiche", "dep:mini-moka"]
 quinn = ["dep:quinn-proto", "dep:rustls"]
 
-tokio = ["dep:tokio", "dep:event-listener", "dep:crossfire", "dep:sharded-slab"]
-monoio = ["dep:monoio", "dep:intrusive-collections"]
-
+async-send = ["dep:event-listener", "dep:crossfire", "dep:sharded-slab"]
 server-util = ["dep:bitvec", "dep:aes"]
 
-default = []
+default = ["async-send"]
 
 
 [dependencies]
 aquic-macros = { path = "../aquic-macros" }
-
-tokio = { version = "1.50", features = ["rt", "time"], optional = true }
-monoio = { version = "0.2", optional = true }
 
 quiche = { version = "0.26", optional = true }
 mini-moka = { version = "0.10", optional = true }
@@ -34,7 +29,7 @@ crossfire = { version = "3.1", optional = true }
 sharded-slab = { version = "0.1", optional = true }
 
 # for `!Send` async runtimes
-intrusive-collections = { version = "0.10.0", optional = true }
+intrusive-collections = "0.10.0"
 
 # for `server-util` feature
 bitvec = { version = "1.0", optional = true }
@@ -56,10 +51,6 @@ hashlink = "0.11"
 foldhash = "0.2"
 ahash = "0.8"
 domain = "0.11"
-
-
-[build-dependencies]
-cfg_aliases = "0.2"
 
 
 [lints]

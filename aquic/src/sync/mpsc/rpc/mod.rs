@@ -1,5 +1,5 @@
+use crate::SendOnMt;
 use crate::conditional;
-use crate::exec::SendOnMt;
 use crate::sync::mpsc;
 use std::fmt::{Debug, Display, Formatter};
 
@@ -59,7 +59,7 @@ pub(crate) struct RemoteCall<T, C> {
 
 
 conditional! {
-    multithread,
+    any(feature = "async-send"),
 
     mod mt;
 
@@ -71,7 +71,7 @@ conditional! {
 }
 
 conditional! {
-    not(multithread),
+    not(any(feature = "async-send")),
 
     mod st;
 
