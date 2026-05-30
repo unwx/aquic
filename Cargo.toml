@@ -2,7 +2,7 @@
 resolver = "2"
 
 members = [
-    "aquic",
+    "aquic-core",
     "aquic-macros",
 ]
 
