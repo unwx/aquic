@@ -1,6 +1,5 @@
 use crate::{
     backend::quinn::{Connection, connection::QuinnConnectionId},
-    runtime::AsyncRuntime,
     util::{TimerKey, TimerTick, WheelTimer},
 };
 use std::time::{Duration, Instant};
@@ -59,15 +58,16 @@ impl Time {
     }
 
 
-    /// Sleeps until there is a scheduled event to handle.
+    /// Ticks, storing all fired events.
+    /// In case of time-lag, previous events are handled too.
     ///
-    /// # Cancel Safety
+    /// Fired events can be retrived via [`fired_events()`][Self::fired_events].
     ///
-    /// Cancel safe, no side effects.
-    pub async fn sleep<AR: AsyncRuntime>(&mut self) {
-        self.timer
-            .next::<AR>(&mut self.fired_events, self.clock)
-            .await;
+    /// Returns the instant at which this method should be called again,
+    /// and whether there are pending [`fired_events()`][Self::fired_events] to be handled.
+    pub fn tick(&mut self) -> (Instant, bool) {
+        let next_tick_instant = self.timer.progress(&mut self.fired_events, self.clock);
+        (next_tick_instant, !self.fired_events.is_empty())
     }
 
     /// Returns all fired events, that are ready to be handled.

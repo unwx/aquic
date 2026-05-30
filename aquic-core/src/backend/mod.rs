@@ -1,6 +1,5 @@
 use crate::conditional;
 use crate::net::{Buf, BufMut, MultiMsgFlattenIter, SendMsg, ServerName, SoFeat};
-use crate::runtime::AsyncRuntime;
 use crate::stream::{Priority, StreamId};
 use aquic_macros::doc_support;
 use bytes::Bytes;
@@ -178,7 +177,7 @@ pub trait QuicBackend: Sized {
     /// writes immediate outgoing packets into `&mut out_messages`.
     ///
     /// **Notes**:
-    /// - After this method the [`send_prepare()`](QuicBackend::send_prepare) is going to be invoked,
+    /// - After this method the [`send()`](QuicBackend::send) is going to be invoked,
     ///   therefore, it's not recommended to write non-immediate data like stream/datagram data, etc, to `&mut out_messages`;
     ///   a good practice would be to write `initial`/`version-negotiation`/`retry` packets only.
     /// - At least one message must be handled after all internal buffers are returned via [`send_done()`][QuicBackend::send_done],
@@ -190,18 +189,12 @@ pub trait QuicBackend: Sized {
     );
 
 
-    /// Sleeps until there is an internal event that must be handled,
-    /// for example connection timeout.
+    /// Ticks the backend's wheel timer with its internal QUIC events.
     ///
-    /// On wake-up, [`send_prepare()`][QuicBackend::send_prepare] will be invoked.
-    ///
-    /// It's recommended to take a look at [`WheelTimer`][`crate::util::WheelTimer`],
-    /// as it might be useful.
-    ///
-    /// # Cancel Safety
-    ///
-    /// This method is cancel safe, with no side-effects on future drop.
-    fn sleep<AR: AsyncRuntime>(&mut self) -> impl Future<Output = ()>;
+    /// Returns the instant at which this method should be called again,
+    /// and whether [`send()`][QuicBackend::send]
+    /// should be invoked to handle fired internal events.
+    fn tick(&mut self) -> (Instant, bool);
 
 
     /// Notifies that **client** application switched the network.

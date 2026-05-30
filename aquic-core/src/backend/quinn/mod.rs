@@ -8,7 +8,6 @@ use crate::backend::{Error, QuicBackend};
 use crate::backend::{Event, HaltKind, Result};
 use crate::debug_panic;
 use crate::net::{BufMut, MultiMsgFlattenIter, SendMsg, ServerName, SoFeat};
-use crate::runtime::AsyncRuntime;
 use crate::stream::{Priority, StreamId};
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
@@ -250,8 +249,8 @@ impl QuicBackend for QuinnBackend {
     }
 
 
-    async fn sleep<AR: AsyncRuntime>(&mut self) {
-        self.time.sleep::<AR>().await;
+    fn tick(&mut self) -> (Instant, bool) {
+        self.time.tick()
     }
 
 

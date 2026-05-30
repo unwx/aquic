@@ -1,7 +1,4 @@
-use crate::{
-    runtime::AsyncRuntime,
-    util::timer::level::{Level, LevelKey},
-};
+use crate::util::timer::level::{Level, LevelKey};
 use std::{
     ops::{Deref, DerefMut},
     time::{Duration, Instant},
@@ -93,37 +90,21 @@ impl<T> WheelTimer<T> {
         }
     }
 
-    /// Waits until a scheduled event fires, collecting them into `out`.
+    /// Writes all fired events (`schedule_time` <= `now`) into `out`.
     ///
-    /// If a time-lag occurred, all previous ticks will be processed sequentially.
+    /// Returns the instant at which this method should be called again.
+    /// This represents the time of the next tick.
     ///
     /// # Cancel Safety
     ///
     /// Cancel safe, no side effects.
-    pub async fn next<AR: AsyncRuntime>(&mut self, out: &mut Vec<TimerTick<T>>, now: Instant) {
-        let out_start_len = out.len();
-
-        {
-            let mut clock = self.current_clock;
-
-            while clock <= now {
-                self.tick(out);
-
-                self.current_clock = clock;
-                clock += self.start_hz;
-            }
-        }
-
-        while out.len() == out_start_len {
-            let alarm = self.current_clock + self.start_hz;
-
-            while self.current_clock < alarm {
-                AR::sleep_until(alarm).await;
-                self.current_clock = Instant::min(alarm, Instant::now());
-            }
-
+    pub fn progress(&mut self, out: &mut Vec<TimerTick<T>>, now: Instant) -> Instant {
+        while self.current_clock <= now {
             self.tick(out);
+            self.current_clock += self.start_hz;
         }
+
+        self.current_clock
     }
 
 
