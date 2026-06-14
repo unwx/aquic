@@ -17,7 +17,7 @@ default = ["async-send"]
 [dependencies]
 aquic-macros = { path = "../aquic-macros" }
 
-quiche = { version = "0.26", optional = true }
+quiche = { version = "0.29", optional = true }
 mini-moka = { version = "0.10", optional = true }
 
 quinn-proto = { version = "0.11", optional = true }
@@ -33,24 +33,24 @@ intrusive-collections = "0.10.0"
 
 # for `server-util` feature
 bitvec = { version = "1.0", optional = true }
-aes = { version = "0.8", features = ["zeroize"], optional = true }
+aes = { version = "0.9", features = ["zeroize"], optional = true }
 
 rand = "0.10"
-zeroize = "1.8"
+hybrid-array = "0.4"
 subtle = "2.6"
-aead = { version = "0.5", features = ["alloc"] }
-digest = { version = "0.11", features = ["mac"]}
-typenum = "1.19"
+aead = { version = "0.6", features = ["alloc"] }
+digest = { version = "0.11", features = ["mac"] }
+typenum = "1.20"
 
 tracing = "0.1"
 uuid = { version = "1.23", features = ["v4"] }
 futures = "0.3"
 bytes = "1.11"
 slotmap = "1.1"
-hashlink = "0.11"
+hashlink = "0.12"
 foldhash = "0.2"
 ahash = "0.8"
-domain = "0.11"
+domain = "0.12"
 
 
 [lints]

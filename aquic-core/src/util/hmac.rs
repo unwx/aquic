@@ -1,31 +1,27 @@
-use crate::util::KeyConsumer;
-use digest::{KeyInit, Mac, array::Array};
-use std::{any::type_name, marker::PhantomData};
+use crate::util::KeyStore;
+use digest::{KeyInit, Mac};
 use subtle::ConstantTimeEq;
 use typenum::Unsigned;
-use zeroize::Zeroize;
 
 /// HMAC, provides authentication and verification methods
 /// and allows manual key rotation using [KeyConsumer].
 pub struct Hmac<M, K> {
-    keys: Vec<u8>,
-    key_consumer: K,
+    macs: Vec<M>,
+    key_store: K,
     revision: u64,
-    _phantom: PhantomData<M>,
 }
 
 impl<M, K> Hmac<M, K>
 where
-    M: KeyInit + Mac,
-    K: KeyConsumer,
+    M: KeyInit + Mac + Clone,
+    K: KeyStore<KeySize = M::KeySize>,
 {
     /// Creates a new hmac instance.
-    pub fn new(key_consumer: K) -> Self {
+    pub fn new(key_store: K) -> Self {
         let mut this = Self {
-            keys: Vec::new(),
-            key_consumer,
+            macs: Vec::new(),
+            key_store,
             revision: 0,
-            _phantom: PhantomData,
         };
 
         this.update_keys();
@@ -36,7 +32,7 @@ where
     pub fn compute(&mut self, data: &[u8], out: &mut Vec<u8>) {
         self.compare_and_update_keys();
 
-        let mut provider = self.active_provider();
+        let mut provider = self.macs[0].clone();
         provider.update(data);
 
         let output = provider.finalize();
@@ -66,7 +62,7 @@ where
     {
         self.compare_and_update_keys();
 
-        for mut provider in self.all_providers() {
+        for mut provider in self.macs.iter().cloned() {
             provider.update(data);
 
             let output = provider.finalize();
@@ -82,60 +78,16 @@ where
 
 
     fn compare_and_update_keys(&mut self) {
-        if self.revision != self.key_consumer.revision() {
+        if self.revision != self.key_store.revision() {
             self.update_keys();
         }
     }
 
     #[rustfmt::skip]
     fn update_keys(&mut self) {
-        let verify_key = |key: &[u8]| {
-            if key.len() != M::KeySize::USIZE {
-                panic!("HMAC {} key must be {} bytes long", type_name::<M>(), M::KeySize::USIZE);
-            }
-        };
-
-        self.keys.zeroize();
-        self.keys.clear();
-
-        self.keys.extend_from_slice({
-            let key = self.key_consumer.active();
-            verify_key(key);
-            key
-        });
-
-        for key in self.key_consumer.passive() {
-            verify_key(key);
-            self.keys.extend_from_slice(key);
-        }
-
-        self.revision = self.key_consumer.revision();
-    }
-
-
-    fn active_provider(&self) -> M {
-        let key = Array::<u8, M::KeySize>::try_from(&self.keys[0..M::KeySize::USIZE])
-            .expect("keys chunk should have the right size");
-
-        Self::key_to_provider(&key)
-    }
-
-    fn all_providers(&self) -> impl Iterator<Item = M> + '_ {
-        self.keys
-            .chunks_exact(M::KeySize::USIZE)
-            .map(|chunk| {
-                Array::<u8, M::KeySize>::try_from(chunk).expect("chunk should have the right size")
-            })
-            .map(|array| Self::key_to_provider(&array))
-    }
-
-    fn key_to_provider(key: &Array<u8, M::KeySize>) -> M {
-        <M as KeyInit>::new(key)
-    }
-}
-
-impl<M, K> Drop for Hmac<M, K> {
-    fn drop(&mut self) {
-        self.keys.zeroize();
+        self.macs.clear();
+        self.macs.push(M::new(self.key_store.active()));
+        self.macs.extend(self.key_store.passive().map(M::new));
+        self.revision = self.key_store.revision();
     }
 }

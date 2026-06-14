@@ -1,7 +1,6 @@
-use crate::util::KeyConsumer;
-use aead::AeadInPlace;
-use aead::KeyInit;
-use aead::generic_array::GenericArray;
+use crate::util::KeyStore;
+use aead::{AeadInOut, KeyInit};
+use hybrid_array::Array;
 use rand::Rng;
 use rand::rng;
 use std::fmt;
@@ -11,23 +10,23 @@ use std::ops::Add;
 use typenum::Unsigned;
 
 /// AEAD cipher, provides encryption & decryption API
-/// and allows manual key rotation using [KeyConsumer].
+/// and allows manual key rotation using [KeyStore].
 pub struct Aead<A, K> {
     ciphers: Vec<Cipher<A>>,
-    keys: K,
+    key_store: K,
     revision: u64,
 }
 
 impl<A, K> Aead<A, K>
 where
-    A: KeyInit + AeadInPlace,
-    K: KeyConsumer,
+    A: KeyInit + AeadInOut,
+    K: KeyStore<KeySize = A::KeySize>,
 {
     /// Creates a new cipher instance.
-    pub fn new(keys: K) -> Self {
+    pub fn new(key_store: K) -> Self {
         let mut this = Self {
             ciphers: Vec::new(),
-            keys,
+            key_store,
             revision: 0,
         };
 
@@ -91,7 +90,7 @@ where
 
 
     fn compare_and_update_ciphers(&mut self) {
-        if self.revision != self.keys.revision() {
+        if self.revision != self.key_store.revision() {
             self.update_ciphers();
         }
     }
@@ -99,9 +98,9 @@ where
     #[rustfmt::skip]
     fn update_ciphers(&mut self) {
         self.ciphers.clear();
-        self.ciphers.push(Cipher::new(self.keys.active()));
-        self.ciphers.extend(self.keys.passive().map(Cipher::new));
-        self.revision = self.keys.revision();
+        self.ciphers.push(Cipher::new(self.key_store.active()));
+        self.ciphers.extend(self.key_store.passive().map(Cipher::new));
+        self.revision = self.key_store.revision();
     }
 }
 
@@ -119,22 +118,17 @@ struct Cipher<A> {
 
 impl<A> Cipher<A>
 where
-    A: KeyInit + AeadInPlace,
+    A: KeyInit + AeadInOut,
 {
-    pub fn new(key: &[u8]) -> Self {
-        let key = GenericArray::from_slice(key);
+    pub fn new(key: &Array<u8, A::KeySize>) -> Self {
         Self { inner: A::new(key) }
     }
 
     pub fn encrypt_and_pack(&self, associated_data: &[u8], plaintext: &mut Vec<u8>) {
-        let mut nonce = GenericArray::<u8, A::NonceSize>::default();
+        let mut nonce = Array::<u8, A::NonceSize>::default();
         rng().fill_bytes(&mut nonce);
 
-        plaintext.reserve(
-            Self::auth_tag_len()
-                .add(Self::nonce_len())
-                .add(Self::cipher_overhead()),
-        );
+        plaintext.reserve(Self::auth_tag_len().add(Self::nonce_len()));
 
         self.inner
             .encrypt_in_place(&nonce, associated_data, plaintext)
@@ -152,10 +146,9 @@ where
             return Err(aead::Error);
         }
 
-        let nonce = GenericArray::<u8, A::NonceSize>::from_exact_iter(
+        let nonce = Array::<u8, A::NonceSize>::from_iter(
             ciphertext.drain((ciphertext.len() - Self::nonce_len())..),
-        )
-        .expect("provided iterator must have the same size 'nonce' len");
+        );
 
         self.inner
             .decrypt_in_place(&nonce, associated_data, ciphertext)
@@ -168,9 +161,5 @@ where
 
     pub const fn auth_tag_len() -> usize {
         <A::TagSize as Unsigned>::USIZE
-    }
-
-    pub const fn cipher_overhead() -> usize {
-        <A::CiphertextOverhead as Unsigned>::USIZE
     }
 }

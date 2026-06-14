@@ -1,9 +1,10 @@
+use crate::util::KeyStore;
 use crate::{
     backend::{
         Token, TokenError, TokenGenerator, TokenKind,
         cid::{ConnectionId, MAX_CID_LEN},
     },
-    util::{Aead, Hmac, KeyConsumer},
+    util::{Aead, Hmac},
 };
 use rand::{Rng, rng};
 use std::{
@@ -64,21 +65,21 @@ use typenum::Unsigned;
 /// # Stateless Reset token
 ///
 /// Uses HMAC function on server SCID.
-pub struct PaddedTokenGenerator<A, M, AKeys, MKeys> {
+pub struct PaddedTokenGenerator<A, M, AStore, MStore> {
     plaintext_buffer: Vec<u8>,
     associated_data_buffer: Vec<u8>,
     reserve_buffer: Vec<u8>,
 
-    aead: Aead<A, AKeys>,
-    hmac: Hmac<M, MKeys>,
+    aead: Aead<A, AStore>,
+    hmac: Hmac<M, MStore>,
 }
 
-impl<A, M, AKeys, MKeys> PaddedTokenGenerator<A, M, AKeys, MKeys>
+impl<A, M, AStore, MStore> PaddedTokenGenerator<A, M, AStore, MStore>
 where
-    A: aead::KeyInit + aead::AeadInPlace,
+    A: aead::KeyInit + aead::AeadInOut,
     M: digest::KeyInit + digest::Mac,
-    AKeys: KeyConsumer,
-    MKeys: KeyConsumer,
+    AStore: KeyStore<KeySize = A::KeySize>,
+    MStore: KeyStore<KeySize = M::KeySize>,
 {
     /// Creates a new instance of `PaddedTokenGenerator`.
     /// - AEAD is used for `Retry` packet and `NEW_TOKEN` frame tokens.
@@ -87,7 +88,7 @@ where
     /// # Panics
     ///
     /// If provided HMAC algorithm produces outputs shorter 16 bytes long.
-    pub fn new(aead: Aead<A, AKeys>, hmac: Hmac<M, MKeys>) -> Self {
+    pub fn new(aead: Aead<A, AStore>, hmac: Hmac<M, MStore>) -> Self {
         if <M::OutputSize as Unsigned>::USIZE < 16 {
             panic!(
                 "HMAC algorithm output size must be at least 16 (reset_token size): {}",
@@ -230,12 +231,12 @@ where
     }
 }
 
-impl<A, M, AKeys, MKeys> TokenGenerator for PaddedTokenGenerator<A, M, AKeys, MKeys>
+impl<A, M, AStore, MStore> TokenGenerator for PaddedTokenGenerator<A, M, AStore, MStore>
 where
-    A: aead::KeyInit + aead::AeadInPlace,
-    M: digest::KeyInit + digest::Mac,
-    AKeys: KeyConsumer,
-    MKeys: KeyConsumer,
+    A: aead::KeyInit + aead::AeadInOut,
+    M: digest::KeyInit + digest::Mac + Clone,
+    AStore: KeyStore<KeySize = A::KeySize>,
+    MStore: KeyStore<KeySize = M::KeySize>,
 {
     fn generate_retry_token(
         &mut self,
